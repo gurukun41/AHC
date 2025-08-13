@@ -35,3 +35,5 @@
 *.plist
 
 *.DS_Store
+
+*.txt
