@@ -1,0 +1,530 @@
+#include <bits/stdc++.h>
+
+#include <atcoder/all>
+#include <chrono>
+using namespace std;
+using ll = long long;
+using vl = vector<ll>;                                     // long long型の一次元
+using vvl = vector<vl>;                                    // long long型の二次元配列
+using vvvl = vector<vvl>;                                  // long long型の三次元配列
+using vi = vector<int>;                                    // int型の一次元
+using vvi = vector<vi>;                                    // int型の二次元配列
+using vvvi = vector<vvi>;                                  // int型の三次元配列
+#define rep(i, a, b) for (int i = (a); i < (int)(b); i++)  // for文の短縮
+#define all(v) v.begin(), v.end()                          // all(v)でvの始まりと終わりのイテレーター
+
+// 入力を受け取る
+template <typename T>
+T input() {
+    T x;
+    cin >> x;
+    return x;
+}
+
+// a,bのうち最大のものをaに入れる(aがbに置き換わるときはtrueを返す)
+template <typename T>
+inline bool chmax(T& a, const T& b) {
+    if (a < b) {
+        a = b;
+        return true;
+    }
+    return false;
+}
+
+// a,bのうち最小のものをaに入れる(aがbに置き換わるときはtrueを返す)
+template <typename T>
+inline bool chmin(T& a, const T& b) {
+    if (a > b) {
+        a = b;
+        return true;
+    }
+    return false;
+}
+
+// 素数判定
+bool is_prime(long long n) {
+    if (n <= 1) {
+        return false;
+    }
+    for (long long i = 2; i * i <= n; i++) {
+        if (n % i == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct Point {
+    ll x;
+    ll y;
+};
+
+struct Input {
+    ll N;
+    ll M;
+    ll K;
+    vector<Point> p;
+    vvi v;
+    vvi h;
+    Input(ll N_ = 30, ll M_ = 10, ll K_ = 10) : N(N_), M(M_), K(K_), p(N_), v(N_, vi(N_ - 1)), h(N_ - 1, vi(N_)) {};
+};
+
+struct Output {
+    vector<vector<char>> c;
+    vector<int> a;
+    Output(ll K, ll M) : c(K, vector<char>(M)), a(0) {};
+
+    void print() {
+        rep(i, 0, c.size()) {
+            rep(j, 0, c[i].size()) {
+                cout << c[i][j];
+                if (j == c[i].size() - 1) {
+                    cout << "\n";
+                } else {
+                    cout << " ";
+                }
+            }
+        }
+        rep(i, 0, a.size()) { cout << a[i] << "\n"; }
+    }
+};
+
+struct Map {
+    ll N;
+    vector<vector<bool>> grid;
+    vector<Point> p;
+    bool all_filled;
+    Map(ll N_, vector<Point> p_) : N(N_), grid(N_, vector<bool>(N_, false)), p(p_), all_filled(false) {}
+    void search_filled() {
+        for (ll i = 0; i < N; i++) {
+            for (ll j = 0; j < N; j++) {
+                if (!grid[i][j]) {
+                    all_filled = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    int count_not_filled() {
+        int count = 0;
+        for (ll i = 0; i < N; i++) {
+            for (ll j = 0; j < N; j++) {
+                if (!grid[i][j]) count++;
+            }
+        }
+        return count;
+    }
+};
+
+int calc_score(const Input& in, const Output& out, Map& mp) {
+    ll T = out.a.size();
+    if (mp.all_filled) {
+        return 3 * in.N * in.N - T;
+    }
+    int remain = mp.count_not_filled();
+    return in.N * in.N - remain;
+}
+
+void greedy_search(const Input& in, Output& out, Map& mp) {
+    int count = 0;
+    vector<Point> robots = in.p;
+    mp.grid = vector<vector<bool>>(in.N, vector<bool>(in.N, false));
+    for (auto& p : robots) mp.grid[p.x][p.y] = true;
+
+    auto is_valid = [&](ll x, ll y) { return 0 <= x && x < in.N && 0 <= y && y < in.N; };
+
+    vector<pair<int, int>> dir = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}, {0, 0}};  // UDLRS
+    vector<char> dir_c = {'U', 'D', 'L', 'R', 'S'};
+
+    while (count < 2 * in.N * in.N && !mp.all_filled) {
+        // 各指示パターンのシミュレーション結果を比較
+        int best_pattern = 0;
+        int best_new_cells = -1;
+
+        rep(pattern, 0, in.K) {
+            // このパターンを選んだ場合のシミュレーション
+            vector<Point> sim_robots = robots;
+            int new_cells = 0;
+            vector<vector<bool>> visited = mp.grid;
+
+            rep(j, 0, in.M) {
+                char move = out.c[pattern][j];
+                int k = find(dir_c.begin(), dir_c.end(), move) - dir_c.begin();
+                ll nx = sim_robots[j].x + dir[k].first;
+                ll ny = sim_robots[j].y + dir[k].second;
+
+                // 壁判定
+                if (k == 0 && (sim_robots[j].x == 0 || in.h[sim_robots[j].x - 1][sim_robots[j].y])) continue;
+                if (k == 1 && (sim_robots[j].x == in.N - 1 || in.h[sim_robots[j].x][sim_robots[j].y])) continue;
+                if (k == 2 && (sim_robots[j].y == 0 || in.v[sim_robots[j].x][sim_robots[j].y - 1])) continue;
+                if (k == 3 && (sim_robots[j].y == in.N - 1 || in.v[sim_robots[j].x][sim_robots[j].y])) continue;
+                if (!is_valid(nx, ny)) continue;
+
+                sim_robots[j].x = nx;
+                sim_robots[j].y = ny;
+                if (!visited[nx][ny]) {
+                    visited[nx][ny] = true;
+                    new_cells++;
+                }
+            }
+
+            // より多くの新しいセルを訪れるパターンを選ぶ
+            if (new_cells > best_new_cells) {
+                best_new_cells = new_cells;
+                best_pattern = pattern;
+            }
+        }
+
+        // 移動先がなくなった場合は、BFSで未訪問マスへの経路を探索
+        if (best_new_cells <= 0) {
+            // 全ロボットのBFSによる経路を格納
+            vector<vector<char>> paths(in.M);
+            vector<bool> has_path(in.M, false);
+            bool any_path_found = false;
+
+            // 各ロボットについて最短経路を探索
+            rep(j, 0, in.M) {
+                queue<pair<Point, vector<char>>> q;
+                vector<vector<bool>> visited(in.N, vector<bool>(in.N, false));
+                q.push({robots[j], {}});
+                visited[robots[j].x][robots[j].y] = true;
+
+                while (!q.empty()) {
+                    auto [current, path] = q.front();
+                    q.pop();
+
+                    // 未訪問マスを見つけた場合
+                    if (!mp.grid[current.x][current.y]) {
+                        paths[j] = path;
+                        has_path[j] = true;
+                        any_path_found = true;
+                        break;
+                    }
+
+                    // 4方向を探索
+                    rep(k, 0, 4) {  // S（止まる）は除外
+                        ll nx = current.x + dir[k].first;
+                        ll ny = current.y + dir[k].second;
+
+                        // 壁判定と有効性チェック
+                        if (!is_valid(nx, ny)) continue;
+                        if (k == 0 && (current.x == 0 || in.h[current.x - 1][current.y])) continue;
+                        if (k == 1 && (current.x == in.N - 1 || in.h[current.x][current.y])) continue;
+                        if (k == 2 && (current.y == 0 || in.v[current.x][current.y - 1])) continue;
+                        if (k == 3 && (current.y == in.N - 1 || in.v[current.x][current.y])) continue;
+                        if (visited[nx][ny]) continue;
+
+                        vector<char> new_path = path;
+                        new_path.push_back(dir_c[k]);
+                        q.push({{nx, ny}, new_path});
+                        visited[nx][ny] = true;
+                    }
+                }
+            }
+
+            // 経路が見つからなかった場合は終了
+            if (!any_path_found) {
+                break;
+            }
+
+            // 最短経路を持つロボットを見つける
+            int min_path_length = INT_MAX;
+            int best_robot = -1;
+
+            rep(j, 0, in.M) {
+                if (has_path[j] && (int)paths[j].size() < min_path_length) {
+                    min_path_length = paths[j].size();
+                    best_robot = j;
+                }
+            }
+
+            if (best_robot == -1) break;  // 経路が見つからない場合
+
+            // 最短経路を持つロボットの経路を復元して移動
+            for (int step = 0; step < min_path_length; step++) {
+                // 最短経路を持つロボットの移動方向
+                char target_move = paths[best_robot][step];
+
+                // この移動方向を実現する最適なパターンを選択
+                int best_pattern_step = -1;
+
+                // まず、目標のロボットが正しく移動できるパターンを見つける
+                rep(pattern, 0, in.K) {
+                    if (out.c[pattern][best_robot] == target_move) {
+                        best_pattern_step = pattern;
+                        break;
+                    }
+                }
+
+                // 適切なパターンが見つからなかった場合の対応
+                if (best_pattern_step == -1) {
+                    // ランダムに選択するか、特別なパターンを用意しておく
+                    best_pattern_step = rand() % in.K;
+                }
+
+                // 選択したパターンを追加
+                out.a.push_back(best_pattern_step);
+
+                // 実際に移動
+                rep(j, 0, in.M) {
+                    char move = out.c[best_pattern_step][j];
+                    int k = find(dir_c.begin(), dir_c.end(), move) - dir_c.begin();
+                    ll nx = robots[j].x + dir[k].first;
+                    ll ny = robots[j].y + dir[k].second;
+
+                    // 壁判定
+                    if (k == 0 && (robots[j].x == 0 || in.h[robots[j].x - 1][robots[j].y])) continue;
+                    if (k == 1 && (robots[j].x == in.N - 1 || in.h[robots[j].x][robots[j].y])) continue;
+                    if (k == 2 && (robots[j].y == 0 || in.v[robots[j].x][robots[j].y - 1])) continue;
+                    if (k == 3 && (robots[j].y == in.N - 1 || in.v[robots[j].x][robots[j].y])) continue;
+                    if (!is_valid(nx, ny)) continue;
+
+                    robots[j].x = nx;
+                    robots[j].y = ny;
+                    mp.grid[nx][ny] = true;
+                }
+
+                // 全マス埋まったか判定
+                mp.all_filled = true;
+                rep(i, 0, in.N) rep(j, 0, in.N) if (!mp.grid[i][j]) mp.all_filled = false;
+                if (mp.all_filled) break;
+
+                count++;
+                if (count >= 2 * in.N * in.N) break;
+            }
+
+            // 経路に沿った移動が終了したら次のイテレーションへ
+            continue;
+        }
+
+        // 通常の移動（新しいマスを訪問できる場合）
+        out.a.push_back(best_pattern);
+
+        rep(j, 0, in.M) {
+            char move = out.c[best_pattern][j];
+            int k = find(dir_c.begin(), dir_c.end(), move) - dir_c.begin();
+            ll nx = robots[j].x + dir[k].first;
+            ll ny = robots[j].y + dir[k].second;
+
+            if (k == 0 && (robots[j].x == 0 || in.h[robots[j].x - 1][robots[j].y])) continue;
+            if (k == 1 && (robots[j].x == in.N - 1 || in.h[robots[j].x][robots[j].y])) continue;
+            if (k == 2 && (robots[j].y == 0 || in.v[robots[j].x][robots[j].y - 1])) continue;
+            if (k == 3 && (robots[j].y == in.N - 1 || in.v[robots[j].x][robots[j].y])) continue;
+            if (!is_valid(nx, ny)) continue;
+
+            robots[j].x = nx;
+            robots[j].y = ny;
+            mp.grid[nx][ny] = true;
+        }
+
+        // 全マス埋まったか判定
+        mp.all_filled = true;
+        rep(i, 0, in.N) rep(j, 0, in.N) if (!mp.grid[i][j]) mp.all_filled = false;
+
+        count++;
+    }
+}
+
+// パターンの有効性を評価する関数（高速化版）
+double evaluate_patterns(const Input& in, const Output& out) {
+    double total_score = 0;
+    int num_trials = 2;  // 5→2に削減
+
+    for (int trial = 0; trial < num_trials; trial++) {
+        Map mp(in.N, in.p);
+        vector<Point> robots = in.p;
+        mp.grid = vector<vector<bool>>(in.N, vector<bool>(in.N, false));
+        for (auto& p : robots) mp.grid[p.x][p.y] = true;
+
+        int visited_cells = in.M;  // 初期位置のセル数
+        int max_steps = 15;        // 50→15に大幅削減
+
+        for (int step = 0; step < max_steps; step++) {
+            // 各パターンを試して最も良いものを選ぶ
+            int best_pattern = 0;
+            int best_new_cells = -1;
+
+            rep(pattern, 0, in.K) {
+                vector<Point> sim_robots = robots;
+                int new_cells = 0;
+                vector<vector<bool>> sim_grid = mp.grid;
+
+                rep(j, 0, in.M) {
+                    char move = out.c[pattern][j];
+                    int k = 0;
+                    if (move == 'U')
+                        k = 0;
+                    else if (move == 'D')
+                        k = 1;
+                    else if (move == 'L')
+                        k = 2;
+                    else if (move == 'R')
+                        k = 3;
+                    else
+                        k = 4;
+
+                    vector<pair<int, int>> dir = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}, {0, 0}};  // UDLRS
+                    ll nx = sim_robots[j].x + dir[k].first;
+                    ll ny = sim_robots[j].y + dir[k].second;
+
+                    // 壁判定
+                    if (k == 0 && (sim_robots[j].x == 0 || in.h[sim_robots[j].x - 1][sim_robots[j].y])) continue;
+                    if (k == 1 && (sim_robots[j].x == in.N - 1 || in.h[sim_robots[j].x][sim_robots[j].y])) continue;
+                    if (k == 2 && (sim_robots[j].y == 0 || in.v[sim_robots[j].x][sim_robots[j].y - 1])) continue;
+                    if (k == 3 && (sim_robots[j].y == in.N - 1 || in.v[sim_robots[j].x][sim_robots[j].y])) continue;
+                    if (!(0 <= nx && nx < in.N && 0 <= ny && ny < in.N)) continue;
+
+                    sim_robots[j].x = nx;
+                    sim_robots[j].y = ny;
+                    if (!sim_grid[nx][ny]) {
+                        sim_grid[nx][ny] = true;
+                        new_cells++;
+                    }
+                }
+
+                if (new_cells > best_new_cells) {
+                    best_new_cells = new_cells;
+                    best_pattern = pattern;
+                }
+            }
+
+            if (best_new_cells <= 0) break;
+
+            // 最良パターンで実際に移動
+            vector<pair<int, int>> dir = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}, {0, 0}};  // UDLRS
+            vector<char> dir_c = {'U', 'D', 'L', 'R', 'S'};
+
+            rep(j, 0, in.M) {
+                char move = out.c[best_pattern][j];
+                int k = find(dir_c.begin(), dir_c.end(), move) - dir_c.begin();
+                ll nx = robots[j].x + dir[k].first;
+                ll ny = robots[j].y + dir[k].second;
+
+                if (k == 0 && (robots[j].x == 0 || in.h[robots[j].x - 1][robots[j].y])) continue;
+                if (k == 1 && (robots[j].x == in.N - 1 || in.h[robots[j].x][robots[j].y])) continue;
+                if (k == 2 && (robots[j].y == 0 || in.v[robots[j].x][robots[j].y - 1])) continue;
+                if (k == 3 && (robots[j].y == in.N - 1 || in.v[robots[j].x][robots[j].y])) continue;
+                if (!(0 <= nx && nx < in.N && 0 <= ny && ny < in.N)) continue;
+
+                robots[j].x = nx;
+                robots[j].y = ny;
+                if (!mp.grid[nx][ny]) {
+                    mp.grid[nx][ny] = true;
+                    visited_cells++;
+                }
+            }
+        }
+
+        // 訪問したセルの割合をスコアとする
+        total_score += (double)visited_cells / (in.N * in.N);
+    }
+
+    return total_score / num_trials;
+}
+
+void optimize_commands_with_sa(Input& in, Output& out) {
+    vector<char> put = {'U', 'D', 'L', 'R', 'S'};
+
+    // c[0]からc[3]は既に設定済みなので変更しない
+    // c[4]以降のパターンのみ初期化
+
+    // 対角線パターンなど追加（c[4]以降のみ）
+    if (in.K > 4) rep(j, 0, in.M) out.c[4][j] = (j % 2 == 0) ? 'U' : 'R';
+    if (in.K > 5) rep(j, 0, in.M) out.c[5][j] = (j % 2 == 0) ? 'D' : 'R';
+    if (in.K > 6) rep(j, 0, in.M) out.c[6][j] = (j % 2 == 0) ? 'U' : 'L';
+    if (in.K > 7) rep(j, 0, in.M) out.c[7][j] = (j % 2 == 0) ? 'D' : 'L';
+
+    // 残りはランダム初期化（c[8]以降）
+    rep(i, 8, in.K) rep(j, 0, in.M) out.c[i][j] = put[rand() % 5];
+
+    // 最良の状態を保持
+    auto best_c = out.c;
+    double best_score = evaluate_patterns(in, out);
+
+    // 時間ベースの焼きなまし法（高速化版）
+    auto start = std::chrono::steady_clock::now();
+    const double TIME_LIMIT = 1.5;           // 秒
+    const double INITIAL_TEMPERATURE = 5.0;  // 10.0→5.0に削減
+    const double FINAL_TEMPERATURE = 0.01;
+
+    int iterations = 0;  // イテレーション数をカウント
+
+    while (true) {
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() / 1000.0;
+        if (elapsed > TIME_LIMIT) break;
+
+        // 温度を線形に減少させる
+        double temperature = INITIAL_TEMPERATURE - (INITIAL_TEMPERATURE - FINAL_TEMPERATURE) * (elapsed / TIME_LIMIT);
+
+        // 現在の状態を保存
+        auto current_c = out.c;
+
+        // 近傍操作: パターンの一部をランダムに変更（c[4]以降のみ）
+        if (in.K > 4) {
+            int pattern = 4 + rand() % (in.K - 4);                   // c[4]以降のみ選択
+            int num_changes = 1 + rand() % min(3, (int)(in.M / 3));  // 変更数を制限（高速化）
+
+            for (int i = 0; i < num_changes; i++) {
+                int robot = rand() % in.M;
+                out.c[pattern][robot] = put[rand() % 5];
+            }
+
+            // 新しい状態を評価
+            double new_score = evaluate_patterns(in, out);
+            double delta = new_score - best_score;
+
+            // スコアが改善したか、確率的に受理
+            if (delta > 0 || exp(delta / temperature) > (double)rand() / RAND_MAX) {
+                if (delta > 0) {
+                    best_c = out.c;
+                    best_score = new_score;
+                }
+            } else {
+                out.c = current_c;
+            }
+            iterations++;
+        }
+    }
+
+    out.c = best_c;
+    // デバッグ情報（必要に応じてコメントアウト）
+    cerr << "Iterations: " << iterations << ", Best score: " << best_score << endl;
+}
+
+// BFS反映済み焼きなまし
+int main() {
+    int seed = 2;
+    std::ostringstream oss;
+    oss << std::setw(4) << std::setfill('0') << seed;
+    string input_filename = "in/" + oss.str() + ".txt";
+    string output_filename = "out/f2_" + oss.str() + ".txt";
+    freopen(input_filename.c_str(), "r", stdin);
+    freopen(output_filename.c_str(), "w", stdout);
+    ll N, M, K;
+    cin >> N >> M >> K;
+    Input in(N, M, K);
+    rep(i, 0, M) cin >> in.p[i].x >> in.p[i].y;
+    rep(i, 0, N) {
+        string S;
+        cin >> S;
+        rep(j, 0, N - 1) { S[j] == '1' ? in.v[i][j] = 1 : in.v[i][j] = 0; }
+    }
+    rep(i, 0, N - 1) {
+        string S;
+        cin >> S;
+        rep(j, 0, N) { S[j] == '1' ? in.h[i][j] = 1 : in.h[i][j] = 0; }
+    }
+
+    Output out(K, M);
+    vector<char> put = {'U', 'D', 'L', 'R'};
+    rep(i, 0, 4) rep(j, 0, M) out.c[i][j] = put[i];
+
+    // 焼きなましで指示パターンを最適化（c[4]以降のみ）
+    optimize_commands_with_sa(in, out);
+
+    Map mp(N, in.p);
+    greedy_search(in, out, mp);
+    out.print();
+}
