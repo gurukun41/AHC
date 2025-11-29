@@ -111,6 +111,14 @@ namespace rnd {
             swap(a[i], a[get(i + 1)]);
         }
     }
+
+    inline void init(uint32_t seed) {
+        X2 = seed;
+        X3 = 0xcafef00d ^ (seed << 17); // 適当に混ぜる
+        C_X1 = 0xd15ea5e5ULL << 32 | (23456 ^ seed);
+        // ウォームアップ（最初の数回を捨てる）
+        for(int i=0; i<8; ++i) next();
+    }
 }
 
 struct Input {
@@ -392,6 +400,7 @@ struct State {
     }
 };
 
+
 // トーラス上の重心を計算する関数
 pd calc_torus_centroid(const vector<int>& members, const vector<pd>& ps, double L) {
     if (members.empty()) return {0, 0};
@@ -437,90 +446,88 @@ long long dist_sq_torus(pd p1, pd p2, double L) {
     return (long long)((dx * dx + dy * dy) * 100); 
 }
 
-// Constrained K-meansの実装
-void perform_constrained_kmeans(vector<ClusterGroup> &groups, Input &input, vector<bool> &used) {
+
+// 指定した時刻 t における全原子の位置を計算して返す
+vector<pd> get_positions_at_time(const Input &input, ll t) {
+    vector<pd> current_ps(input.N);
+    for(int i = 0; i < input.N; ++i) {
+        double px = input.ps[i].x + input.vs[i].x * t;
+        double py = input.ps[i].y + input.vs[i].y * t;
+        
+        // トーラス処理
+        px = fmod(px, input.L);
+        if(px < 0) px += input.L;
+        py = fmod(py, input.L);
+        if(py < 0) py += input.L;
+        
+        current_ps[i] = {px, py};
+    }
+    return current_ps;
+}
+
+// 戻り値: {最小コスト, 割り当て配列(index -> group_id)}
+pair<long long, vector<int>> run_kmeans_on_positions(const Input &input, const vector<pd> &current_ps) {
     int N = input.N;
     int M = input.M;
     int K = input.K;
     double L = input.L;
     
     // 1. K-means++ 初期化
-    // 最初の1個をランダムに選ぶ
     vector<pd> centroids;
-    centroids.push_back(input.ps[rand() % N]);
+    centroids.push_back(current_ps[rnd::get(N)]);
     
-    // 残りのM-1個を、既存の重心から遠い場所から選ぶ
     while(centroids.size() < M) {
         vector<double> min_dists(N, 1e18);
         double sum_sq_dist = 0;
-        
         for(int i=0; i<N; ++i) {
             for(const auto& c : centroids) {
-                double dx = fabs(input.ps[i].x - c.x);
+                double dx = fabs(current_ps[i].x - c.x);
                 dx = min(dx, L - dx);
-                double dy = fabs(input.ps[i].y - c.y);
+                double dy = fabs(current_ps[i].y - c.y);
                 dy = min(dy, L - dy);
-                double d = dx*dx + dy*dy;
-                min_dists[i] = min(min_dists[i], d);
+                min_dists[i] = min(min_dists[i], dx*dx + dy*dy);
             }
             sum_sq_dist += min_dists[i];
         }
         
-        // 確率的に選ぶ（距離の2乗に比例）
-        double r = (double)rand() / RAND_MAX * sum_sq_dist;
+        size_t pre_size = centroids.size();
+        double r = rnd::nextf() * sum_sq_dist;
         for(int i=0; i<N; ++i) {
             r -= min_dists[i];
             if(r <= 0) {
-                centroids.push_back(input.ps[i]);
+                centroids.push_back(current_ps[i]);
                 break;
             }
         }
-        // 数値誤差で選ばれなかった場合のフォールバック
-        if(centroids.size() < centroids.size() + 1) { // 直前のループで追加されなかったら
-             centroids.push_back(input.ps[rand() % N]);
-        }
+        if(centroids.size() == pre_size) centroids.push_back(current_ps[rnd::get(N)]);
     }
 
     // 2. K-means 反復
-    // 反復回数（時間は十分あるので多めでOK）
-    int max_iter = 20; 
-    
+    int max_iter = 10; // 探索回数を増やすため反復は少し減らしてもOK
     vector<int> assignment(N);
+    long long final_cost = -1;
     
     for(int iter=0; iter<max_iter; ++iter) {
-        // --- 割り当てステップ (Min-Cost Flow) ---
-        // グラフ構築: S -> Atoms -> Groups -> T
-        // ノード番号: S=0, Atoms=1~N, Groups=N+1~N+M, T=N+M+1
-        int S = 0;
-        int T = N + M + 1;
+        int S = 0, T = N + M + 1;
         atcoder::mcf_graph<long long, long long> g(T + 1);
         
-        // S -> Atoms
-        for(int i=0; i<N; ++i) {
-            g.add_edge(S, i + 1, 1, 0);
-        }
+        for(int i=0; i<N; ++i) g.add_edge(S, i + 1, 1, 0);
         
-        // Atoms -> Groups
         for(int i=0; i<N; ++i) {
             for(int j=0; j<M; ++j) {
-                long long cost = dist_sq_torus(input.ps[i], centroids[j], L);
+                long long cost = dist_sq_torus(current_ps[i], centroids[j], L);
                 g.add_edge(i + 1, N + 1 + j, 1, cost);
             }
         }
         
-        // Groups -> T
-        for(int j=0; j<M; ++j) {
-            g.add_edge(N + 1 + j, T, K, 0);
-        }
+        for(int j=0; j<M; ++j) g.add_edge(N + 1 + j, T, K, 0);
         
-        // フローを流す (流量N)
         auto result = g.flow(S, T, N);
+        final_cost = result.second; // 最小費用流のコストがそのままクラスタリングの良さになる
         
-        // 結果の取得
         vector<vector<int>> new_clusters(M);
         auto edges = g.edges();
         for(const auto& e : edges) {
-            // Atoms -> Groups のエッジで、流れたものを探す
             if(e.from >= 1 && e.from <= N && e.to >= N + 1 && e.to <= N + M && e.flow > 0) {
                 int atom_idx = e.from - 1;
                 int group_idx = e.to - (N + 1);
@@ -529,44 +536,19 @@ void perform_constrained_kmeans(vector<ClusterGroup> &groups, Input &input, vect
             }
         }
         
-        // --- 更新ステップ ---
-        // 重心の再計算
         bool changed = false;
         for(int j=0; j<M; ++j) {
-            if(new_clusters[j].empty()) continue; // 基本ありえないが念のため
-            pd new_c = calc_torus_centroid(new_clusters[j], input.ps, L);
-            
-            // 重心が大きく動いたかチェック（収束判定用だが、今回は固定回数回すので簡易的に）
-            if(abs(new_c.x - centroids[j].x) > 1e-3 || abs(new_c.y - centroids[j].y) > 1e-3) {
-                changed = true;
-            }
+            if(new_clusters[j].empty()) continue;
+            pd new_c = calc_torus_centroid(new_clusters[j], current_ps, L);
+            if(abs(new_c.x - centroids[j].x) > 1e-3 || abs(new_c.y - centroids[j].y) > 1e-3) changed = true;
             centroids[j] = new_c;
         }
-        
-        // 収束したら早期終了
         if(!changed) break;
     }
-
-    // 3. 結果をClusterGroupに反映
-    // used配列も更新
-    fill(used.begin(), used.end(), true); // 全て使うことになる
-    for(int i=0; i<N; ++i) {
-        int g_idx = assignment[i];
-        groups[g_idx].add_cluster(i, input.K); // ここではsize=1のatomを追加していくが、ClusterGroupのロジックに合わせて修正
-    }
     
-    // ClusterGroupの実装に合わせて、add_clusterは原子1個(size=1)を追加すると解釈
-    // 既存のgroupsをクリアしてから入れる
-    for(int j=0; j<M; ++j) {
-        groups[j].cluster_indices.clear();
-        groups[j].current_size = 0;
-    }
-    
-    for(int i=0; i<N; ++i) {
-        int g_idx = assignment[i];
-        groups[g_idx].add_cluster(i, 1); // 原子1個なのでサイズ1
-    }
+    return {final_cost, assignment};
 }
+
 
 void solve() {
     Input input;
@@ -575,48 +557,76 @@ void solve() {
 
     State state(input, output);
     
-    // 修正: used配列をここで管理
     vector<bool> used(input.N, false);
     vector<ClusterGroup> groups(input.M, ClusterGroup(input));
     
-    // K-means でグループ分けを実行（used配列とgroupsを一括で更新）
-    perform_constrained_kmeans(groups, input, used);
+    // --- 1. 時間探索パート（変更なし） ---
+    long long best_cost = -1; 
+    vector<int> best_assignment;
+    int best_time = 0;
 
-    // デバッグ: 全原子が割り振られたか確認
-    int used_count = 0;
-    for(bool u : used) if(u) used_count++;
-    if(used_count != input.N) {
-        cerr << "Warning: Not all atoms are assigned to groups!" << endl;
+    // 粗い刻み幅で探索（例: 50刻み）
+    int time_step = 50; 
+    for(int t = 0; t < input.T; t += time_step) {
+        vector<pd> ps_at_t = get_positions_at_time(input, t);
+        pair<long long, vector<int>> result = run_kmeans_on_positions(input, ps_at_t);
+        
+        if (best_cost == -1 || result.first < best_cost) {
+            best_cost = result.first;
+            best_assignment = result.second;
+            best_time = t;
+        }
+    }
+    
+    cerr << "Best clustering found at time: " << best_time << " with cost: " << best_cost << endl;
+
+    // --- 2. グループ割り当ての適用 ---
+    // (ここで groups を構築)
+    fill(used.begin(), used.end(), true);
+    for(int i=0; i<input.N; ++i) {
+        int g_idx = best_assignment[i];
+        groups[g_idx].add_cluster(i, 1);
     }
 
-    // 時間刻み（少し細かく見る）
-    ll dt = 10; 
+    // --- 3. 実行フェーズ（ここを大幅修正） ---
+
+    // 重要: 計算された「ベストな時刻」まで一気に進める
+    // ギリギリだと結合順序などで溢れる可能性があるので、念のため少し余裕を見るなら -10 くらいしても良いが、
+    // K-meansはその瞬間をターゲットにしているので、ジャストでOK。
+    if (best_time > 0) {
+        state.advance_to(best_time);
+    }
 
     // メインループ
+    // 基本的に best_time でほとんどの結合が終わるはずですが、
+    // わずかに届かない場合などのために、Tまで少しずつ進める処理は残します
+    ll dt = 1; // 結合フェーズに入ったら時間は細かく進める
+
     while(!state.is_goal()) {
-        // 現在の時刻で、結合できるペアがある限り結合し続ける
-        bool merged_any = false;
         
+        // 全グループに対して結合を試行
         for(ll g = 0; g < input.M; g++) {
             ClusterGroup &group = groups[g];
             
-            // このグループ内で結合を実行
-            // 1ステップで複数回結合してもよいのでループさせる
+            // 可能な限り結合を繰り返す
             while(true) {
                 double min_dist = 1e18;
                 ll best_i = -1, best_j = -1;
 
-                // グループ内の総当たりで最小コストのペアを探す
+                // グループ内で結合可能なペアを探索
                 for (ll i_idx : group.cluster_indices) {
-                    if (!state.clusters[i_idx].alive) continue; // 死んでいるクラスタは無視
+                    if (!state.clusters[i_idx].alive) continue;
                     
                     for (ll j_idx : group.cluster_indices) {
                         if (i_idx >= j_idx) continue;
                         if (!state.clusters[j_idx].alive) continue;
 
-                        // マージ可能かチェック（サイズ超過など）
                         if (!state.clusters[i_idx].can_merge(state.clusters[j_idx])) continue;
 
+                        // ここで「距離制限」を設けても良い
+                        // 例: if (dist > 5000) continue; 
+                        // 今回はベスト時刻に来ているはずなので、無条件で近い順に繋ぐ
+                        
                         double dist = state.clusters[i_idx].gdistance(state.clusters[j_idx]);
                         if (dist < min_dist) {
                             min_dist = dist;
@@ -626,12 +636,9 @@ void solve() {
                     }
                 }
 
-                // 見つかったペアがあれば結合
-                // ここで閾値を設けて「遠すぎるなら今は結合しない」とするとスコアが上がるが、
-                // まずは完成させるために無条件で結合する
                 if (best_i != -1 && best_j != -1) {
+                    // 結合実行（時刻は現在の state.current_time）
                     state.merge_clusters(best_i, best_j, state.current_time);
-                    merged_any = true;
                 } else {
                     // このグループではもう結合できるペアがない
                     break;
@@ -640,13 +647,9 @@ void solve() {
         }
         
         // 時間切れチェック
-        if (state.current_time + dt >= input.T) {
-            // 時間が足りないので強制的に最後の処理をするか、諦める
-            // 今回はループを抜けて終了
-            break;
-        }
-
-        // 時間を進める
+        if (state.current_time + dt >= input.T) break;
+        
+        // 時間を少し進める
         state.advance_to(state.current_time + dt);
     }
 
@@ -655,5 +658,6 @@ void solve() {
 
 
 int main(){
+    rnd::init(42); // 乱数初期化
     solve();
 }
