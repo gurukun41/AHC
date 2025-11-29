@@ -24,10 +24,10 @@ using vpd = vector<pd>;                                  // double型のペア�
 #define x first
 #define y second
 
-// get_time
+// --- Utility Functions ---
+
 double get_time() {
     double time;
-
 #ifdef LOCAL
     struct timespec ts;
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
@@ -37,20 +37,10 @@ double get_time() {
     auto now = system_clock::now();
     time = duration_cast<nanoseconds>(now.time_since_epoch()).count() * 1e-9;
 #endif
-
     static double START = -1.0;
-    if (START == -1.0) {
-        START = time;
-    }
-
-#ifdef LOCAL
-    return (time - START) * 1.0;
-#else
+    if (START == -1.0) START = time;
     return time - START;
-#endif
 }
-
-// rnd
 
 namespace rnd {
     static uint32_t X2 = 12345;
@@ -60,419 +50,373 @@ namespace rnd {
     inline uint32_t next() {
         uint64_t work = (uint64_t)X3 * 3487286589ULL;
         uint32_t ret = (X3 ^ X2) + ((uint32_t)C_X1 ^ (uint32_t)(work >> 32));
-        X3 = X2;
-        X2 = (uint32_t)C_X1;
-        C_X1 = work + (C_X1 >> 32);
+        X3 = X2; X2 = (uint32_t)C_X1; C_X1 = work + (C_X1 >> 32);
         return ret;
     }
-
-    inline uint64_t next64() {
-        return (uint64_t)next() << 32 | (uint64_t)next();
-    }
-
     inline double nextf() {
         uint64_t v = 0x3ff0000000000000ULL | ((uint64_t)next() << 20);
-        double d;
-        memcpy(&d, &v, sizeof(double));
-        return d - 1.0;
+        double d; memcpy(&d, &v, sizeof(double)); return d - 1.0;
     }
-
-    inline size_t get(size_t n) {
-        assert(0 < n && n <= UINT32_MAX);
-        return (size_t)((uint64_t)next() * n >> 32);
+    inline size_t get(size_t n) { return (size_t)((uint64_t)next() * n >> 32); }
+    inline size_t range(size_t a, size_t b) { return get(b - a) + a; }
+    template<typename T> void shuffle(vector<T>& a) {
+        for (size_t i = a.size() - 1; i > 0; --i) swap(a[i], a[get(i + 1)]);
     }
-
-    inline size_t range(size_t a, size_t b) {
-        assert(a < b);
-        return get(b - a) + a;
-    }
-
-    inline size_t range_skip(size_t a, size_t b, size_t skip) {
-        assert(a <= skip && skip < b);
-        size_t n = range(a, b - 1);
-        return n + (skip <= n);
-    }
-
-    inline ll rangei(ll a, ll b) {
-        assert(a < b);
-        return (ll)get((size_t)(b - a)) + a;
-    }
-
-    template<typename T>
-    void shuffle(vector<T>& a) {
-        for (size_t i = a.size() - 1; i > 0; --i) {
-            swap(a[i], a[get(i + 1)]);
-        }
-    }
-    
-    template<typename T, size_t N>
-    void shuffle(T (&a)[N]) {
-        for (size_t i = N - 1; i > 0; --i) {
-            swap(a[i], a[get(i + 1)]);
-        }
-    }
-
     inline void init(uint32_t seed) {
         X2 = seed;
-        X3 = 0xcafef00d ^ (seed << 17); // 適当に混ぜる
+        X3 = 0xcafef00d ^ (seed << 17);
         C_X1 = 0xd15ea5e5ULL << 32 | (23456 ^ seed);
-        // ウォームアップ（最初の数回を捨てる）
         for(int i=0; i<8; ++i) next();
     }
 }
 
+// --- Problem Structures ---
+
 struct Input {
-    ll N;
-    ll T;
-    ll M;
-    ll K;
-    ll L;
-    vpd ps;
-    vpd vs;
-    Input() {}
+    ll N, T, M, K, L;
+    vector<pd> ps, vs;
     void read() {
         cin >> N >> T >> M >> K >> L;
-        ps.resize(N);
-        vs.resize(N);
-        rep(i, 0, N) {
-            cin >> ps[i].x >> ps[i].y >> vs[i].x >> vs[i].y;
-        }
+        ps.resize(N); vs.resize(N);
+        rep(i, 0, N) cin >> ps[i].x >> ps[i].y >> vs[i].x >> vs[i].y;
     }
 };
 
 struct Output {
     vector<tuple<ll, ll, ll>> merges;
-    Input &input;
-    Output(Input &input) : input(input) {
-        merges.resize(0);
-    }
-
-    bool check_size() {
-        return merges.size() == (input.N - input.M);
-    }
-
-    void push(ll t, ll a, ll b) {
-        merges.push_back(make_tuple(t, a, b));
-    }
-
+    void push(ll t, ll a, ll b) { merges.emplace_back(t, a, b); }
     void print() {
-        cerr << "Total merges: " << merges.size() << "\n";
-        cerr << "Expected merges: " << (input.N - input.M) << "\n";
-        assert(check_size());
-        for (auto [t, a, b] : merges) {
-            cout << t << " " << a << " " << b << "\n";
-        }
-    }
-
-};
-
-struct Atom {
-    ll id;
-    pd p;
-    pd v;
-    // デフォルトコンストラクタを追加
-    Atom() : id(0), p({0, 0}), v({0, 0}) {}
-    Atom(ll id, pd p, pd v) : id(id), p(p), v(v) {}
-
-    void move(ll t, Input &input) {
-        p.x = fmod(p.x + v.x * t, input.L);
-        if(p.x < 0) p.x += input.L;
-        p.y = fmod(p.y + v.y * t, input.L);
-        if(p.y < 0) p.y += input.L;
-    }
-
-    void change_velocity(pd new_v) {
-        v = new_v;
+        // 時刻順に出力する必要があるためソート
+        sort(all(merges));
+        for (auto [t, a, b] : merges) cout << t << " " << a << " " << b << "\n";
     }
 };
 
+// --- Physics Logic for Tree Simulation ---
 
-struct Cluster {
-    vector<Atom> atoms;
-    ll size;
-    Input &input;
-    bool alive;
-    pd v;
-    pd gp;  // 重心位置
-
-    Cluster(Atom atom, Input &input) : input(input) {
-        atoms.resize(0);
-        atoms.push_back(atom);
-        size = 1;
-        alive = true;
-        v = atom.v;
-        gp = atom.p;
-    }
-
-    bool can_merge(const Cluster &other) const {
-        if (!alive || !other.alive) return false;
-        return (size + other.size) <= input.K;
-    }
-
-    double gdistance(const Cluster &other) const {
-        if(!can_merge(other)) return 1e18;
-        double dx = fabs(gp.x - other.gp.x);
-        dx = min(dx, input.L - dx);
-        double dy = fabs(gp.y - other.gp.y);
-        dy = min(dy, input.L - dy);
-        return sqrt(dx * dx + dy * dy);
-    }
-
-    double distance(const Cluster &other, ll &id1, ll &id2) const {
-        if(!can_merge(other)) return 1e18;
-        double min_dist = 1e18;
-        for (const auto& atom1 : atoms) {
-            for (const auto& atom2 : other.atoms) {
-                double dx = fabs(atom1.p.x - atom2.p.x);
-                dx = min(dx, input.L - dx);
-                double dy = fabs(atom1.p.y - atom2.p.y);
-                dy = min(dy, input.L - dy);
-                double dist = sqrt(dx * dx + dy * dy);
-                if (dist < min_dist) {
-                    min_dist = dist;
-                    id1 = atom1.id;
-                    id2 = atom2.id;
-                }
-            }
-        }
-        return min_dist;
-    }
-
-    bool merge(Cluster &other) {
-        if (!can_merge(other)) return false;
-        for (auto atom : other.atoms) {
-            atoms.push_back(atom);
-        }
-
-        double new_vx = (size * v.x + other.size * other.v.x) / (size + other.size);
-        double new_vy = (size * v.y + other.size * other.v.y) / (size + other.size);
-        for (auto &atom : atoms) {
-            atom.change_velocity({new_vx, new_vy});
-        }
-        v = {new_vx, new_vy};
-
-        double new_gpx = (size * gp.x + other.size * other.gp.x) / (size + other.size);
-        new_gpx = fmod(new_gpx, input.L);
-        if(new_gpx < 0) new_gpx += input.L;
-        double new_gpy = (size * gp.y + other.size * other.gp.y) / (size + other.size);
-        new_gpy = fmod(new_gpy, input.L);
-        if(new_gpy < 0) new_gpy += input.L;
-        gp = {new_gpx, new_gpy};
-
-        size += other.size;
-        other.alive = false;
-        return true;
-    }
-
-    void move(ll t = 1) {
-        if (!alive) return;
-        for (auto &atom : atoms) {
-            atom.move(t, input);
-        }
-        gp.x = fmod(gp.x + v.x * t, input.L);
-        if(gp.x < 0) gp.x += input.L;
-        gp.y = fmod(gp.y + v.y * t, input.L);
-        if(gp.y < 0) gp.y += input.L;
-    }
+// 物理状態のみを持つ軽量構造体
+struct ClusterState {
+    pd p; // 位置
+    pd v; // 速度
+    int size; // 原子数
+    ll t_update; // 位置pが有効な時刻
+    int id; // 代表ID（出力用）
 };
 
-struct ClusterGroup {
-    vector<ll> cluster_indices;
-    ll target_size;
-    ll current_size;
-    Input &input;
-    
-    ClusterGroup(Input &input) : input(input), target_size(input.K), current_size(0) {
-        cluster_indices.resize(0);
-    }
-    
-    bool can_add(ll size) const {
-        return (current_size + size) <= target_size;
-    }
-    
-    void add_cluster(ll idx, ll size) {
-        cluster_indices.push_back(idx);
-        current_size += size;
-    }
-    
-    bool is_complete() const {
-        return current_size == target_size;
-    }
-};
-
-struct State {
-    vector<Cluster> clusters;
-    ll current_time;
-    Input &input;
-    Output &output;
-
-    State(Input &input, Output &output) : input(input), output(output), current_time(0) {
-        clusters.reserve(input.N);
-        for (int i = 0; i < input.N; i++) {
-            clusters.emplace_back(Atom(i, input.ps[i], input.vs[i]), input);
-        }
-    }
-
-    // 生きているクラスタの数を取得
-    ll count_alive_clusters() const {
-        ll cnt = 0;
-        for (const auto& cluster : clusters) {
-            if (cluster.alive) cnt++;
-        }
-        return cnt;
-    }
-
-    // 目標に到達しているかチェック
-    bool is_goal() const {
-        return count_alive_clusters() == input.M;
-    }
-
-    // 2つのクラスタを結合（時刻tで）
-    bool merge_clusters(ll idx1, ll idx2, ll t) {
-        if (idx1 == idx2) return false;
-        if (!clusters[idx1].alive || !clusters[idx2].alive) return false;
-        if (t < current_time) return false;
-        
-        // 時刻tまで移動
-        ll dt = t - current_time;
-        if (dt > 0) {
-            move_all(dt);
-        }
-        
-        // 結合する原子のIDを取得
-        ll atom_id1, atom_id2;
-        clusters[idx1].distance(clusters[idx2], atom_id1, atom_id2);
-        
-        // 結合実行
-        if (clusters[idx1].merge(clusters[idx2])) {
-            output.push(t, atom_id1, atom_id2);
-            return true;
-        }
-        return false;
-    }
-
-    // 全クラスタを時間分移動
-    void move_all(ll dt = 1) {
-        for (auto &cluster : clusters) {
-            cluster.move(dt);
-        }
-        current_time += dt;
-    }
-
-    // 時刻tまで進める
-    void advance_to(ll t) {
-        if (t > current_time) {
-            move_all(t - current_time);
-        }
-    }
-
-    // 最も近い2つのクラスタのペアを取得（結合可能なもの）
-    pair<ll, ll> get_nearest_pair() const {
-        double min_dist = 1e18;
-        ll best_i = -1, best_j = -1;
-        
-        for (ll i = 0; i < clusters.size(); i++) {
-            if (!clusters[i].alive) continue;
-            for (ll j = i + 1; j < clusters.size(); j++) {
-                if (!clusters[j].alive) continue;
-                if (!clusters[i].can_merge(clusters[j])) continue;
-                
-                double dist = clusters[i].gdistance(clusters[j]);
-                if (dist < min_dist) {
-                    min_dist = dist;
-                    best_i = i;
-                    best_j = j;
-                }
-            }
-        }
-        return {best_i, best_j};
-    }
-
-    // スコア評価用：総結合コストの概算（既に出力されたもの）
-    ll calculate_current_cost() const {
-        // output.mergesから計算するか、別途管理
-        return 0; // TODO: 実装
-    }
-
-    // デバッグ用
-    void print_status() const {
-        cerr << "Time: " << current_time << ", Alive clusters: " << count_alive_clusters() << endl;
-    }
-};
-
-
-// トーラス上の重心を計算する関数
-pd calc_torus_centroid(const vector<int>& members, const vector<pd>& ps, double L) {
-    if (members.empty()) return {0, 0};
-    
-    // 最初の点を基準にする（トーラスの境界またぎ対策）
-    pd ref = ps[members[0]];
-    double sum_dx = 0;
-    double sum_dy = 0;
-    
-    for (int idx : members) {
-        double dx = ps[idx].x - ref.x;
-        double dy = ps[idx].y - ref.y;
-        
-        // 最短経路での変位に補正
-        if (dx > L / 2) dx -= L;
-        if (dx < -L / 2) dx += L;
-        if (dy > L / 2) dy -= L;
-        if (dy < -L / 2) dy += L;
-        
-        sum_dx += dx;
-        sum_dy += dy;
-    }
-    
-    double avg_x = ref.x + sum_dx / members.size();
-    double avg_y = ref.y + sum_dy / members.size();
-    
-    // 0~Lの範囲に収める
-    avg_x = fmod(avg_x, L);
-    if(avg_x < 0) avg_x += L;
-    avg_y = fmod(avg_y, L);
-    if(avg_y < 0) avg_y += L;
-    
-    return {avg_x, avg_y};
-}
-
-// 2点間のトーラス距離の2乗を返す（K-meansは2乗距離の和を最小化するため）
-long long dist_sq_torus(pd p1, pd p2, double L) {
+// トーラス上の距離計算
+double calc_dist(pd p1, pd p2, double L) {
     double dx = fabs(p1.x - p2.x);
     dx = min(dx, L - dx);
     double dy = fabs(p1.y - p2.y);
     dy = min(dy, L - dy);
-    // MCFのコストは整数である必要があるため、適当にスケーリングしてlong longにする
+    return sqrt(dx * dx + dy * dy);
+}
+
+// 時刻 t における位置を計算
+pd predict_pos(const ClusterState &c, ll t, double L) {
+    double dt = (double)(t - c.t_update);
+    double px = c.p.x + c.v.x * dt;
+    double py = c.p.y + c.v.y * dt;
+    px = fmod(px, L); if(px < 0) px += L;
+    py = fmod(py, L); if(py < 0) py += L;
+    return {px, py};
+}
+
+// マージ後の状態を計算
+ClusterState merge_states(const ClusterState &c1, const ClusterState &c2, ll t, double L) {
+    pd p1 = predict_pos(c1, t, L);
+    pd p2 = predict_pos(c2, t, L);
+    
+    double new_vx = (c1.size * c1.v.x + c2.size * c2.v.x) / (c1.size + c2.size);
+    double new_vy = (c1.size * c1.v.y + c2.size * c2.v.y) / (c1.size + c2.size);
+    
+    // 重心位置（トーラス考慮）
+    double dx = p2.x - p1.x;
+    if (dx > L / 2) dx -= L; if (dx < -L / 2) dx += L;
+    double dy = p2.y - p1.y;
+    if (dy > L / 2) dy -= L; if (dy < -L / 2) dy += L;
+    
+    double gpx = p1.x + dx * c2.size / (c1.size + c2.size);
+    double gpy = p1.y + dy * c2.size / (c1.size + c2.size);
+    
+    gpx = fmod(gpx, L); if(gpx < 0) gpx += L;
+    gpy = fmod(gpy, L); if(gpy < 0) gpy += L;
+
+    return {{gpx, gpy}, {new_vx, new_vy}, c1.size + c2.size, t, min(c1.id, c2.id)};
+}
+
+// 結合コスト計算
+ll calc_merge_cost(const ClusterState &c1, const ClusterState &c2, ll t, double L) {
+    pd p1 = predict_pos(c1, t, L);
+    pd p2 = predict_pos(c2, t, L);
+    double d = calc_dist(p1, p2, L);
+    return (ll)round(d);
+}
+
+// --- Merge Tree Optimization ---
+
+struct MergeNode {
+    int left = -1;
+    int right = -1;
+    int parent = -1;
+    int time = 0;
+    bool is_leaf = false;
+    int atom_idx = -1; // leafの場合の原子ID
+};
+
+struct GroupSolver {
+    Input &input;
+    vector<int> atom_indices; // このグループに属する原子IDのリスト
+    vector<MergeNode> tree;
+    int root;
+    int K;
+
+    GroupSolver(Input &inp, const vector<int>& atoms, int init_time) : input(inp), atom_indices(atoms) {
+        K = atom_indices.size();
+        tree.resize(2 * K - 1);
+        
+        // 完全二分木に近い形状で初期化
+        // 葉ノード: 0 ~ K-1
+        // 内部ノード: K ~ 2K-2
+        rep(i, 0, K) {
+            tree[i].is_leaf = true;
+            tree[i].atom_idx = atom_indices[i];
+        }
+        
+        // 単純なトーナメント形式で構築
+        vector<int> current_layer(K);
+        iota(all(current_layer), 0);
+        int next_id = K;
+        
+        while(current_layer.size() > 1) {
+            vector<int> next_layer;
+            for(size_t i=0; i<current_layer.size(); i+=2) {
+                if(i + 1 < current_layer.size()) {
+                    int l = current_layer[i];
+                    int r = current_layer[i+1];
+                    int p = next_id++;
+                    tree[p].left = l;
+                    tree[p].right = r;
+                    tree[p].time = init_time; // 初期時刻はK-meansで見つけたベストタイム
+                    tree[p].is_leaf = false;
+                    tree[l].parent = p;
+                    tree[r].parent = p;
+                    next_layer.push_back(p);
+                } else {
+                    next_layer.push_back(current_layer[i]);
+                }
+            }
+            current_layer = next_layer;
+        }
+        root = current_layer[0];
+    }
+
+    // ツリー全体のコストを再帰計算
+    // memo化なしでもNが小さいので高速
+    pair<double, ClusterState> evaluate(int u) {
+        if (tree[u].is_leaf) {
+            int aid = tree[u].atom_idx;
+            return {0.0, {input.ps[aid], input.vs[aid], 1, 0, aid}};
+        }
+
+        auto [cost_l, state_l] = evaluate(tree[u].left);
+        auto [cost_r, state_r] = evaluate(tree[u].right);
+
+        double my_cost = cost_l + cost_r;
+        
+        // コスト計算
+        my_cost += calc_merge_cost(state_l, state_r, tree[u].time, input.L);
+        
+        // 新しい状態
+        ClusterState my_state = merge_states(state_l, state_r, tree[u].time, input.L);
+        
+        return {my_cost, my_state};
+    }
+
+    double get_score() {
+        return evaluate(root).first;
+    }
+    
+    // Output生成用
+    void collect_merges(int u, Output &out) {
+        if (tree[u].is_leaf) return;
+        
+        collect_merges(tree[u].left, out);
+        collect_merges(tree[u].right, out);
+        
+        // このノードでのマージを出力
+        // IDを取得するために再計算が必要（あるいはキャッシュしておく）
+        // ここでは簡易的にevaluateを部分的に呼ぶのと同等の処理を行う
+        auto s_l = get_state(tree[u].left);
+        auto s_r = get_state(tree[u].right);
+        out.push(tree[u].time, s_l.id, s_r.id);
+    }
+
+    // 特定ノードの最終状態を取得（再帰）
+    ClusterState get_state(int u) {
+        if(tree[u].is_leaf) {
+            int aid = tree[u].atom_idx;
+            return {input.ps[aid], input.vs[aid], 1, 0, aid};
+        }
+        auto s_l = get_state(tree[u].left);
+        auto s_r = get_state(tree[u].right);
+        return merge_states(s_l, s_r, tree[u].time, input.L);
+    }
+
+    // 焼きなまし
+    void anneal(double duration) {
+        double start_time = get_time();
+        double current_score = get_score();
+        
+        int internal_start = K;
+        int internal_end = 2 * K - 1;
+        
+        ll valid = 0;
+        ll iter = 0;
+        
+        // SAパラメータ
+        double start_temp = 5000.0;
+        double end_temp = 100.0;
+
+        while(true) {
+            iter++;
+            if((iter & 255) == 0) {
+                double now = get_time();
+                if(now - start_time > duration) break;
+            }
+
+            double time_ratio = (get_time() - start_time) / duration;
+            double temp = start_temp + (end_temp - start_temp) * time_ratio;
+
+            int type = rnd::range(0, 2); // 0: time shift, 1: leaf swap
+
+            if (type == 0) {
+                // Time Shift
+                int u = rnd::range(internal_start, internal_end);
+                int old_t = tree[u].time;
+                int delta = rnd::range(0, 2) ? rnd::range(1, 21) : -rnd::range(1, 21);
+                int new_t = old_t + delta;
+                
+                // 制約チェック
+                if (new_t < 0 || new_t >= input.T) continue;
+                
+                // 親より遅く、子より早くなければならない (同時刻はOK)
+                int p = tree[u].parent;
+                int l = tree[u].left;
+                int r = tree[u].right;
+                
+                if (p != -1 && new_t > tree[p].time) continue; // 親の時刻を超えるのはNG
+                int t_l = tree[l].is_leaf ? 0 : tree[l].time;
+                int t_r = tree[r].is_leaf ? 0 : tree[r].time;
+                if (new_t < t_l || new_t < t_r) continue; // 子の時刻より前なのはNG
+
+                tree[u].time = new_t;
+                double new_score = get_score(); // 部分更新すれば高速だがK=30なら全計算でも間に合う
+                
+                if (new_score < current_score || rnd::nextf() < exp((current_score - new_score) / temp)) {
+                    current_score = new_score;
+                    valid++;
+                } else {
+                    tree[u].time = old_t; // revert
+                }
+            } else {
+                // Leaf Swap
+                int u1 = rnd::range(0, K);
+                int u2 = rnd::range(0, K);
+                if (u1 == u2) continue;
+                
+                swap(tree[u1].atom_idx, tree[u2].atom_idx);
+                double new_score = get_score();
+                
+                if (new_score < current_score || rnd::nextf() < exp((current_score - new_score) / temp)) {
+                    current_score = new_score;
+                    valid++;
+                } else {
+                    swap(tree[u1].atom_idx, tree[u2].atom_idx); // revert
+                }
+            }
+        }
+        cerr << "Iter: " << iter << " Valid: " << valid << " Score: " << current_score << endl;
+    }
+
+    // GroupSolver構造体の中に追加してください
+    void set_atoms(const vector<int>& new_atoms, int init_time) {
+        atom_indices = new_atoms;
+        // ツリーの葉を更新
+        rep(i, 0, K) {
+            tree[i].is_leaf = true;
+            tree[i].atom_idx = atom_indices[i];
+        }
+        
+        // 内部ノードのリセット（トーナメント再構築のような処理）
+        // 簡易的に全て init_time に戻す
+        int next_id = K;
+        vector<int> current_layer(K);
+        iota(all(current_layer), 0);
+        
+        while(current_layer.size() > 1) {
+            vector<int> next_layer;
+            for(size_t i=0; i<current_layer.size(); i+=2) {
+                if(i + 1 < current_layer.size()) {
+                    int p = next_id++;
+                    // 構造は変えず、時間だけリセットする
+                    tree[p].time = init_time;
+                    // 親子関係の再リンクは構造が変わらないなら不要だが念のため
+                    tree[current_layer[i]].parent = p;
+                    tree[current_layer[i+1]].parent = p;
+                    next_layer.push_back(p);
+                } else {
+                    next_layer.push_back(current_layer[i]);
+                }
+            }
+            current_layer = next_layer;
+        }
+        // ルートは変わらないはずだが念のため更新
+        root = current_layer[0];
+    }
+};
+
+
+// --- K-means Helpers (from previous discussion) ---
+
+pd calc_torus_centroid(const vector<int>& members, const vector<pd>& ps, double L) {
+    if (members.empty()) return {0, 0};
+    pd ref = ps[members[0]];
+    double sum_dx = 0, sum_dy = 0;
+    for (int idx : members) {
+        double dx = ps[idx].x - ref.x;
+        double dy = ps[idx].y - ref.y;
+        if (dx > L / 2) dx -= L; if (dx < -L / 2) dx += L;
+        if (dy > L / 2) dy -= L; if (dy < -L / 2) dy += L;
+        sum_dx += dx; sum_dy += dy;
+    }
+    double avg_x = ref.x + sum_dx / members.size();
+    double avg_y = ref.y + sum_dy / members.size();
+    avg_x = fmod(avg_x, L); if(avg_x < 0) avg_x += L;
+    avg_y = fmod(avg_y, L); if(avg_y < 0) avg_y += L;
+    return {avg_x, avg_y};
+}
+
+long long dist_sq_torus(pd p1, pd p2, double L) {
+    double dx = fabs(p1.x - p2.x); dx = min(dx, L - dx);
+    double dy = fabs(p1.y - p2.y); dy = min(dy, L - dy);
     return (long long)((dx * dx + dy * dy) * 100); 
 }
 
-
-// 指定した時刻 t における全原子の位置を計算して返す
 vector<pd> get_positions_at_time(const Input &input, ll t) {
     vector<pd> current_ps(input.N);
     for(int i = 0; i < input.N; ++i) {
         double px = input.ps[i].x + input.vs[i].x * t;
         double py = input.ps[i].y + input.vs[i].y * t;
-        
-        // トーラス処理
-        px = fmod(px, input.L);
-        if(px < 0) px += input.L;
-        py = fmod(py, input.L);
-        if(py < 0) py += input.L;
-        
+        px = fmod(px, input.L); if(px < 0) px += input.L;
+        py = fmod(py, input.L); if(py < 0) py += input.L;
         current_ps[i] = {px, py};
     }
     return current_ps;
 }
 
-// 戻り値: {最小コスト, 割り当て配列(index -> group_id)}
-pair<long long, vector<int>> run_kmeans_on_positions(const Input &input, const vector<pd> &current_ps) {
-    int N = input.N;
-    int M = input.M;
-    int K = input.K;
-    double L = input.L;
-    
-    // 1. K-means++ 初期化
+pair<long long, vector<int>> run_kmeans(const Input &input, const vector<pd> &current_ps) {
+    int N = input.N; int M = input.M; int K = input.K; double L = input.L;
     vector<pd> centroids;
     centroids.push_back(current_ps[rnd::get(N)]);
     
@@ -481,183 +425,115 @@ pair<long long, vector<int>> run_kmeans_on_positions(const Input &input, const v
         double sum_sq_dist = 0;
         for(int i=0; i<N; ++i) {
             for(const auto& c : centroids) {
-                double dx = fabs(current_ps[i].x - c.x);
-                dx = min(dx, L - dx);
-                double dy = fabs(current_ps[i].y - c.y);
-                dy = min(dy, L - dy);
+                double dx = fabs(current_ps[i].x - c.x); dx = min(dx, L - dx);
+                double dy = fabs(current_ps[i].y - c.y); dy = min(dy, L - dy);
                 min_dists[i] = min(min_dists[i], dx*dx + dy*dy);
             }
             sum_sq_dist += min_dists[i];
         }
-        
-        size_t pre_size = centroids.size();
         double r = rnd::nextf() * sum_sq_dist;
+        size_t pre = centroids.size();
         for(int i=0; i<N; ++i) {
             r -= min_dists[i];
-            if(r <= 0) {
-                centroids.push_back(current_ps[i]);
-                break;
-            }
+            if(r <= 0) { centroids.push_back(current_ps[i]); break; }
         }
-        if(centroids.size() == pre_size) centroids.push_back(current_ps[rnd::get(N)]);
+        if(centroids.size() == pre) centroids.push_back(current_ps[rnd::get(N)]);
     }
 
-    // 2. K-means 反復
-    int max_iter = 10; // 探索回数を増やすため反復は少し減らしてもOK
     vector<int> assignment(N);
     long long final_cost = -1;
-    
-    for(int iter=0; iter<max_iter; ++iter) {
+    for(int iter=0; iter<15; ++iter) { // 繰り返し回数
+        atcoder::mcf_graph<long long, long long> g(N + M + 2);
         int S = 0, T = N + M + 1;
-        atcoder::mcf_graph<long long, long long> g(T + 1);
-        
         for(int i=0; i<N; ++i) g.add_edge(S, i + 1, 1, 0);
-        
         for(int i=0; i<N; ++i) {
             for(int j=0; j<M; ++j) {
-                long long cost = dist_sq_torus(current_ps[i], centroids[j], L);
-                g.add_edge(i + 1, N + 1 + j, 1, cost);
+                g.add_edge(i + 1, N + 1 + j, 1, dist_sq_torus(current_ps[i], centroids[j], L));
             }
         }
-        
         for(int j=0; j<M; ++j) g.add_edge(N + 1 + j, T, K, 0);
         
-        auto result = g.flow(S, T, N);
-        final_cost = result.second; // 最小費用流のコストがそのままクラスタリングの良さになる
+        auto res = g.flow(S, T, N);
+        final_cost = res.second;
         
-        vector<vector<int>> new_clusters(M);
-        auto edges = g.edges();
-        for(const auto& e : edges) {
+        vector<vector<int>> new_cls(M);
+        for(const auto& e : g.edges()) {
             if(e.from >= 1 && e.from <= N && e.to >= N + 1 && e.to <= N + M && e.flow > 0) {
-                int atom_idx = e.from - 1;
-                int group_idx = e.to - (N + 1);
-                new_clusters[group_idx].push_back(atom_idx);
-                assignment[atom_idx] = group_idx;
+                int aid = e.from - 1;
+                int gid = e.to - (N + 1);
+                new_cls[gid].push_back(aid);
+                assignment[aid] = gid;
             }
         }
-        
-        bool changed = false;
+        bool chg = false;
         for(int j=0; j<M; ++j) {
-            if(new_clusters[j].empty()) continue;
-            pd new_c = calc_torus_centroid(new_clusters[j], current_ps, L);
-            if(abs(new_c.x - centroids[j].x) > 1e-3 || abs(new_c.y - centroids[j].y) > 1e-3) changed = true;
-            centroids[j] = new_c;
+            if(new_cls[j].empty()) continue;
+            pd nc = calc_torus_centroid(new_cls[j], current_ps, L);
+            if(abs(nc.x - centroids[j].x) > 1e-3 || abs(nc.y - centroids[j].y) > 1e-3) chg = true;
+            centroids[j] = nc;
         }
-        if(!changed) break;
+        if(!chg) break;
     }
-    
     return {final_cost, assignment};
 }
 
 
+// --- Main Logic ---
+
 void solve() {
     Input input;
     input.read();
-    Output output(input);
+    Output output;
 
-    State state(input, output);
-    
-    vector<bool> used(input.N, false);
-    vector<ClusterGroup> groups(input.M, ClusterGroup(input));
-    
-    // --- 1. 時間探索パート（変更なし） ---
-    long long best_cost = -1; 
+    // 1. K-means で最適な一括結合時刻とグループ分けを探す (Time Limit: 0.3s)
+    long long best_cost = -1;
     vector<int> best_assignment;
     int best_time = 0;
-
-    // 粗い刻み幅で探索（例: 50刻み）
-    int time_step = 50; 
-    for(int t = 0; t < input.T; t += time_step) {
-        vector<pd> ps_at_t = get_positions_at_time(input, t);
-        pair<long long, vector<int>> result = run_kmeans_on_positions(input, ps_at_t);
-        
-        if (best_cost == -1 || result.first < best_cost) {
-            best_cost = result.first;
-            best_assignment = result.second;
+    
+    // 時間探索
+    for(int t = 0; t < input.T; t += 20) {
+        if(get_time() > 0.3) break; 
+        vector<pd> ps = get_positions_at_time(input, t);
+        auto res = run_kmeans(input, ps);
+        if(best_cost == -1 || res.first < best_cost) {
+            best_cost = res.first;
+            best_assignment = res.second;
             best_time = t;
         }
     }
-    
-    cerr << "Best clustering found at time: " << best_time << " with cost: " << best_cost << endl;
+    cerr << "Init Time: " << best_time << " Cost: " << best_cost << endl;
 
-    // --- 2. グループ割り当ての適用 ---
-    // (ここで groups を構築)
-    fill(used.begin(), used.end(), true);
-    for(int i=0; i<input.N; ++i) {
-        int g_idx = best_assignment[i];
-        groups[g_idx].add_cluster(i, 1);
+    // グループごとに原子IDを分類
+    vector<vector<int>> group_atoms(input.M);
+    rep(i, 0, input.N) {
+        group_atoms[best_assignment[i]].push_back(i);
     }
 
-    // --- 3. 実行フェーズ（ここを大幅修正） ---
+    // 2. 各グループごとに独立してマージ順序と時刻を最適化 (SA)
+    // 残り時間を各グループに分配
+    double remaining_time = 1.5 - get_time();
+    double time_per_group = remaining_time / input.M;
 
-    // 重要: 計算された「ベストな時刻」まで一気に進める
-    // ギリギリだと結合順序などで溢れる可能性があるので、念のため少し余裕を見るなら -10 くらいしても良いが、
-    // K-meansはその瞬間をターゲットにしているので、ジャストでOK。
-    if (best_time > 0) {
-        state.advance_to(best_time);
-    }
-
-    // メインループ
-    // 基本的に best_time でほとんどの結合が終わるはずですが、
-    // わずかに届かない場合などのために、Tまで少しずつ進める処理は残します
-    ll dt = 1; // 結合フェーズに入ったら時間は細かく進める
-
-    while(!state.is_goal()) {
+    for(int i = 0; i < input.M; ++i) {
+        // グループごとのSolver作成
+        GroupSolver solver(input, group_atoms[i], best_time);
         
-        // 全グループに対して結合を試行
-        for(ll g = 0; g < input.M; g++) {
-            ClusterGroup &group = groups[g];
-            
-            // 可能な限り結合を繰り返す
-            while(true) {
-                double min_dist = 1e18;
-                ll best_i = -1, best_j = -1;
-
-                // グループ内で結合可能なペアを探索
-                for (ll i_idx : group.cluster_indices) {
-                    if (!state.clusters[i_idx].alive) continue;
-                    
-                    for (ll j_idx : group.cluster_indices) {
-                        if (i_idx >= j_idx) continue;
-                        if (!state.clusters[j_idx].alive) continue;
-
-                        if (!state.clusters[i_idx].can_merge(state.clusters[j_idx])) continue;
-
-                        // ここで「距離制限」を設けても良い
-                        // 例: if (dist > 5000) continue; 
-                        // 今回はベスト時刻に来ているはずなので、無条件で近い順に繋ぐ
-                        
-                        double dist = state.clusters[i_idx].gdistance(state.clusters[j_idx]);
-                        if (dist < min_dist) {
-                            min_dist = dist;
-                            best_i = i_idx;
-                            best_j = j_idx;
-                        }
-                    }
-                }
-
-                if (best_i != -1 && best_j != -1) {
-                    // 結合実行（時刻は現在の state.current_time）
-                    state.merge_clusters(best_i, best_j, state.current_time);
-                } else {
-                    // このグループではもう結合できるペアがない
-                    break;
-                }
-            }
-        }
+        // 焼きなまし実行
+        solver.anneal(time_per_group);
         
-        // 時間切れチェック
-        if (state.current_time + dt >= input.T) break;
-        
-        // 時間を少し進める
-        state.advance_to(state.current_time + dt);
+        // 結果をOutputに登録
+        solver.collect_merges(solver.root, output);
     }
 
     output.print();
 }
 
-
-int main(){
-    rnd::init(42); // 乱数初期化
+int main() {
+    // 時間をシードにする
+    auto now = std::chrono::high_resolution_clock::now();
+    uint32_t seed = (uint32_t)now.time_since_epoch().count();
+    rnd::init(seed);
+    
     solve();
+    return 0;
 }
