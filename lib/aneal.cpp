@@ -110,11 +110,51 @@ namespace rnd {
     }
 }
 
+// anneal
+void anneal(double tl) {
+    double start = get_time();
+    tl = tl - start;
+    assert(0.0 < tl);
 
-void solve() {
+    ll valid = 0;
+    ll iter = 0;
+    double heat = 0.0;
+    
+    static double log_table[65536];
+    for (int i = 0; i < 65536; ++i) {
+        log_table[i] = log((i + 0.5) / 65536.0);
+    }
+    rnd::shuffle(log_table);
 
-}
+    while (true) {
+        if (iter % 256 == 0) {
+            double time = (get_time() - start) / tl;
+            if (time >= 1.0) {
+                break;
+            }
+            // 問題に合わせて調整する
+            const double T0 = 1.0;
+            const double T1 = 0.1;
+            heat = T0 * pow(T1 / T0, time);
+        }
+        iter++;
 
-int main(){
-    solve();
+        double add = heat * log_table[iter % 65536]; // 最大化
+        // double add = -heat * log_table[iter % 65536]; // 最小化
+        // double add = 0.0; // 山登り法になる
+
+        // TODO: スコア計算の実装
+        // double old_score = ...;
+        // double new_score = ...;
+
+        // if (new_score - old_score >= add) { // 最大化
+        // if (new_score - old_score <= add) { // 最小化
+            valid += 1;
+            // TODO: 状態の更新
+        // }
+    }
+
+    cerr << "iter = " << iter << "\n";
+    cerr << "ratio = " << fixed << setprecision(3) 
+              << ((double)valid / iter) << "\n";
 }
