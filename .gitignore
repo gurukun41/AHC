@@ -37,3 +37,6 @@
 *.DS_Store
 
 *.txt
+
+# ignore AHC/tools directory
+tools/
