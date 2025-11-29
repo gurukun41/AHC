@@ -392,49 +392,179 @@ struct State {
     }
 };
 
-// 修正: used配列を参照で受け取るように変更
-void decide_group(ClusterGroup &group, const vector<Cluster> &clusters, vector<bool> &used) {
-    ll N = clusters.size();
+// トーラス上の重心を計算する関数
+pd calc_torus_centroid(const vector<int>& members, const vector<pd>& ps, double L) {
+    if (members.empty()) return {0, 0};
     
-    while (!group.is_complete()) {
-        double min_dist = 1e18;
-        ll best_idx = -1;
+    // 最初の点を基準にする（トーラスの境界またぎ対策）
+    pd ref = ps[members[0]];
+    double sum_dx = 0;
+    double sum_dy = 0;
+    
+    for (int idx : members) {
+        double dx = ps[idx].x - ref.x;
+        double dy = ps[idx].y - ref.y;
         
-        // グループが空の場合、最初の1個はランダム（または未使の適当なもの）に決める
-        if (group.cluster_indices.empty()) {
-            while(true) {
-                ll idx = rnd::get(N);
-                if (!used[idx] && group.can_add(clusters[idx].size)) {
-                    best_idx = idx;
-                    break;
-                }
+        // 最短経路での変位に補正
+        if (dx > L / 2) dx -= L;
+        if (dx < -L / 2) dx += L;
+        if (dy > L / 2) dy -= L;
+        if (dy < -L / 2) dy += L;
+        
+        sum_dx += dx;
+        sum_dy += dy;
+    }
+    
+    double avg_x = ref.x + sum_dx / members.size();
+    double avg_y = ref.y + sum_dy / members.size();
+    
+    // 0~Lの範囲に収める
+    avg_x = fmod(avg_x, L);
+    if(avg_x < 0) avg_x += L;
+    avg_y = fmod(avg_y, L);
+    if(avg_y < 0) avg_y += L;
+    
+    return {avg_x, avg_y};
+}
+
+// 2点間のトーラス距離の2乗を返す（K-meansは2乗距離の和を最小化するため）
+long long dist_sq_torus(pd p1, pd p2, double L) {
+    double dx = fabs(p1.x - p2.x);
+    dx = min(dx, L - dx);
+    double dy = fabs(p1.y - p2.y);
+    dy = min(dy, L - dy);
+    // MCFのコストは整数である必要があるため、適当にスケーリングしてlong longにする
+    return (long long)((dx * dx + dy * dy) * 100); 
+}
+
+// Constrained K-meansの実装
+void perform_constrained_kmeans(vector<ClusterGroup> &groups, Input &input, vector<bool> &used) {
+    int N = input.N;
+    int M = input.M;
+    int K = input.K;
+    double L = input.L;
+    
+    // 1. K-means++ 初期化
+    // 最初の1個をランダムに選ぶ
+    vector<pd> centroids;
+    centroids.push_back(input.ps[rand() % N]);
+    
+    // 残りのM-1個を、既存の重心から遠い場所から選ぶ
+    while(centroids.size() < M) {
+        vector<double> min_dists(N, 1e18);
+        double sum_sq_dist = 0;
+        
+        for(int i=0; i<N; ++i) {
+            for(const auto& c : centroids) {
+                double dx = fabs(input.ps[i].x - c.x);
+                dx = min(dx, L - dx);
+                double dy = fabs(input.ps[i].y - c.y);
+                dy = min(dy, L - dy);
+                double d = dx*dx + dy*dy;
+                min_dists[i] = min(min_dists[i], d);
             }
-        } else {
-            // 2個目以降は、重心に近いものを選ぶ
-            for (ll i = 0; i < N; i++) {
-                if (used[i]) continue;
-                if (!group.can_add(clusters[i].size)) continue;
-                
-                // グループ内の全クラスタとの平均距離（重心距離のほうが計算が軽いが、現状維持）
-                double total_dist = 0.0;
-                for (ll idx : group.cluster_indices) {
-                    total_dist += clusters[idx].gdistance(clusters[i]);
-                }
-                double dist = total_dist / group.cluster_indices.size();
-                
-                if (dist < min_dist) {
-                    min_dist = dist;
-                    best_idx = i;
-                }
+            sum_sq_dist += min_dists[i];
+        }
+        
+        // 確率的に選ぶ（距離の2乗に比例）
+        double r = (double)rand() / RAND_MAX * sum_sq_dist;
+        for(int i=0; i<N; ++i) {
+            r -= min_dists[i];
+            if(r <= 0) {
+                centroids.push_back(input.ps[i]);
+                break;
+            }
+        }
+        // 数値誤差で選ばれなかった場合のフォールバック
+        if(centroids.size() < centroids.size() + 1) { // 直前のループで追加されなかったら
+             centroids.push_back(input.ps[rand() % N]);
+        }
+    }
+
+    // 2. K-means 反復
+    // 反復回数（時間は十分あるので多めでOK）
+    int max_iter = 20; 
+    
+    vector<int> assignment(N);
+    
+    for(int iter=0; iter<max_iter; ++iter) {
+        // --- 割り当てステップ (Min-Cost Flow) ---
+        // グラフ構築: S -> Atoms -> Groups -> T
+        // ノード番号: S=0, Atoms=1~N, Groups=N+1~N+M, T=N+M+1
+        int S = 0;
+        int T = N + M + 1;
+        atcoder::mcf_graph<long long, long long> g(T + 1);
+        
+        // S -> Atoms
+        for(int i=0; i<N; ++i) {
+            g.add_edge(S, i + 1, 1, 0);
+        }
+        
+        // Atoms -> Groups
+        for(int i=0; i<N; ++i) {
+            for(int j=0; j<M; ++j) {
+                long long cost = dist_sq_torus(input.ps[i], centroids[j], L);
+                g.add_edge(i + 1, N + 1 + j, 1, cost);
             }
         }
         
-        if (best_idx != -1) {
-            group.add_cluster(best_idx, clusters[best_idx].size);
-            used[best_idx] = true;
-        } else {
-            break; 
+        // Groups -> T
+        for(int j=0; j<M; ++j) {
+            g.add_edge(N + 1 + j, T, K, 0);
         }
+        
+        // フローを流す (流量N)
+        auto result = g.flow(S, T, N);
+        
+        // 結果の取得
+        vector<vector<int>> new_clusters(M);
+        auto edges = g.edges();
+        for(const auto& e : edges) {
+            // Atoms -> Groups のエッジで、流れたものを探す
+            if(e.from >= 1 && e.from <= N && e.to >= N + 1 && e.to <= N + M && e.flow > 0) {
+                int atom_idx = e.from - 1;
+                int group_idx = e.to - (N + 1);
+                new_clusters[group_idx].push_back(atom_idx);
+                assignment[atom_idx] = group_idx;
+            }
+        }
+        
+        // --- 更新ステップ ---
+        // 重心の再計算
+        bool changed = false;
+        for(int j=0; j<M; ++j) {
+            if(new_clusters[j].empty()) continue; // 基本ありえないが念のため
+            pd new_c = calc_torus_centroid(new_clusters[j], input.ps, L);
+            
+            // 重心が大きく動いたかチェック（収束判定用だが、今回は固定回数回すので簡易的に）
+            if(abs(new_c.x - centroids[j].x) > 1e-3 || abs(new_c.y - centroids[j].y) > 1e-3) {
+                changed = true;
+            }
+            centroids[j] = new_c;
+        }
+        
+        // 収束したら早期終了
+        if(!changed) break;
+    }
+
+    // 3. 結果をClusterGroupに反映
+    // used配列も更新
+    fill(used.begin(), used.end(), true); // 全て使うことになる
+    for(int i=0; i<N; ++i) {
+        int g_idx = assignment[i];
+        groups[g_idx].add_cluster(i, input.K); // ここではsize=1のatomを追加していくが、ClusterGroupのロジックに合わせて修正
+    }
+    
+    // ClusterGroupの実装に合わせて、add_clusterは原子1個(size=1)を追加すると解釈
+    // 既存のgroupsをクリアしてから入れる
+    for(int j=0; j<M; ++j) {
+        groups[j].cluster_indices.clear();
+        groups[j].current_size = 0;
+    }
+    
+    for(int i=0; i<N; ++i) {
+        int g_idx = assignment[i];
+        groups[g_idx].add_cluster(i, 1); // 原子1個なのでサイズ1
     }
 }
 
@@ -449,10 +579,8 @@ void solve() {
     vector<bool> used(input.N, false);
     vector<ClusterGroup> groups(input.M, ClusterGroup(input));
     
-    // グループ分けを実行
-    for (ll i = 0; i < input.M; i++) {
-        decide_group(groups[i], state.clusters, used);
-    }
+    // K-means でグループ分けを実行（used配列とgroupsを一括で更新）
+    perform_constrained_kmeans(groups, input, used);
 
     // デバッグ: 全原子が割り振られたか確認
     int used_count = 0;
