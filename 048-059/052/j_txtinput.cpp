@@ -501,11 +501,8 @@ Output anneal_pattern(const Input& in, Output& initial_out) {
 
 // めも焼きなまし
 int main() {
-    int seed = 35;
-    std::ostringstream oss;
-    oss << std::setw(4) << std::setfill('0') << seed;
-    string input_filename = "in/" + oss.str() + ".txt";
-    string output_filename = "out/j_" + oss.str() + ".txt";
+    string input_filename = "in/input.txt";
+    string output_filename = "out/j_input.txt";
     freopen(input_filename.c_str(), "r", stdin);
     freopen(output_filename.c_str(), "w", stdout);
     ll N, M, K;
