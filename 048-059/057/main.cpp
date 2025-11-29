@@ -550,207 +550,109 @@ pair<long long, vector<int>> run_kmeans_on_positions(const Input &input, const v
 }
 
 
-// --- 追加: 軌道予測に基づく結合計画 ---
-
-struct SimCluster {
-    int id;
-    pd p, v;
-    int size;
-    int available_time; // このクラスタが結合可能になる時刻（前の結合が終わった時刻）
-
-    // 指定時刻の位置予測
-    pd pos_at(int t, double L) const {
-        double dt = t - available_time; // 基準時刻からの経過時間ではなく、位置pが更新された時刻からの差分が必要
-        // 今回の実装では、merge時に位置をその時刻のものに更新する方針をとるため、
-        // 単純に (t - update_time) で計算する
-        // 簡易実装のため、メンバ変数 p は "available_time" における位置とする
-        
-        double px = p.x + v.x * dt;
-        double py = p.y + v.y * dt;
-        px = fmod(px, L); if(px < 0) px += L;
-        py = fmod(py, L); if(py < 0) py += L;
-        return {px, py};
-    }
-};
-
-// 2つのSimClusterの将来の最小距離と、その時刻を探す
-tuple<double, int> find_best_merge_time(const SimCluster &c1, const SimCluster &c2, int T, double L) {
-    int start_t = max(c1.available_time, c2.available_time);
-    double min_dist = 1e18;
-    int best_t = start_t;
-
-    // Tまでの時間を走査 (刻み幅を小さくすれば精度向上)
-    // ここでは処理速度優先で 粗く探索 -> 周辺を細かく探索 とする
-    
-    auto calc_dist = [&](int t) -> double {
-        pd p1 = c1.pos_at(t, L);
-        pd p2 = c2.pos_at(t, L);
-        double dx = fabs(p1.x - p2.x); dx = min(dx, L - dx);
-        double dy = fabs(p1.y - p2.y); dy = min(dy, L - dy);
-        return sqrt(dx*dx + dy*dy);
-    };
-
-    // 1. 粗い探索 (step 10)
-    for(int t = start_t; t < T; t += 10) {
-        double d = calc_dist(t);
-        if(d < min_dist) {
-            min_dist = d;
-            best_t = t;
-        }
-    }
-    // 最後もチェック
-    if (T > start_t) {
-        double d = calc_dist(T-1);
-        if(d < min_dist) {
-            min_dist = d;
-            best_t = T-1;
-        }
-    }
-
-    // 2. 精密探索 (best_t の前後)
-    int search_start = max(start_t, best_t - 15);
-    int search_end = min(T, best_t + 15);
-    for(int t = search_start; t < search_end; ++t) {
-        double d = calc_dist(t);
-        if(d < min_dist) {
-            min_dist = d;
-            best_t = t;
-        }
-    }
-
-    return {min_dist, best_t};
-}
-
-// 1つのグループに対する結合計画を作成
-void plan_merges_greedy(const Input &input, const vector<int> &atom_indices, vector<tuple<ll, ll, ll>> &all_merges) {
-    int K = atom_indices.size();
-    vector<SimCluster> clusters;
-    
-    // 初期化
-    for(int idx : atom_indices) {
-        clusters.push_back({
-            (int)input.vs[idx].x, // input.vs[idx].x は速度だが、idを入れる場所間違えた？ -> いや、Atom生成時にあわせる
-            // SimCluster定義: id, p, v, size, time
-            (int)idx, 
-            input.ps[idx], 
-            input.vs[idx], 
-            1, 
-            0
-        });
-        // 最初のメンバ変数が id なので修正
-        clusters.back().id = idx; // 念のため上書き
-    }
-
-    // クラスタが1つになるまで繰り返す
-    while(clusters.size() > 1) {
-        double global_min_dist = 1e18;
-        int best_t = -1;
-        int best_i = -1, best_j = -1;
-
-        // 全ペア探索
-        for(int i=0; i<(int)clusters.size(); ++i) {
-            for(int j=i+1; j<(int)clusters.size(); ++j) {
-                // サイズ制限チェック
-                if(clusters[i].size + clusters[j].size > input.K) continue;
-
-                auto [dist, t] = find_best_merge_time(clusters[i], clusters[j], input.T, input.L);
-                
-                // コストが小さいもの、同じなら時間が早いものを優先
-                if(dist < global_min_dist) {
-                    global_min_dist = dist;
-                    best_t = t;
-                    best_i = i;
-                    best_j = j;
-                }
-            }
-        }
-
-        if(best_i == -1) break; // 結合候補なし
-
-        // 結合採用
-        SimCluster &c1 = clusters[best_i];
-        SimCluster &c2 = clusters[best_j];
-        
-        // 出力用リストに追加 (時刻, id1, id2)
-        all_merges.emplace_back(best_t, c1.id, c2.id);
-
-        // 新しいクラスタの状態作成
-        SimCluster new_c;
-        new_c.id = min(c1.id, c2.id); // IDは小さい方を継承（出力仕様に合わせて適当に）
-        new_c.size = c1.size + c2.size;
-        new_c.available_time = best_t;
-
-        // 速度更新 (運動量保存)
-        new_c.v.x = (c1.size * c1.v.x + c2.size * c2.v.x) / new_c.size;
-        new_c.v.y = (c1.size * c1.v.y + c2.size * c2.v.y) / new_c.size;
-
-        // 位置更新 (重心)
-        pd p1 = c1.pos_at(best_t, input.L);
-        pd p2 = c2.pos_at(best_t, input.L);
-        
-        // トーラス上の重心計算
-        double dx = p2.x - p1.x;
-        if (dx > input.L / 2) dx -= input.L;
-        if (dx < -input.L / 2) dx += input.L;
-        double dy = p2.y - p1.y;
-        if (dy > input.L / 2) dy -= input.L;
-        if (dy < -input.L / 2) dy += input.L;
-
-        new_c.p.x = p1.x + dx * c2.size / new_c.size;
-        new_c.p.y = p1.y + dy * c2.size / new_c.size;
-        
-        // 正規化
-        new_c.p.x = fmod(new_c.p.x, input.L); if(new_c.p.x < 0) new_c.p.x += input.L;
-        new_c.p.y = fmod(new_c.p.y, input.L); if(new_c.p.y < 0) new_c.p.y += input.L;
-
-        // 配列更新 (後ろから消すとindexズレが少ない)
-        clusters.erase(clusters.begin() + best_j);
-        clusters[best_i] = new_c;
-    }
-}
-
-
 void solve() {
     Input input;
     input.read();
     Output output(input);
 
-    // 1. K-means Init (ここまでは元のコードと同じ)
+    State state(input, output);
+    
+    vector<bool> used(input.N, false);
+    vector<ClusterGroup> groups(input.M, ClusterGroup(input));
+    
+    // --- 1. 時間探索パート（変更なし） ---
     long long best_cost = -1; 
     vector<int> best_assignment;
     int best_time = 0;
+
+    // 粗い刻み幅で探索（例: 50刻み）
     int time_step = 50; 
     for(int t = 0; t < input.T; t += time_step) {
         vector<pd> ps_at_t = get_positions_at_time(input, t);
         pair<long long, vector<int>> result = run_kmeans_on_positions(input, ps_at_t);
+        
         if (best_cost == -1 || result.first < best_cost) {
             best_cost = result.first;
             best_assignment = result.second;
             best_time = t;
         }
     }
+    
     cerr << "Best clustering found at time: " << best_time << " with cost: " << best_cost << endl;
 
-    // グループ作成
-    vector<vector<int>> groups(input.M);
+    // --- 2. グループ割り当ての適用 ---
+    // (ここで groups を構築)
+    fill(used.begin(), used.end(), true);
     for(int i=0; i<input.N; ++i) {
-        groups[best_assignment[i]].push_back(i);
+        int g_idx = best_assignment[i];
+        groups[g_idx].add_cluster(i, 1);
     }
 
-    // 2. 実行フェーズ (変更点: 一括シミュレーションではなく、グループごとの計画作成)
-    vector<tuple<ll, ll, ll>> all_merges;
-    
-    for(int i=0; i<input.M; ++i) {
-        plan_merges_greedy(input, groups[i], all_merges);
+    // --- 3. 実行フェーズ（ここを大幅修正） ---
+
+    // 重要: 計算された「ベストな時刻」まで一気に進める
+    // ギリギリだと結合順序などで溢れる可能性があるので、念のため少し余裕を見るなら -10 くらいしても良いが、
+    // K-meansはその瞬間をターゲットにしているので、ジャストでOK。
+    if (best_time > 0) {
+        state.advance_to(best_time);
     }
 
-    // 3. 出力 (時刻順にソート)
-    sort(all_merges.begin(), all_merges.end());
-    for(auto [t, a, b] : all_merges) {
-        output.push(t, a, b);
+    // メインループ
+    // 基本的に best_time でほとんどの結合が終わるはずですが、
+    // わずかに届かない場合などのために、Tまで少しずつ進める処理は残します
+    ll dt = 1; // 結合フェーズに入ったら時間は細かく進める
+
+    while(!state.is_goal()) {
+        
+        // 全グループに対して結合を試行
+        for(ll g = 0; g < input.M; g++) {
+            ClusterGroup &group = groups[g];
+            
+            // 可能な限り結合を繰り返す
+            while(true) {
+                double min_dist = 1e18;
+                ll best_i = -1, best_j = -1;
+
+                // グループ内で結合可能なペアを探索
+                for (ll i_idx : group.cluster_indices) {
+                    if (!state.clusters[i_idx].alive) continue;
+                    
+                    for (ll j_idx : group.cluster_indices) {
+                        if (i_idx >= j_idx) continue;
+                        if (!state.clusters[j_idx].alive) continue;
+
+                        if (!state.clusters[i_idx].can_merge(state.clusters[j_idx])) continue;
+
+                        // ここで「距離制限」を設けても良い
+                        // 例: if (dist > 5000) continue; 
+                        // 今回はベスト時刻に来ているはずなので、無条件で近い順に繋ぐ
+                        
+                        double dist = state.clusters[i_idx].gdistance(state.clusters[j_idx]);
+                        if (dist < min_dist) {
+                            min_dist = dist;
+                            best_i = i_idx;
+                            best_j = j_idx;
+                        }
+                    }
+                }
+
+                if (best_i != -1 && best_j != -1) {
+                    // 結合実行（時刻は現在の state.current_time）
+                    state.merge_clusters(best_i, best_j, state.current_time);
+                } else {
+                    // このグループではもう結合できるペアがない
+                    break;
+                }
+            }
+        }
+        
+        // 時間切れチェック
+        if (state.current_time + dt >= input.T) break;
+        
+        // 時間を少し進める
+        state.advance_to(state.current_time + dt);
     }
-    
-    // Output構造体のprintを呼ぶ (assertチェックなどが入っているため)
+
     output.print();
 }
 
