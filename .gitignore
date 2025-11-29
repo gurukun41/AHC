@@ -40,3 +40,6 @@
 
 # ignore AHC/tools directory
 tools/
+
+# pahcer
+*.toml
