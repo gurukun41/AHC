@@ -24,6 +24,95 @@ using vpd = vector<pd>;                                  // double型のペア�
 #define x first
 #define y second
 
+// get_time
+double get_time() {
+    double time;
+
+#ifdef LOCAL
+    struct timespec ts;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+    time = ts.tv_sec + ts.tv_nsec * 1e-9;
+#else
+    using namespace std::chrono;
+    auto now = system_clock::now();
+    time = duration_cast<nanoseconds>(now.time_since_epoch()).count() * 1e-9;
+#endif
+
+    static double START = -1.0;
+    if (START == -1.0) {
+        START = time;
+    }
+
+#ifdef LOCAL
+    return (time - START) * 1.0;
+#else
+    return time - START;
+#endif
+}
+
+// rnd
+
+namespace rnd {
+    static uint32_t X2 = 12345;
+    static uint32_t X3 = 0xcafef00d;
+    static uint64_t C_X1 = 0xd15ea5e5ULL << 32 | 23456;
+
+    inline uint32_t next() {
+        uint64_t work = (uint64_t)X3 * 3487286589ULL;
+        uint32_t ret = (X3 ^ X2) + ((uint32_t)C_X1 ^ (uint32_t)(work >> 32));
+        X3 = X2;
+        X2 = (uint32_t)C_X1;
+        C_X1 = work + (C_X1 >> 32);
+        return ret;
+    }
+
+    inline uint64_t next64() {
+        return (uint64_t)next() << 32 | (uint64_t)next();
+    }
+
+    inline double nextf() {
+        uint64_t v = 0x3ff0000000000000ULL | ((uint64_t)next() << 20);
+        double d;
+        memcpy(&d, &v, sizeof(double));
+        return d - 1.0;
+    }
+
+    inline size_t get(size_t n) {
+        assert(0 < n && n <= UINT32_MAX);
+        return (size_t)((uint64_t)next() * n >> 32);
+    }
+
+    inline size_t range(size_t a, size_t b) {
+        assert(a < b);
+        return get(b - a) + a;
+    }
+
+    inline size_t range_skip(size_t a, size_t b, size_t skip) {
+        assert(a <= skip && skip < b);
+        size_t n = range(a, b - 1);
+        return n + (skip <= n);
+    }
+
+    inline ll rangei(ll a, ll b) {
+        assert(a < b);
+        return (ll)get((size_t)(b - a)) + a;
+    }
+
+    template<typename T>
+    void shuffle(vector<T>& a) {
+        for (size_t i = a.size() - 1; i > 0; --i) {
+            swap(a[i], a[get(i + 1)]);
+        }
+    }
+    
+    template<typename T, size_t N>
+    void shuffle(T (&a)[N]) {
+        for (size_t i = N - 1; i > 0; --i) {
+            swap(a[i], a[get(i + 1)]);
+        }
+    }
+}
+
 struct Input {
     ll N;
     ll T;
@@ -313,12 +402,10 @@ void decide_group(ClusterGroup &group, const vector<Cluster> &clusters, vector<b
         
         // グループが空の場合、最初の1個はランダム（または未使の適当なもの）に決める
         if (group.cluster_indices.empty()) {
-            // 単純に「まだ使われていない最初の原子」だと場所が偏るので、
-            // 本来はランダムやK-means法が良いが、一旦バグ修正として「未使の先頭」で実装する
-            // (改善するならここでランダムに未使のindexを選ぶ)
-            for (ll i = 0; i < N; i++) {
-                if (!used[i] && group.can_add(clusters[i].size)) {
-                    best_idx = i;
+            while(true) {
+                ll idx = rnd::get(N);
+                if (!used[idx] && group.can_add(clusters[idx].size)) {
+                    best_idx = idx;
                     break;
                 }
             }
