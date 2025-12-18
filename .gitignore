@@ -43,3 +43,5 @@ tools/
 
 # pahcer
 *.toml
+vis
+*.html
