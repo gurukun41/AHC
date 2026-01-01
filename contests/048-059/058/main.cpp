@@ -49,13 +49,13 @@ struct MachineState {
 
 struct State {
     ll sum;
-    ll total_power;
+    ll weighted_power;
     vector<vector<MachineState>> machines;
     vector<pl> history;
 
     State() {
         sum = K;
-        total_power = 0;
+        weighted_power = 0;
         machines.resize(L, vector<MachineState>(N));
         rep(i, 0, L) {
             rep(j, 0, N) {
@@ -81,16 +81,20 @@ struct State {
         ll cost = C[i][j] * (machines[i][j].power + 1);
         sum -= cost;
         machines[i][j].power++;
-        total_power++;
+        
+        ll weight = 1;
+        rep(k, 0, i) {
+            weight *= machines[k][j].power;
+        }
+        weighted_power += weight;
     }
 
-    // レベルの総和 * 所持金 で比較
     bool operator<(const State& other) const {
-        return (unsigned __int128) total_power < (unsigned __int128) other.total_power;
+        return (unsigned __int128)weighted_power < (unsigned __int128)other.weighted_power;
     }
     
     bool operator>(const State& other) const {
-        return (unsigned __int128) total_power > (unsigned __int128) other.total_power;
+        return (unsigned __int128) weighted_power > (unsigned __int128)other.weighted_power;
     }
 };
 
