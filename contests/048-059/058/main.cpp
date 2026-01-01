@@ -41,6 +41,7 @@ inline bool chmin(T &a, const T &b) {
 ll N, L, T, K;
 vl A;
 vvl C;
+vector<vector<vector<unsigned long long>>> zobrist;
 
 struct MachineState {
     ll num;
@@ -50,16 +51,23 @@ struct MachineState {
 struct State {
     ll sum;
     ll weighted_power;
+    ll next_cost_sum; 
+    unsigned long long hash; 
     vector<vector<MachineState>> machines;
-    vector<pl> history;
 
     State() {
         sum = K;
         weighted_power = 0;
+        next_cost_sum = 0; 
+        hash = 0;
         machines.resize(L, vector<MachineState>(N));
         rep(i, 0, L) {
             rep(j, 0, N) {
                 machines[i][j] = {1, 0};
+                next_cost_sum += C[i][j]; 
+                if (!zobrist.empty()) { 
+                    hash ^= zobrist[i][j][0];
+                }
             }
         }
     }
@@ -80,8 +88,13 @@ struct State {
     void upgrade(int i, int j) {
         ll cost = C[i][j] * (machines[i][j].power + 1);
         sum -= cost;
+
+        hash ^= zobrist[i][j][machines[i][j].power];
         machines[i][j].power++;
+        hash ^= zobrist[i][j][machines[i][j].power];
         
+        next_cost_sum += C[i][j];
+
         ll weight = 1;
         rep(k, 0, i) {
             weight *= machines[k][j].power;
@@ -90,44 +103,78 @@ struct State {
     }
 
     bool operator<(const State& other) const {
-        return (unsigned __int128)weighted_power < (unsigned __int128)other.weighted_power;
+        return (unsigned __int128)weighted_power < (unsigned __int128)other.weighted_power ;
     }
-    
+
     bool operator>(const State& other) const {
-        return (unsigned __int128) weighted_power > (unsigned __int128)other.weighted_power;
+        return (unsigned __int128)weighted_power > (unsigned __int128)other.weighted_power;
+    }
+};
+
+struct Node {
+    State state;
+    shared_ptr<Node> parent;
+    pl op; 
+
+    Node(const State& s, shared_ptr<Node> p, pl o) : state(s), parent(p), op(o) {}
+
+    bool operator>(const Node& other) const {
+        return state > other.state;
     }
 };
 
 void solve() {
-    const int BEAM_WIDTH = 50;
-    vector<State> beam;
-    beam.push_back(State());
+    const int BEAM_WIDTH = 70;
+    
+    vector<shared_ptr<Node>> beam;
+    beam.push_back(make_shared<Node>(State(), nullptr, make_pair(-1, -1)));
 
     rep(t, 0, T) {
-        vector<State> next_beam;
+        map<unsigned long long, shared_ptr<Node>> candidates_map;
         
-        for (const auto& curr : beam) {
+        for (const auto& curr_node : beam) {
+            const State& curr_state = curr_node->state;
+
+            auto add_candidate = [&](State& next_state, pl op) {
+
+                unsigned long long h = next_state.hash;
+                if (candidates_map.find(h) == candidates_map.end()) {
+                    candidates_map[h] = make_shared<Node>(next_state, curr_node, op);
+                } else {
+                    if (next_state > candidates_map[h]->state) {
+                        candidates_map[h] = make_shared<Node>(next_state, curr_node, op);
+                    }
+                }
+            };
+
             {
-                State next_state = curr;
-                next_state.history.push_back({-1, -1});
+                State next_state = curr_state;
                 next_state.simulate_turn();
-                next_beam.push_back(next_state);
+                add_candidate(next_state, {-1, -1});
             }
 
             rep(i, 0, L) {
                 rep(j, 0, N) {
-                    if (curr.can_upgrade(i, j)) {
-                        State next_state = curr;
+                    if (curr_state.can_upgrade(i, j)) {
+                        State next_state = curr_state;
                         next_state.upgrade(i, j);
-                        next_state.history.push_back({i, j});
                         next_state.simulate_turn();
-                        next_beam.push_back(next_state);
+                        add_candidate(next_state, {i, j});
                     }
                 }
             }
         }
 
-        sort(all(next_beam), greater<State>());
+        vector<shared_ptr<Node>> next_beam;
+        next_beam.reserve(candidates_map.size());
+        for (auto const& [key, val] : candidates_map) {
+            next_beam.push_back(val);
+        }
+
+        sort(all(next_beam), [](const shared_ptr<Node>& a, const shared_ptr<Node>& b) {
+            return *a > *b;
+        });
+
         if (next_beam.size() > BEAM_WIDTH) {
             next_beam.resize(BEAM_WIDTH);
         }
@@ -135,15 +182,24 @@ void solve() {
     }
 
     if (!beam.empty()) {
-        const auto& best_state = beam[0];
-        for (const auto& op : best_state.history) {
+        vector<pl> history;
+        auto curr = beam[0];
+        
+        while (curr->parent != nullptr) {
+            history.push_back(curr->op);
+            curr = curr->parent;
+        }
+        
+        reverse(all(history));
+
+        for (const auto& op : history) {
             if (op.first == -1) {
                 cout << -1 << "\n";
             } else {
                 cout << op.first << " " << op.second << "\n";
             }
         }
-        cerr << "Final Sum: " << best_state.sum << "\n";
+        cerr << "Final Sum: " << beam[0]->state.sum << "\n";
     }
 }
 
@@ -151,6 +207,17 @@ int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
     cin >> N >> L >> T >> K;
+    
+    mt19937_64 rng(chrono::steady_clock::now().time_since_epoch().count());
+    zobrist.resize(L, vector<vector<unsigned long long>>(N, vector<unsigned long long>(T + 5)));
+    rep(i, 0, L) {
+        rep(j, 0, N) {
+            rep(k, 0, T + 5) {
+                zobrist[i][j][k] = rng();
+            }
+        }
+    }
+
     A.resize(N);
     rep(i,0,N) {
         cin >> A[i];
