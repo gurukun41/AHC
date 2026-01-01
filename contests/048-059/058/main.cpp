@@ -42,104 +42,110 @@ ll N, L, T, K;
 vl A;
 vvl C;
 
-struct machine {
-    ll index_i;
-    ll index_j;
+struct MachineState {
     ll num;
     ll power;
-    machine *lower;
-    machine *higher;
-    machine(){
-        index_i = -1;
-        index_j = -1;
-        num = 0;
-        power = 0;
-        lower = nullptr;
-        higher = nullptr;
-    }
-    machine(ll i, ll j, machine *l = nullptr, machine *h = nullptr) {
-        index_i = i;
-        index_j = j;
-        num = 1;
-        power = 0;
-        lower = l;
-        higher = h;
-    }
-    int update() {
-        if (lower == nullptr) {
-            ll ret = A[index_j] * num * power;
-            if(higher != nullptr) higher->update();
-            return ret;
-        } else {
-            lower->num += num*power;
-            if(higher != nullptr) higher->update();
-            return 0;
-        }
-    }
 };
 
-struct state {
-    ll turn;
+struct State {
     ll sum;
-    vector<vector<machine>> machines;
-    state() {
-        turn = 0;
+    ll total_power;
+    vector<vector<MachineState>> machines;
+    vector<pl> history;
+
+    State() {
         sum = K;
-        machines.resize(L);
-        rep(i,0,L){
-            machines[i].resize(N);
-            rep(j,0,N){
-                if(i == 0){
-                    machines[i][j] = machine(i,j,nullptr,nullptr);
-                } else if(i == L-1){
-                    machines[i][j] = machine(i,j,&machines[i-1][j],nullptr);
-                } else {
-                    machines[i][j] = machine(i,j,&machines[i-1][j],&machines[i+1][j]);
-                }
+        total_power = 0;
+        machines.resize(L, vector<MachineState>(N));
+        rep(i, 0, L) {
+            rep(j, 0, N) {
+                machines[i][j] = {1, 0};
             }
         }
     }
-    void next_turn(ll ti = -1, ll tj = -1) {
-        assert(turn < T);
-        if(ti != -1 && tj != -1){
-            sum -= C[ti][tj]*(machines[ti][tj].power+1);
-            assert(sum >= 0);
-            machines[ti][tj].power++;
+
+    void simulate_turn() {
+        rep(j, 0, N) {
+            sum += A[j] * machines[0][j].num * machines[0][j].power;
+            rep(i, 1, L) {
+                machines[i - 1][j].num += machines[i][j].num * machines[i][j].power;
+            }
         }
-        rep(i,0,L){
-            sum += machines[i][0].update();
-        }
-        turn++;
+    }
+
+    bool can_upgrade(int i, int j) const {
+        return sum >= C[i][j] * (machines[i][j].power + 1);
+    }
+
+    void upgrade(int i, int j) {
+        ll cost = C[i][j] * (machines[i][j].power + 1);
+        sum -= cost;
+        machines[i][j].power++;
+        total_power++;
+    }
+
+    // レベルの総和 * 所持金 で比較
+    bool operator<(const State& other) const {
+        return (unsigned __int128) total_power < (unsigned __int128) other.total_power;
+    }
+    
+    bool operator>(const State& other) const {
+        return (unsigned __int128) total_power > (unsigned __int128) other.total_power;
     }
 };
 
-
 void solve() {
-    state st;
-    rep(_,0,T){
-        ll ti = -1, tj = -1;
-        ll min = LLONG_MAX;
-        rep(i, 0, L){
-            rep(j, 0, N){
-                if(st.sum >= C[i][j]*(st.machines[i][j].power+1)){
-                    if(chmin(min, C[i][j]*(st.machines[i][j].power+1))){
-                        ti = i;
-                        tj = j;
+    const int BEAM_WIDTH = 50;
+    vector<State> beam;
+    beam.push_back(State());
+
+    rep(t, 0, T) {
+        vector<State> next_beam;
+        
+        for (const auto& curr : beam) {
+            {
+                State next_state = curr;
+                next_state.history.push_back({-1, -1});
+                next_state.simulate_turn();
+                next_beam.push_back(next_state);
+            }
+
+            rep(i, 0, L) {
+                rep(j, 0, N) {
+                    if (curr.can_upgrade(i, j)) {
+                        State next_state = curr;
+                        next_state.upgrade(i, j);
+                        next_state.history.push_back({i, j});
+                        next_state.simulate_turn();
+                        next_beam.push_back(next_state);
                     }
                 }
             }
         }
-        st.next_turn(ti, tj);
-        if(ti != -1 && tj != -1){
-            cout << ti << " " << tj << "\n";
-        } else {
-            cout << -1 << "\n";
+
+        sort(all(next_beam), greater<State>());
+        if (next_beam.size() > BEAM_WIDTH) {
+            next_beam.resize(BEAM_WIDTH);
         }
-        cerr << "Final Sum: " << st.sum << "\n";
+        beam = next_beam;
+    }
+
+    if (!beam.empty()) {
+        const auto& best_state = beam[0];
+        for (const auto& op : best_state.history) {
+            if (op.first == -1) {
+                cout << -1 << "\n";
+            } else {
+                cout << op.first << " " << op.second << "\n";
+            }
+        }
+        cerr << "Final Sum: " << best_state.sum << "\n";
     }
 }
 
 int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
     cin >> N >> L >> T >> K;
     A.resize(N);
     rep(i,0,N) {
