@@ -2,175 +2,117 @@
 #include <atcoder/all>
 using namespace std;
 using ll = long long;
-using ld = long double;
-using mint = atcoder::modint998244353;
-using vl = vector<ll>;
-using vvl = vector<vl>;
-using vvvl = vector<vvl>;
-using vi = vector<int>;
-using vvi = vector<vi>;
-using vvvi = vector<vvi>;
-using vb = vector<bool>;
-using vvb = vector<vb>;
-using vvvb = vector<vvb>;
-using vs = vector<string>;
-using vvs = vector<vs>;
 using pl = pair<ll, ll>;
-using vpl = vector<pl>;
+using vvl = vector<vector<ll>>;
+
 #define rep(i, a, b) for (ll i = (a); i < (ll)(b); i++)
-#define all(v) v.begin(), v.end()
-
-template <typename T>
-inline bool chmax(T &a, const T &b) {
-    if (a < b) {
-        a = b;
-        return true;
-    }
-    return false;
-}
-
-template <typename T>
-inline bool chmin(T &a, const T &b) {
-    if (a > b) {
-        a = b;
-        return true;
-    }
-    return false;
-}
-
 
 ll N = 20;
-vvl a(20, vl(20));
+vvl a(20, vector<ll>(20));
 
-
-ll dist(pl p1, pl p2) {
-    return abs(p1.first - p2.first) + abs(p1.second - p2.second);
+pl get_home(ll val) {
+    return {val / 20, val % 20};
 }
 
-struct Task {
-    ll val;
-    pl p[2];
-};
-
 void solve() {
-    map<ll, vpl> m;
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            if (a[i][j] != -1) m[a[i][j]].push_back({(ll)i, (ll)j});
+    vector<char> moves;
+    ll cur_i = 0, cur_j = 0;
+    stack<ll> st;
+    vvl now = a; 
+    ll count = 0;
+    ll turn = 0;
+
+    auto move_to = [&](ll ti, ll tj) {
+        while (cur_i != ti || cur_j != tj) {
+            if (cur_i < ti) { moves.push_back('D'); cur_i++; }
+            else if (cur_i > ti) { moves.push_back('U'); cur_i--; }
+            else if (cur_j < tj) { moves.push_back('R'); cur_j++; }
+            else if (cur_j > tj) { moves.push_back('L'); cur_j--; }
+            turn++;
+            if (turn >= 16000) return;
         }
-    }
+    };
 
-    vector<Task> tasks;
-    for (auto const& [val, pos] : m) {
-        if (pos.size() == 2) {
-            tasks.push_back({val, {pos[0], pos[1]}});
-        }
-    }
-
-    int M = tasks.size();
-    if (M == 0) return;
-
-    vl order;
-    vl ori;
-    vb used(M, false);
-    pl cur = {0, 0};
-
-    for (int i = 0; i < M; i++) {
-        int best_idx = -1;
-        ll min_d = 1e18;
-        int best_o = 0;
-        for (int j = 0; j < M; j++) {
-            if (used[j]) continue;
-            for (int o = 0; o < 2; o++) {
-                ll d = dist(cur, tasks[j].p[o]);
+    auto find_nearest_empty = [&](ll si, ll sj) {
+        ll min_d = 1e9;
+        pl best = {-1, -1};
+        rep(r, 0, N) rep(c, 0, N) {
+            if (now[r][c] == -1) {
+                ll d = abs(si - r) + abs(sj - c);
+                if (r >= 10) d -= 2; 
                 if (d < min_d) {
                     min_d = d;
-                    best_idx = j;
-                    best_o = o;
+                    best = {r, c};
                 }
             }
         }
-        used[best_idx] = true;
-        order.push_back(best_idx);
-        ori.push_back(best_o);
-        cur = tasks[best_idx].p[1 - best_o];
-    }
-
-    auto get_total_dist = [&]() {
-        ll total = 0;
-        pl p_prev = {0, 0};
-        for (int i = 0; i < M; i++) {
-            total += dist(p_prev, tasks[order[i]].p[ori[i]]);
-            total += dist(tasks[order[i]].p[ori[i]], tasks[order[i]].p[1 - ori[i]]);
-            p_prev = tasks[order[i]].p[1 - ori[i]];
-        }
-        return total;
+        return best;
     };
 
-    ll current_dist = get_total_dist();
-    mt19937 engine(42);
-    auto start_time = chrono::steady_clock::now();
-
-    while (true) {
-        auto now_time = chrono::steady_clock::now();
-        if (chrono::duration_cast<chrono::milliseconds>(now_time - start_time).count() > 1800) break;
-
-        int type = engine() % 100;
-        if (type < 30) {
-            int i = engine() % M;
-            int j = engine() % M;
-            if (i == j) continue;
-            swap(order[i], order[j]);
-            ll next_dist = get_total_dist();
-            if (next_dist < current_dist) current_dist = next_dist;
-            else swap(order[i], order[j]);
-        } else if (type < 60) {
-            int i = engine() % M;
-            ori[i] = 1 - ori[i];
-            ll next_dist = get_total_dist();
-            if (next_dist < current_dist) current_dist = next_dist;
-            else ori[i] = 1 - ori[i];
+    while (turn < 16000 && count < 200) {
+        if (st.empty()) {
+            ll min_dist = 1e9;
+            pl best_target = {-1, -1};
+            rep(r, 0, N) rep(c, 0, N) {
+                if (now[r][c] != -1) {
+                    pl home = get_home(now[r][c]);
+                    if (r == home.first && c == home.second) continue; 
+                    ll dist = abs(cur_i - r) + abs(cur_j - c);
+                    if (dist < min_dist) {
+                        min_dist = dist;
+                        best_target = {r, c};
+                    }
+                }
+            }
+            if (best_target.first == -1) break; 
+            move_to(best_target.first, best_target.second);
+            if (turn >= 16000) break;
+            moves.push_back('Z');
+            st.push(now[cur_i][cur_j]);
+            now[cur_i][cur_j] = -1;
+            turn++;
         } else {
-            int i = engine() % M;
-            int j = engine() % M;
-            if (i > j) swap(i, j);
-            if (i == j) continue;
-            reverse(order.begin() + i, order.begin() + j + 1);
-            ll next_dist = get_total_dist();
-            if (next_dist < current_dist) current_dist = next_dist;
-            else reverse(order.begin() + i, order.begin() + j + 1);
+            ll val = st.top();
+            pl home = get_home(val);
+            if (now[home.first][home.second] == -1 || now[home.first][home.second] == val) {
+                move_to(home.first, home.second);
+            } else {
+                ll occupant = now[home.first][home.second];
+                pl occ_home = get_home(occupant);
+                if (home.first == occ_home.first && home.second == occ_home.second) {
+                    pl alt = find_nearest_empty(cur_i, cur_j);
+                    move_to(alt.first, alt.second);
+                } else {
+                    move_to(home.first, home.second);
+                }
+            }
+            if (turn >= 16000) break;
+            if (now[cur_i][cur_j] == -1) {
+                moves.push_back('X');
+                now[cur_i][cur_j] = val;
+                st.pop();
+            } else if (now[cur_i][cur_j] == val) {
+                moves.push_back('Z');
+                now[cur_i][cur_j] = -1;
+                st.pop();
+                count++;
+            } else {
+                moves.push_back('Z');
+                st.push(now[cur_i][cur_j]);
+                now[cur_i][cur_j] = -1;
+            }
+            turn++;
         }
     }
-
-    auto move_to = [&](pl target, pl& now, vector<char>& res) {
-        while (now.first < target.first) { res.push_back('D'); now.first++; }
-        while (now.first > target.first) { res.push_back('U'); now.first--; }
-        while (now.second < target.second) { res.push_back('R'); now.second++; }
-        while (now.second > target.second) { res.push_back('L'); now.second--; }
-    };
-
-    vector<char> moves;
-    pl now_p = {0, 0};
-    for (int i = 0; i < M; i++) {
-        move_to(tasks[order[i]].p[ori[i]], now_p, moves);
-        moves.push_back('Z');
-        move_to(tasks[order[i]].p[1 - ori[i]], now_p, moves);
-        moves.push_back('Z');
-    }
-
-    for (int i = 0; i < (int)moves.size() && i < 16000; i++) {
-        cout << moves[i] << "\n";
-    }
+    for (char m : moves) cout << m << "\n";
 }
 
 int main() {
-    cin >> N;
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+    if (!(cin >> N)) return 0;
     a.assign(N, vector<ll>(N));
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            cin >> a[i][j];
-        }
-    }
+    rep(i, 0, N) rep(j, 0, N) cin >> a[i][j];
     solve();
     return 0;
 }
