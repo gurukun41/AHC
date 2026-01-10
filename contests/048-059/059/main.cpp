@@ -2,116 +2,164 @@
 #include <atcoder/all>
 using namespace std;
 using ll = long long;
+using ld = long double;
+using mint = atcoder::modint998244353;
+using vl = vector<ll>;
+using vvl = vector<vl>;
+using vvvl = vector<vvl>;
+using vi = vector<int>;
+using vvi = vector<vi>;
+using vvvi = vector<vvi>;
+using vb = vector<bool>;
+using vvb = vector<vb>;
+using vvvb = vector<vvb>;
+using vs = vector<string>;
+using vvs = vector<vs>;
 using pl = pair<ll, ll>;
-using vvl = vector<vector<ll>>;
-
+using vpl = vector<pl>;
 #define rep(i, a, b) for (ll i = (a); i < (ll)(b); i++)
+#define all(v) v.begin(), v.end()
+
+template <typename T>
+inline bool chmax(T &a, const T &b) {
+    if (a < b) {
+        a = b;
+        return true;
+    }
+    return false;
+}
+
+template <typename T>
+inline bool chmin(T &a, const T &b) {
+    if (a > b) {
+        a = b;
+        return true;
+    }
+    return false;
+}
 
 ll N = 20;
-vvl a(20, vector<ll>(20));
-
-pl get_home(ll val) {
-    return {val / 20, val % 20};
-}
+vvl a(20, vl(20));
 
 void solve() {
     vector<char> moves;
-    ll cur_i = 0, cur_j = 0;
+    ll i = 0, j = 0;
     stack<ll> st;
-    vvl now = a; 
+    vvl now = a;
     ll count = 0;
     ll turn = 0;
 
-    auto move_to = [&](ll ti, ll tj) {
-        while (cur_i != ti || cur_j != tj) {
-            if (cur_i < ti) { moves.push_back('D'); cur_i++; }
-            else if (cur_i > ti) { moves.push_back('U'); cur_i--; }
-            else if (cur_j < tj) { moves.push_back('R'); cur_j++; }
-            else if (cur_j > tj) { moves.push_back('L'); cur_j--; }
-            turn++;
-            if (turn >= 16000) return;
-        }
-    };
-
-    auto find_nearest_empty = [&](ll si, ll sj) {
-        ll min_d = 1e9;
-        pl best = {-1, -1};
-        rep(r, 0, N) rep(c, 0, N) {
-            if (now[r][c] == -1) {
-                ll d = abs(si - r) + abs(sj - c);
-                if (r >= 10) d -= 2; 
-                if (d < min_d) {
-                    min_d = d;
-                    best = {r, c};
-                }
-            }
-        }
-        return best;
-    };
+    // 目的地リスト（順番に消化していく）
+    deque<pl> target_queue;
 
     while (turn < 16000 && count < 200) {
-        if (st.empty()) {
+        // 現在の目的地がある場合、そこへ向かう
+        if (!target_queue.empty()) {
+            pl target = target_queue.front();
+            
+            if (target != pl{i, j}) {
+                // 移動処理
+                if (target.first < i) { moves.push_back('U'); i--; }
+                else if (target.first > i) { moves.push_back('D'); i++; }
+                else if (target.second < j) { moves.push_back('L'); j--; }
+                else if (target.second > j) { moves.push_back('R'); j++; }
+                turn++;
+                continue;
+            } else {
+                // 目的地に到着
+                target_queue.pop_front();
+                moves.push_back('Z');
+                if (!st.empty() && st.top() == now[i][j]) {
+                    st.pop();
+                    count++;
+                } else {
+                    st.push(now[i][j]);
+                }
+                now[i][j] = -1;
+                turn++;
+                continue;
+            }
+        }
+
+        // 目的地リストが空の場合、新しい経路を計画する
+        if (target_queue.empty()) {
             ll min_dist = 1e9;
-            pl best_target = {-1, -1};
-            rep(r, 0, N) rep(c, 0, N) {
-                if (now[r][c] != -1) {
-                    pl home = get_home(now[r][c]);
-                    if (r == home.first && c == home.second) continue; 
-                    ll dist = abs(cur_i - r) + abs(cur_j - c);
+            pl a1 = {-1, -1};
+            
+            // 1. 最も近いカード(A1)を探す
+            rep(ni, 0, N) rep(nj, 0, N) {
+                if (now[ni][nj] != -1) {
+                    ll dist = abs(i - ni) + abs(j - nj);
                     if (dist < min_dist) {
                         min_dist = dist;
-                        best_target = {r, c};
+                        a1 = {ni, nj};
                     }
                 }
             }
-            if (best_target.first == -1) break; 
-            move_to(best_target.first, best_target.second);
-            if (turn >= 16000) break;
-            moves.push_back('Z');
-            st.push(now[cur_i][cur_j]);
-            now[cur_i][cur_j] = -1;
-            turn++;
-        } else {
-            ll val = st.top();
-            pl home = get_home(val);
-            if (now[home.first][home.second] == -1 || now[home.first][home.second] == val) {
-                move_to(home.first, home.second);
-            } else {
-                ll occupant = now[home.first][home.second];
-                pl occ_home = get_home(occupant);
-                if (home.first == occ_home.first && home.second == occ_home.second) {
-                    pl alt = find_nearest_empty(cur_i, cur_j);
-                    move_to(alt.first, alt.second);
-                } else {
-                    move_to(home.first, home.second);
+
+            if (a1 == pl{-1, -1}) break; // カードがない
+
+            // 2. A1のペア(A2)を探す
+            pl a2 = {-1, -1};
+            ll val_a = now[a1.first][a1.second];
+            rep(ni, 0, N) rep(nj, 0, N) {
+                if ((ni != a1.first || nj != a1.second) && now[ni][nj] == val_a) {
+                    a2 = {ni, nj};
+                    break;
                 }
             }
-            if (turn >= 16000) break;
-            if (now[cur_i][cur_j] == -1) {
-                moves.push_back('X');
-                now[cur_i][cur_j] = val;
-                st.pop();
-            } else if (now[cur_i][cur_j] == val) {
-                moves.push_back('Z');
-                now[cur_i][cur_j] = -1;
-                st.pop();
-                count++;
-            } else {
-                moves.push_back('Z');
-                st.push(now[cur_i][cur_j]);
-                now[cur_i][cur_j] = -1;
+
+            // 3. A1からA2への経路計画（ネスト構造の構築）
+            // 基本ルート: A1 -> A2
+            target_queue.push_back(a1);
+            
+            // 4. A1とA2の矩形範囲内に、他のペア(B1, B2)がまるごと入っていないか探す
+            ll r_min = min(a1.first, a2.first), r_max = max(a1.first, a2.first);
+            ll c_min = min(a1.second, a2.second), c_max = max(a1.second, a2.second);
+
+            vector<ll> nested_vals;
+            rep(ni, r_min, r_max + 1) rep(nj, c_min, c_max + 1) {
+                ll val_b = now[ni][nj];
+                if (val_b != -1 && val_b != val_a) {
+                    // ペアのもう片方もこの範囲内に隠れているか？
+                    pl b1 = {ni, nj};
+                    pl b2 = {-1, -1};
+                    rep(mi, r_min, r_max + 1) rep(mj, c_min, c_max + 1) {
+                        if ((mi != ni || mj != nj) && now[mi][mj] == val_b) {
+                            b2 = {mi, mj};
+                            break;
+                        }
+                    }
+                    // ペアが両方とも矩形内にあり、まだリストに入れていなければ採用
+                    if (b2 != pl{-1, -1}) {
+                        bool already = false;
+                        for(auto v : nested_vals) if(v == val_b) already = true;
+                        if(!already) {
+                            // A1 -> B1 -> B2 -> A2 の形にするためキューに入れる
+                            // ※簡易化のため1つのペアだけネストさせる（複数入れる場合はソートが必要）
+                            target_queue.push_back(b1);
+                            target_queue.push_back(b2);
+                            nested_vals.push_back(val_b);
+                            
+                            // 他のペアをこれ以上探さない（スタックが深くなりすぎるのを防ぐ）
+                            if(nested_vals.size() >= 1) goto end_planning; 
+                        }
+                    }
+                }
             }
-            turn++;
+            
+            end_planning:
+            target_queue.push_back(a2);
         }
     }
+
+    // 出力
     for (char m : moves) cout << m << "\n";
 }
 
 int main() {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
     if (!(cin >> N)) return 0;
-    a.assign(N, vector<ll>(N));
+    a.assign(N, vl(N));
     rep(i, 0, N) rep(j, 0, N) cin >> a[i][j];
     solve();
     return 0;
