@@ -2,165 +2,188 @@
 #include <atcoder/all>
 using namespace std;
 using ll = long long;
-using ld = long double;
-using mint = atcoder::modint998244353;
-using vl = vector<ll>;
-using vvl = vector<vl>;
-using vvvl = vector<vvl>;
-using vi = vector<int>;
-using vvi = vector<vi>;
-using vvvi = vector<vvi>;
-using vb = vector<bool>;
-using vvb = vector<vb>;
-using vvvb = vector<vvb>;
-using vs = vector<string>;
-using vvs = vector<vs>;
 using pl = pair<ll, ll>;
 using vpl = vector<pl>;
+using vl = vector<ll>;
+using vvl = vector<vl>;
+
 #define rep(i, a, b) for (ll i = (a); i < (ll)(b); i++)
 #define all(v) v.begin(), v.end()
 
-template <typename T>
-inline bool chmax(T &a, const T &b) {
-    if (a < b) {
-        a = b;
-        return true;
-    }
-    return false;
-}
-
-template <typename T>
-inline bool chmin(T &a, const T &b) {
-    if (a > b) {
-        a = b;
-        return true;
-    }
-    return false;
-}
-
 ll N = 20;
-vvl a(20, vl(20));
+vvl initial_board(20, vl(20));
+
+struct CardPair {
+    ll val;
+    pl p1, p2;
+    bool cleared;
+};
+
+// シミュレーション結果を保持する構造体
+struct Result {
+    ll score;
+    ll pair_count;
+    vector<char> moves;
+};
+
+// 指定した順序でシミュレーションを実行する関数
+Result simulate(const vector<int>& order, const vector<CardPair>& original_pairs) {
+    vector<CardPair> pairs = original_pairs;
+    vvl now = initial_board;
+    ll i = 0, j = 0;
+    ll turn = 0;
+    ll count = 0;
+    vector<char> moves;
+    stack<ll> st;
+
+    auto move_to = [&](pl target) {
+        while (pl{i, j} != target && turn < 16000) {
+            if (target.first < i) { moves.push_back('U'); i--; }
+            else if (target.first > i) { moves.push_back('D'); i++; }
+            else if (target.second < j) { moves.push_back('L'); j--; }
+            else if (target.second > j) { moves.push_back('R'); j++; }
+            turn++;
+        }
+    };
+
+    auto action_z = [&]() {
+        if (turn >= 16000) return;
+        moves.push_back('Z');
+        ll val = now[i][j];
+        if (!st.empty() && st.top() == val) {
+            st.pop();
+            count++;
+        } else {
+            st.push(val);
+        }
+        now[i][j] = -1;
+        turn++;
+    };
+
+    vector<bool> pair_done(pairs.size(), false);
+
+    for (int idx : order) {
+        if (pair_done[idx]) continue;
+        if (turn >= 16000) break;
+
+        CardPair& p = pairs[idx];
+        
+        // A1へ移動
+        move_to(p.p1);
+        action_z();
+
+        // A1からA2への経路の矩形範囲内に他のペアがあるかチェック（ネスト）
+        ll r_min = min(p.p1.first, p.p2.first), r_max = max(p.p1.first, p.p2.first);
+        ll c_min = min(p.p1.second, p.p2.second), c_max = max(p.p1.second, p.p2.second);
+
+        for (int next_idx : order) {
+            if (pair_done[next_idx] || next_idx == idx) continue;
+            CardPair& np = pairs[next_idx];
+            // 両方のカードが矩形内にあればネスト回収
+            if (np.p1.first >= r_min && np.p1.first <= r_max && np.p1.second >= c_min && np.p1.second <= c_max &&
+                np.p2.first >= r_min && np.p2.first <= r_max && np.p2.second >= c_min && np.p2.second <= c_max) {
+                
+                move_to(np.p1);
+                action_z();
+                move_to(np.p2);
+                action_z();
+                pair_done[next_idx] = true;
+            }
+        }
+
+        // 本来の目的地 A2へ移動
+        move_to(p.p2);
+        action_z();
+        pair_done[idx] = true;
+    }
+
+    return {turn, count, moves};
+}
 
 void solve() {
-    vector<char> moves;
-    ll i = 0, j = 0;
-    stack<ll> st;
-    vvl now = a;
-    ll count = 0;
-    ll turn = 0;
-
-    // 目的地リスト（順番に消化していく）
-    deque<pl> target_queue;
-
-    while (turn < 16000 && count < 200) {
-        // 現在の目的地がある場合、そこへ向かう
-        if (!target_queue.empty()) {
-            pl target = target_queue.front();
-            
-            if (target != pl{i, j}) {
-                // 移動処理
-                if (target.first < i) { moves.push_back('U'); i--; }
-                else if (target.first > i) { moves.push_back('D'); i++; }
-                else if (target.second < j) { moves.push_back('L'); j--; }
-                else if (target.second > j) { moves.push_back('R'); j++; }
-                turn++;
-                continue;
-            } else {
-                // 目的地に到着
-                target_queue.pop_front();
-                moves.push_back('Z');
-                if (!st.empty() && st.top() == now[i][j]) {
-                    st.pop();
-                    count++;
-                } else {
-                    st.push(now[i][j]);
-                }
-                now[i][j] = -1;
-                turn++;
-                continue;
-            }
-        }
-
-        // 目的地リストが空の場合、新しい経路を計画する
-        if (target_queue.empty()) {
-            ll min_dist = 1e9;
-            pl a1 = {-1, -1};
-            
-            // 1. 最も近いカード(A1)を探す
-            rep(ni, 0, N) rep(nj, 0, N) {
-                if (now[ni][nj] != -1) {
-                    ll dist = abs(i - ni) + abs(j - nj);
-                    if (dist < min_dist) {
-                        min_dist = dist;
-                        a1 = {ni, nj};
-                    }
-                }
-            }
-
-            if (a1 == pl{-1, -1}) break; // カードがない
-
-            // 2. A1のペア(A2)を探す
-            pl a2 = {-1, -1};
-            ll val_a = now[a1.first][a1.second];
-            rep(ni, 0, N) rep(nj, 0, N) {
-                if ((ni != a1.first || nj != a1.second) && now[ni][nj] == val_a) {
-                    a2 = {ni, nj};
-                    break;
-                }
-            }
-
-            // 3. A1からA2への経路計画（ネスト構造の構築）
-            // 基本ルート: A1 -> A2
-            target_queue.push_back(a1);
-            
-            // 4. A1とA2の矩形範囲内に、他のペア(B1, B2)がまるごと入っていないか探す
-            ll r_min = min(a1.first, a2.first), r_max = max(a1.first, a2.first);
-            ll c_min = min(a1.second, a2.second), c_max = max(a1.second, a2.second);
-
-            vector<ll> nested_vals;
-            rep(ni, r_min, r_max + 1) rep(nj, c_min, c_max + 1) {
-                ll val_b = now[ni][nj];
-                if (val_b != -1 && val_b != val_a) {
-                    // ペアのもう片方もこの範囲内に隠れているか？
-                    pl b1 = {ni, nj};
-                    pl b2 = {-1, -1};
-                    rep(mi, r_min, r_max + 1) rep(mj, c_min, c_max + 1) {
-                        if ((mi != ni || mj != nj) && now[mi][mj] == val_b) {
-                            b2 = {mi, mj};
-                            break;
-                        }
-                    }
-                    // ペアが両方とも矩形内にあり、まだリストに入れていなければ採用
-                    if (b2 != pl{-1, -1}) {
-                        bool already = false;
-                        for(auto v : nested_vals) if(v == val_b) already = true;
-                        if(!already) {
-                            // A1 -> B1 -> B2 -> A2 の形にするためキューに入れる
-                            // ※簡易化のため1つのペアだけネストさせる（複数入れる場合はソートが必要）
-                            target_queue.push_back(b1);
-                            target_queue.push_back(b2);
-                            nested_vals.push_back(val_b);
-                            
-                            // 他のペアをこれ以上探さない（スタックが深くなりすぎるのを防ぐ）
-                            if(nested_vals.size() >= 1) goto end_planning; 
-                        }
-                    }
-                }
-            }
-            
-            end_planning:
-            target_queue.push_back(a2);
-        }
+    // 1. ペア情報の抽出
+    map<ll, vpl> card_positions;
+    rep(r, 0, N) rep(c, 0, N) {
+        card_positions[initial_board[r][c]].push_back({r, c});
     }
 
-    // 出力
-    for (char m : moves) cout << m << "\n";
+    vector<CardPair> pairs;
+    for (auto const& [val, pos] : card_positions) {
+        pairs.push_back({val, pos[0], pos[1], false});
+    }
+
+    int M = pairs.size();
+    vector<int> current_order(M);
+    iota(all(current_order), 0);
+
+    // 初期の貪欲解（近い順に並び替え）
+    // ここでは単純な初期解からスタート
+    Result best_res = simulate(current_order, pairs);
+
+    // 2. 焼きなましループ
+    auto start_time = chrono::system_clock::now();
+    double duration = 0;
+    int iter = 0;
+    
+    // 時間制限 (例: 1.8秒)
+    const double TIME_LIMIT = 1800.0; 
+
+    random_device rd;
+    mt19937 engine(rd());
+    
+    while (true) {
+        auto now_time = chrono::system_clock::now();
+        duration = chrono::duration_cast<chrono::milliseconds>(now_time - start_time).count();
+        if (duration > TIME_LIMIT) break;
+
+        vector<int> next_order = current_order;
+        
+        // 近傍: 2点スワップ
+        int idx1 = engine() % M;
+        int idx2 = engine() % M;
+        swap(next_order[idx1], next_order[idx2]);
+
+        Result next_res = simulate(next_order, pairs);
+
+        // 評価: ペア数が多いほど良く、同じなら手数が少ないほど良い
+        bool accept = false;
+        if (next_res.pair_count > best_res.pair_count) {
+            accept = true;
+        } else if (next_res.pair_count == best_res.pair_count) {
+            if (next_res.score < best_res.score) {
+                accept = true;
+            } else {
+                // 焼きなましの確率判定（簡易版）
+                double temp = (TIME_LIMIT - duration) / TIME_LIMIT;
+                double prob = exp((double)(best_res.score - next_res.score) / (temp * 10.0 + 0.1));
+                if (prob > (double)(engine() % 1000) / 1000.0) {
+                    accept = true;
+                }
+            }
+        }
+
+        if (accept) {
+            current_order = next_order;
+            if (next_res.pair_count > best_res.pair_count || 
+               (next_res.pair_count == best_res.pair_count && next_res.score < best_res.score)) {
+                best_res = next_res;
+            }
+        }
+        iter++;
+    }
+
+    // 最終結果の出力
+    for (char m : best_res.moves) {
+        cout << m << "\n";
+    }
 }
 
 int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
     if (!(cin >> N)) return 0;
-    a.assign(N, vl(N));
-    rep(i, 0, N) rep(j, 0, N) cin >> a[i][j];
+    initial_board.assign(N, vl(N));
+    rep(i, 0, N) rep(j, 0, N) cin >> initial_board[i][j];
     solve();
     return 0;
 }
