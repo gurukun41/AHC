@@ -48,7 +48,6 @@ void yn(bool a) {
 // 時間計測
 double get_time() {
     double time;
-
 #ifdef LOCAL
     struct timespec ts;
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
@@ -58,12 +57,10 @@ double get_time() {
     auto now = system_clock::now();
     time = duration_cast<nanoseconds>(now.time_since_epoch()).count() * 1e-9;
 #endif
-
     static double START = -1.0;
     if (START == -1.0) {
         START = time;
     }
-
 #ifdef LOCAL
     return (time - START) * 1.0;
 #else
@@ -86,273 +83,252 @@ namespace rnd {
         return ret;
     }
 
-    inline uint64_t next64() {
-        return (uint64_t)next() << 32 | (uint64_t)next();
-    }
-
-    inline double nextf() {
-        uint64_t v = 0x3ff0000000000000ULL | ((uint64_t)next() << 20);
-        double d;
-        memcpy(&d, &v, sizeof(double));
-        return d - 1.0;
-    }
-
     inline size_t get(size_t n) {
-        assert(0 < n && n <= UINT32_MAX);
+        if (n == 0) return 0;
         return (size_t)((uint64_t)next() * n >> 32);
     }
 
     inline size_t range(size_t a, size_t b) {
-        assert(a < b);
+        if (a >= b) return a;
         return get(b - a) + a;
     }
-}
-
-// 全点対最短距離を求める関数
-// 計算量: O(N(N+M)) = O(N^2 + NM)
-// BFSをN回実行するため、各BFSがO(N+M)でそれをN回行う
-vvl calc_all_pairs_shortest_path(ll n, const vvl& g) {
-    vvl dist(n, vl(n, 1e18)); // 初期値を無限大に設定
-    
-    // 各頂点を始点としてBFS
-    rep(start, 0, n) {
-        dist[start][start] = 0;
-        queue<ll> q;
-        q.push(start);
-        
-        while (!q.empty()) {
-            ll v = q.front();
-            q.pop();
-            
-            for (ll nv : g[v]) {
-                if (dist[start][nv] == 1e18) {
-                    dist[start][nv] = dist[start][v] + 1;
-                    q.push(nv);
-                }
-            }
-        }
-    }
-    
-    return dist;
 }
 
 // グローバル変数
 ll N, M, K, T;
 vvl graph;
 vl X, Y;
-vvl dist; // 全点対最短距離
+vvl dist_matrix; // 全点対最短距離
 
-// 行動を表す構造体
-struct Action {
-    ll type; // 1: 行動1(移動), 2: 行動2(木の変更)
-    ll target; // 行動1の場合は移動先頂点番号、行動2の場合は-1
-    
-    Action() : type(1), target(-1) {}
-    Action(ll t, ll tg) : type(t), target(tg) {}
-};
-
-// 行動配列
-vector<Action> actions;
-
-// 行動配列を評価する関数（高速化版）
-// 制限違反がある場合は-1を返す
-// 制限を満たす場合はスコアを返す
-inline ll evaluate_actions(const vector<Action>& acts) {
-    // シミュレーション用の状態変数
-    static vb tree_type(100, false);
-    static vector<set<string>> shop_inventory(10);
-    
-    // 初期化
-    fill(tree_type.begin(), tree_type.begin() + N, false);
-    rep(i, 0, K) shop_inventory[i].clear();
-    
-    ll current_pos = 0;
-    ll prev_move_from = -1;
-    static string cone;
-    cone.clear();
-    
-    ll acts_size = acts.size();
-    for (ll step = 0; step < acts_size; step++) {
-        const Action& act = acts[step];
-        
-        if (act.type == 1) {
-            // 行動1: 移動
-            ll next = act.target;
-            
-            // 制限チェック2: 直前の移動元に戻っていないか（高速化のため先にチェック）
-            if (prev_move_from != -1 && next == prev_move_from) {
-                return -1;
-            }
-            
-            // 制限チェック1: 隣接頂点か
-            bool is_adjacent = false;
-            const vl& adj_list = graph[current_pos];
-            ll adj_size = adj_list.size();
-            for (ll i = 0; i < adj_size; i++) {
-                if (adj_list[i] == next) {
-                    is_adjacent = true;
-                    break;
+// 全点対最短距離の計算
+void calc_all_pairs_shortest_path(ll n, const vvl& g) {
+    dist_matrix.assign(n, vl(n, 1e18));
+    rep(start, 0, n) {
+        dist_matrix[start][start] = 0;
+        queue<ll> q;
+        q.push(start);
+        while (!q.empty()) {
+            ll v = q.front();
+            q.pop();
+            for (ll nv : g[v]) {
+                if (dist_matrix[start][nv] == 1e18) {
+                    dist_matrix[start][nv] = dist_matrix[start][v] + 1;
+                    q.push(nv);
                 }
             }
-            if (!is_adjacent) return -1;
+        }
+    }
+}
+
+struct Solution {
+    // 0 ~ N-1: 通常訪問 (移動のみ/収穫/納品)
+    // N ~ 2N-1: 味変訪問 (移動 -> 味変 -> 収穫) ※木の場合のみ
+    vector<int> waypoints;
+    ll score;
+
+    Solution() : score(0) {}
+};
+
+// 評価関数: 通過点での納品を考慮
+ll evaluate_solution(Solution& sol) {
+    ll curr = 0;
+    ll steps = 0;
+    ll prev_move_from = -1;
+    
+    string cone = "";
+    const int MAX_CONE_LEN = 100; 
+    
+    vector<bool> current_tree_flavor(N, false); // false: W, true: R
+    vector<set<string>> shops(K);
+    
+    for (int raw_target : sol.waypoints) {
+        if (steps >= T) break;
+
+        // ターゲット情報のデコード
+        int target = raw_target % N;
+        bool try_change_flavor = (raw_target >= N);
+
+        // --- 移動フェーズ ---
+        while (curr != target) {
+            if (steps >= T) break;
             
-            // 移動実行
-            prev_move_from = current_pos;
-            current_pos = next;
+            // 次の移動先を決定 (prev_move_from以外で最短方向)
+            int next = -1;
+            ll min_d = 1e18;
             
-            // 移動先での処理
-            if (current_pos >= K) {
-                // アイスクリームの木: 収穫
-                cone += (tree_type[current_pos] ? 'R' : 'W');
-            } else {
-                // ショップ: 納品
-                shop_inventory[current_pos].insert(cone);
-                cone.clear();
+            for (int adj : graph[curr]) {
+                if (adj == prev_move_from) continue;
+                
+                ll d = dist_matrix[adj][target];
+                if (d < min_d) {
+                    min_d = d;
+                    next = adj;
+                }
             }
             
-        } else {
-            // 行動2: 木の変更
-            // 制限チェック: 現在位置がバニラ味のアイスクリームの木か
-            if (current_pos < K || tree_type[current_pos]) {
-                return -1;
-            }
+            if (next == -1) { sol.score = 0; return -1; } // Error
             
-            // 木の変更実行
-            tree_type[current_pos] = true;
+            prev_move_from = curr;
+            curr = next;
+            steps++;
+            
+            // --- 到着した頂点での処理 ---
+            if (curr >= K) { 
+                // 木の場合：収穫
+                char flavor = current_tree_flavor[curr] ? 'R' : 'W';
+                if (cone.size() < MAX_CONE_LEN) {
+                    cone += flavor;
+                }
+            } else { 
+                // ショップの場合：納品
+                shops[curr].insert(cone);
+                cone = ""; 
+            }
+        }
+        
+        if (steps >= T) break;
+        
+        // --- Target到達時のアクション (味変) ---
+        // ターゲットに指定されたタイミングでのみ味変を試みる
+        if (try_change_flavor) {
+            // 木であり、かつ現在バニラ(白)であれば赤にする
+            if (target >= K && !current_tree_flavor[target]) {
+                if (steps < T) {
+                    current_tree_flavor[target] = true;
+                    steps++;
+                    // ※味変後に再度収穫するかは戦略次第だが、
+                    // 現状の仕様では「移動時」に収穫しているので、
+                    // ここでは味変のみでターン消費とする。
+                    // もし味変直後の赤も欲しいなら、ここに追加しても良い。
+                    // 今回はシンプルに「次回以降の通過・訪問から赤になる」とする。
+                }
+            }
         }
     }
     
     // スコア計算
-    ll score = 0;
-    for (ll i = 0; i < K; i++) {
-        score += shop_inventory[i].size();
+    ll total_score = 0;
+    rep(i, 0, K) total_score += shops[i].size();
+    
+    sol.score = total_score;
+    return total_score;
+}
+
+// 初期解生成: 貪欲法
+Solution generate_initial_solution() {
+    Solution sol;
+    
+    int curr = 0;
+    int loop_cnt = 0;
+    
+    while (sol.waypoints.size() < 300) { 
+        loop_cnt++;
+        if (loop_cnt > 2000) break; 
+        
+        bool aim_shop = (rnd::get(10) < 4); // 40%くらいで店
+        
+        int best_target = -1;
+        ll min_dist = 1e18;
+        
+        if (aim_shop) {
+            // 近くのショップ
+            rep(s, 0, K) {
+                if (s == curr) continue;
+                if (dist_matrix[curr][s] < min_dist) {
+                    min_dist = dist_matrix[curr][s];
+                    best_target = s;
+                }
+            }
+        } else {
+            // 近くの木
+            rep(t, K, N) {
+                if (t == curr) continue;
+                if (dist_matrix[curr][t] < min_dist) {
+                    min_dist = dist_matrix[curr][t];
+                    best_target = t;
+                }
+            }
+        }
+        
+        if (best_target != -1) {
+            // 木の場合、50%の確率で「味変ターゲット」として追加してみる
+            if (best_target >= K && rnd::get(2) == 0) {
+                sol.waypoints.push_back(best_target + N);
+            } else {
+                sol.waypoints.push_back(best_target);
+            }
+            curr = best_target; 
+        } else {
+            break;
+        }
     }
     
-    return score;
+    evaluate_solution(sol);
+    return sol;
 }
 
-// 近傍操作1: ランダムな位置の行動を変更
-void neighbor_operation_1(vector<Action>& acts, ll pos) {
-    if (acts[pos].type == 1) {
-        // 行動1: 移動先を変更し、それ以降を再構築
-        // pos-1番目とpos-2番目の行動1の位置を取得
-        ll current_pos = 0;
-        ll prev_move_from = -1;
+// 近傍操作
+void mutate(Solution& sol) {
+    int type = rnd::get(100);
+    
+    if (type < 40) { // Insert
+        if (sol.waypoints.size() >= 1000) return;
         
-        // pos直前の行動1を探す
-        for (ll i = pos - 1; i >= 0; i--) {
-            if (acts[i].type == 1) {
-                current_pos = acts[i].target;
-                // さらにその前の行動1を探す
-                for (ll j = i - 1; j >= 0; j--) {
-                    if (acts[j].type == 1) {
-                        prev_move_from = acts[j].target;
-                        break;
-                    }
-                }
-                break;
-            }
-        }
+        // 木を挿入する場合、味変するかどうかもランダム
+        int tree = rnd::range(K, N);
+        if (rnd::get(2) == 0) tree += N; // 味変版
         
-        // pos番目の移動先を変更
-        ll old_target = acts[pos].target;
+        int pos = rnd::get(sol.waypoints.size() + 1);
+        sol.waypoints.insert(sol.waypoints.begin() + pos, tree);
+    } 
+    else if (type < 60) { // Delete
+        if (sol.waypoints.empty()) return;
+        int pos = rnd::get(sol.waypoints.size());
+        sol.waypoints.erase(sol.waypoints.begin() + pos);
+    }
+    else if (type < 80) { // Swap
+        if (sol.waypoints.size() < 2) return;
+        int p1 = rnd::get(sol.waypoints.size());
+        int p2 = rnd::get(sol.waypoints.size());
+        swap(sol.waypoints[p1], sol.waypoints[p2]);
+    }
+    else if (type < 90) { // Change Target
+        if (sol.waypoints.empty()) return;
+        int pos = rnd::get(sol.waypoints.size());
+        int current_val = sol.waypoints[pos];
+        int current_id = current_val % N;
         
-        vl candidates;
-        for (ll adj : graph[current_pos]) {
-            if (prev_move_from == -1 || adj != prev_move_from) {
-                candidates.push_back(adj);
-            }
-        }
-        
-        if (!candidates.empty()) {
-            ll new_target = candidates[rnd::get(candidates.size())];
-            
-            // 移動先が同じならスキップ（何も変更しない）
-            if (new_target == old_target) {
-                return;
-            }
-            
-            acts[pos] = Action(1, new_target);
-            
-            // pos+1以降を再構築
-            prev_move_from = current_pos;
-            current_pos = new_target;
-            
-            for (ll i = pos + 1; i < (ll)acts.size(); i++) {
-                if (acts[i].type == 1) {
-                    vl cand;
-                    for (ll adj : graph[current_pos]) {
-                        if (prev_move_from == -1 || adj != prev_move_from) {
-                            cand.push_back(adj);
-                        }
-                    }
-                    if (!cand.empty()) {
-                        ll next = cand[rnd::get(cand.size())];
-                        acts[i] = Action(1, next);
-                        prev_move_from = current_pos;
-                        current_pos = next;
-                    }
-                }
-                // 行動2の場合は変更しない
-            }
-        }
-    } else {
-        // 行動2: 削除して以降を前に詰める
-        // 最後の行動1の位置情報を先に取得
-        ll last_pos = 0;
-        ll last_prev = -1;
-        
-        // 最後の行動1を見つける
-        for (ll i = (ll)acts.size() - 1; i >= 0; i--) {
-            if (acts[i].type == 1) {
-                last_pos = acts[i].target;
-                // その1つ前の行動1を探す
-                for (ll j = i - 1; j >= 0; j--) {
-                    if (acts[j].type == 1) {
-                        last_prev = acts[j].target;
-                        break;
-                    }
-                }
-                break;
-            }
-        }
-        
-        // 行動2を削除
-        acts.erase(acts.begin() + pos);
-        
-        // 新しい行動1を追加
-        vl candidates;
-        for (ll adj : graph[last_pos]) {
-            if (last_prev == -1 || adj != last_prev) {
-                candidates.push_back(adj);
-            }
-        }
-        
-        if (!candidates.empty()) {
-            ll next = candidates[rnd::get(candidates.size())];
-            acts.push_back(Action(1, next));
+        if (current_id < K) {
+            // 今がショップなら別のショップへ
+            sol.waypoints[pos] = rnd::get(K);
         } else {
-            acts.push_back(Action(1, graph[last_pos][0]));
+            // 今が木なら別の木へ（味変有無もランダム）
+            int next_tree = rnd::range(K, N);
+            if (rnd::get(2) == 0) next_tree += N;
+            sol.waypoints[pos] = next_tree;
+        }
+    }
+    else { // Flip Flavor (Local)
+        // あるターゲットの味変フラグを反転させる
+        if (sol.waypoints.empty()) return;
+        int pos = rnd::get(sol.waypoints.size());
+        int val = sol.waypoints[pos];
+        int id = val % N;
+        
+        // 木の場合のみ反転可能
+        if (id >= K) {
+            if (val >= N) {
+                sol.waypoints[pos] -= N; // 赤 -> 白
+            } else {
+                sol.waypoints[pos] += N; // 白 -> 赤
+            }
         }
     }
 }
 
-// 近傍操作2: ランダムな位置の前に行動2を挿入
-void neighbor_operation_2(vector<Action>& acts, ll pos) {
-    if (acts[pos].type == 1) {
-        // pos番目の1つ前に行動2を挿入
-        acts.insert(acts.begin() + pos, Action(2, -1));
-        // 最後の行動を削除
-        acts.pop_back();
-    }
-    // 行動2の場合は何もしない
-}
-
-int main(){
-    // 入力
+int main() {
     cin >> N >> M >> K >> T;
     
-    // グラフの構築
     graph.resize(N);
     rep(i, 0, M) {
         ll a, b;
@@ -361,143 +337,97 @@ int main(){
         graph[b].push_back(a);
     }
     
-    // 座標情報(必要に応じて使用)
-    X.resize(N);
-    Y.resize(N);
-    rep(i, 0, N) {
-        cin >> X[i] >> Y[i];
-    }
+    X.resize(N); Y.resize(N);
+    rep(i, 0, N) cin >> X[i] >> Y[i];
     
-    // 全点対最短距離を計算
-    dist = calc_all_pairs_shortest_path(N, graph);
+    calc_all_pairs_shortest_path(N, graph);
     
-    // 行動配列の初期化
-    actions.resize(T);
+    Solution best_sol = generate_initial_solution();
+    Solution current_sol = best_sol;
     
-    // 初期解の生成（グラフに沿った有効な行動列）
-    ll current_pos = 0;
-    ll prev_move_from = -1;
-    
-    rep(i, 0, T) {
-        // 現在位置から隣接頂点を選択
-        vl candidates;
-        for (ll adj : graph[current_pos]) {
-            // 直前の移動元でない頂点を候補に追加
-            if (prev_move_from == -1 || adj != prev_move_from) {
-                candidates.push_back(adj);
-            }
-        }
-        
-        // 候補からランダムに選択
-        ll next = candidates[rnd::get(candidates.size())];
-        
-        actions[i] = Action(1, next);
-        
-        // 状態更新
-        prev_move_from = current_pos;
-        current_pos = next;
-    }
-    
-    // 初期スコアの計算
-    ll current_score = evaluate_actions(actions);
-    cerr << "Initial Score: " << current_score << endl;
-    
-    // 焼きなまし法のメインループ
-    double start_time = get_time();
-    double time_limit = 1.8; // 制限時間
-    
+    double time_limit = 1.95; 
     ll iteration = 0;
-    ll valid = 0;
     
-    // 対数テーブルの準備
-    static double log_table[65536];
-    for (int i = 0; i < 65536; ++i) {
-        log_table[i] = log((i + 0.5) / 65536.0);
-    }
-
-    
-    while (true) {
-        if (iteration % 200 == 0) {
-            double elapsed = get_time() - start_time;
-            if (elapsed >= time_limit) {
-                break;
-            }
-            
-            // 温度パラメータの計算
-            double time_ratio = elapsed / time_limit;
-            const double T0 = 1000.0;  // 初期温度
-            const double T1 = 1.0;    // 最終温度
-            double heat = T0 * pow(T1 / T0, time_ratio);
-            
-            if (iteration % 100 == 0) {
-                cerr << "Time: " << fixed << setprecision(3) << elapsed 
-                     << "s, Iter: " << iteration 
-                     << ", Score: " << current_score 
-                     << ", Heat: " << heat << endl;
-            }
-        }
+    while (get_time() < time_limit) {
         iteration++;
+        Solution next_sol = current_sol;
+        mutate(next_sol);
         
-        // ランダムに位置を選択
-        ll pos = rnd::get(T);
+        ll score = evaluate_solution(next_sol);
         
-        // ランダムに操作を選択（操作1または操作2）
-        ll operation = rnd::get(2);
-        
-        // 現在の状態を保存
-        vector<Action> old_actions = actions;
-        ll old_score = current_score;
-        
-        // 近傍操作を適用
-        if (operation == 0) {
-            neighbor_operation_1(actions, pos);
-        } else {
-            neighbor_operation_2(actions, pos);
-        }
-        
-        // 変更がない場合はスキップ
-        if (actions[pos].target == old_actions[pos].target && 
-            actions[pos].type == old_actions[pos].type) {
-            continue;
-        }
-        
-        // 新しいスコアを計算
-        ll new_score = evaluate_actions(actions);
-        
-        // 焼きなまし法による受理判定
-        double elapsed = get_time() - start_time;
-        double time_ratio = elapsed / time_limit;
-        const double T0 = 100.0;
-        const double T1 = 1.0;
-        double heat = T0 * pow(T1 / T0, time_ratio);
-        
-        double add = heat * log_table[iteration % 65536]; // 最大化
-        
-        if (new_score >= 0 && (double)(new_score - old_score) >= add) {
-            // 改善した場合、または確率的に受理
-            current_score = new_score;
-            valid++;
-        } else {
-            // 受理しない場合は元に戻す
-            actions = old_actions;
+        if (score >= current_sol.score) {
+            current_sol = next_sol;
+            if (current_sol.score > best_sol.score) {
+                best_sol = current_sol;
+            }
         }
     }
     
-    cerr << "Finished iteration: " << iteration << endl;
-    cerr << "Accept ratio: " << fixed << setprecision(3) 
-         << ((double)valid / iteration) << endl;
-    
-    // 最終解の出力
-    rep(i, 0, T) {
-        if (actions[i].type == 1) {
-            cout << actions[i].target << endl;
-        } else {
-            cout << -1 << endl;
+    // --- 最終出力生成 ---
+    ll curr = 0;
+    ll prev_move_from = -1;
+    ll steps = 0;
+    vector<bool> current_tree_flavor(N, false);
+    string cone = ""; 
+    const int MAX_CONE_LEN = 100;
+    vector<set<string>> shops(K);
+
+    for (int raw_target : best_sol.waypoints) {
+        if (steps >= T) break;
+        
+        int target = raw_target % N;
+        bool try_change_flavor = (raw_target >= N);
+
+        // 移動
+        while (curr != target) {
+            if (steps >= T) break;
+            
+            int next = -1;
+            ll min_d = 1e18;
+            for (int adj : graph[curr]) {
+                if (adj == prev_move_from) continue;
+                ll d = dist_matrix[adj][target];
+                if (d < min_d) {
+                    min_d = d;
+                    next = adj;
+                }
+            }
+            
+            if (next == -1) break;
+            
+            cout << next << endl; // 行動1出力
+            
+            prev_move_from = curr;
+            curr = next;
+            steps++;
+
+            // 移動先での処理
+            if (curr >= K) { // 木
+                char flavor = current_tree_flavor[curr] ? 'R' : 'W';
+                if (cone.size() < MAX_CONE_LEN) cone += flavor;
+            } else { // ショップ
+                shops[curr].insert(cone);
+                cone = "";
+            }
+        }
+        
+        if (steps >= T) break;
+        
+        // 味変
+        if (try_change_flavor) {
+            if (target >= K && !current_tree_flavor[target]) {
+                if (steps < T) {
+                    cout << "-1" << endl; // 行動2出力
+                    current_tree_flavor[target] = true;
+                    steps++;
+                }
+            }
         }
     }
     
-    // 最終スコア
-    cerr << "Final Score: " << current_score << endl;
+    ll final_score = 0;
+    rep(i, 0, K) final_score += shops[i].size();
+    cerr << "Final Simulated Score: " << final_score << endl;
     
     return 0;
 }
