@@ -45,6 +45,34 @@ void yn(bool a) {
         cout << "No\n";
 }
 
+// 全点対最短距離を求める関数
+// 計算量: O(N(N+M)) = O(N^2 + NM)
+// BFSをN回実行するため、各BFSがO(N+M)でそれをN回行う
+vvl calc_all_pairs_shortest_path(ll n, const vvl& g) {
+    vvl dist(n, vl(n, 1e18)); // 初期値を無限大に設定
+    
+    // 各頂点を始点としてBFS
+    rep(start, 0, n) {
+        dist[start][start] = 0;
+        queue<ll> q;
+        q.push(start);
+        
+        while (!q.empty()) {
+            ll v = q.front();
+            q.pop();
+            
+            for (ll nv : g[v]) {
+                if (dist[start][nv] == 1e18) {
+                    dist[start][nv] = dist[start][v] + 1;
+                    q.push(nv);
+                }
+            }
+        }
+    }
+    
+    return dist;
+}
+
 // グローバル変数
 ll N, M, K, T;
 vvl graph;
