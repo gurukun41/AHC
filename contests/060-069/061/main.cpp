@@ -61,6 +61,7 @@ struct AIParams {
     AIParams() : wa(0.6), wb(0.6), wc(0.6), wd(0.6) {}
 };
 vector<AIParams> aiParams;  // 各AIプレイヤーのパラメータ
+int currentTurn = 0;  // 現在のターン数
 
 // 敵の数に応じてビーム幅を決定
 int getBeamWidth() {
@@ -262,14 +263,23 @@ vector<pl> getCandidatesForPlayer(const State& state, int player) {
     
     // 評価値でソート
     vector<pair<ld, pl>> scored;
+    
+    // 前半は陣地拡大を最優先
+    bool isExpansionPhase = (currentTurn < T / 2);
+    
     for (auto [x, y] : candidates) {
+        // レベル上限の自陣マスは候補から完全除外
+        if (state.owner[x][y] == player && state.level[x][y] >= U) {
+            continue;
+        }
         ld score = V[x][y];
+        
         // 所有状況によって重み付け
         if (state.owner[x][y] == -1) {
-            score *= 1.5;  // 未占領は高評価
+            score *= isExpansionPhase ? 5.0 : 1.5;  // 未占領は前半で超高評価
         } else if (state.owner[x][y] == player) {
             if (state.level[x][y] < U) {
-                score *= 0.8;  // 自陣強化は中評価
+                score *= isExpansionPhase ? 0.01 : 0.8;  // 自陣強化は前半でほぼ除外
             } else {
                 score *= 0.1;  // レベル上限は低評価
             }
@@ -599,6 +609,8 @@ void solve(){
     currentState.positions = FP;
     
     rep(turn, 0, T) {
+        currentTurn = turn;  // グローバル変数を更新
+        
         // 前の状態を保存（学習用）
         State prevState = currentState;
         
