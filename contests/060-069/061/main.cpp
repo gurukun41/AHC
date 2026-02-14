@@ -51,9 +51,9 @@ vpl FP;         // 各プレイヤーの初期位置
 
 vpl dir = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}}; // 移動方向
 
-const int MAX_DEPTH = 3;  // 探索深さ
-const int MY_CANDIDATES = 10;  // 自分の候補手数
-const int AI_CANDIDATES = 3;   // AIの候補手数
+const int MAX_DEPTH = 2;  // 探索深さ
+const int MY_CANDIDATES = 100;  // 自分の候補手数
+const int AI_CANDIDATES = 100;   // AIの候補手数
 
 // 敵の数に応じてビーム幅を決定
 int getBeamWidth() {
@@ -99,7 +99,43 @@ struct State {
         return scores;
     }
     
-    // 評価値（プレイヤー0のスコア比率）
+    // プレイヤーの領土の連結成分数を計算
+    int countConnectedComponents(int player) const {
+        vvb visited(N, vb(N, false));
+        int components = 0;
+        
+        rep(i, 0, N) {
+            rep(j, 0, N) {
+                if (owner[i][j] == player && !visited[i][j]) {
+                    components++;
+                    // BFSで連結成分を探索
+                    queue<pl> q;
+                    q.push({i, j});
+                    visited[i][j] = true;
+                    
+                    while (!q.empty()) {
+                        auto [x, y] = q.front();
+                        q.pop();
+                        
+                        for (auto [dx, dy] : dir) {
+                            ll nx = x + dx;
+                            ll ny = y + dy;
+                            if (nx >= 0 && nx < N && ny >= 0 && ny < N) {
+                                if (owner[nx][ny] == player && !visited[nx][ny]) {
+                                    visited[nx][ny] = true;
+                                    q.push({nx, ny});
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        return components;
+    }
+    
+    // 評価値（プレイヤー0のスコア比率 + 連結性ボーナス）
     ld evaluate() const {
         vl scores = calcScores();
         ll maxAI = 0;
@@ -107,7 +143,18 @@ struct State {
             chmax(maxAI, scores[i]);
         }
         if (maxAI == 0) return 1000.0;  // AIスコアが0の場合は高評価
-        return (ld)scores[0] / maxAI;
+        
+        ld baseScore = (ld)scores[0] / maxAI;
+        
+        // 連結性ボーナス：連結成分が少ないほど良い
+        int myComponents = countConnectedComponents(0);
+        ld connectivityBonus = 0.0;
+        if (myComponents > 0) {
+            // 連結成分が1つなら+5%、2つなら+2.5%、3つ以上は0%
+            connectivityBonus = max(0.0, 0.05 * (4.0 - myComponents) / 3.0);
+        }
+        
+        return baseScore * (1.0 + connectivityBonus);
     }
     
     bool operator<(const State& other) const {
@@ -212,7 +259,7 @@ vector<pl> getCandidatesForPlayer(const State& state, int player) {
         ld score = V[x][y];
         // 所有状況によって重み付け
         if (state.owner[x][y] == -1) {
-            score *= 2.0;  // 未占領は高評価
+            score *= 1.5;  // 未占領は高評価
         } else if (state.owner[x][y] == player) {
             if (state.level[x][y] < U) {
                 score *= 0.8;  // 自陣強化は中評価
@@ -220,7 +267,7 @@ vector<pl> getCandidatesForPlayer(const State& state, int player) {
                 score *= 0.1;  // レベル上限は低評価
             }
         } else {
-            score *= 1.5;  // 敵陣攻撃は高評価
+            score *= 2.0;  // 敵陣攻撃は高評価
         }
         scored.push_back({score, {x, y}});
     }
