@@ -55,6 +55,13 @@ const int MAX_DEPTH = 2;  // 探索深さ
 const int MY_CANDIDATES = 100;  // 自分の候補手数
 const int AI_CANDIDATES = 100;   // AIの候補手数
 
+// AIプレイヤーのパラメータ（学習用）
+struct AIParams {
+    ld wa, wb, wc, wd;  // 評価値の重み
+    AIParams() : wa(0.6), wb(0.6), wc(0.6), wd(0.6) {}
+};
+vector<AIParams> aiParams;  // 各AIプレイヤーのパラメータ
+
 // 敵の数に応じてビーム幅を決定
 int getBeamWidth() {
     // M=2: 200, M=3: 150, M=4: 100, M=5: 80, M=6: 60, M=7: 50, M=8: 40
@@ -368,7 +375,7 @@ State simulate(const State& state, const vpl& moves) {
     return nextState;
 }
 
-// AIプレイヤーの手を予測（簡易版：評価値が高い候補から選ぶ）
+// AIプレイヤーの手を予測（学習したパラメータを使用）
 pl predictAIMove(const State& state, int player) {
     vector<pl> candidates = getCandidatesForPlayer(state, player);
     
@@ -376,8 +383,110 @@ pl predictAIMove(const State& state, int player) {
         return state.positions[player];
     }
     
-    // 評価値が最も高い候補を選ぶ（問題文のアルゴリズムの簡易実装）
-    return candidates[0];
+    // 学習済みパラメータを使用
+    AIParams& params = aiParams[player - 1];  // player 1-indexed, aiParams 0-indexed
+    
+    vector<pair<ld, pl>> scored;
+    
+    for (auto [x, y] : candidates) {
+        ld evalValue = 0.0;
+        
+        if (state.owner[x][y] == -1) {
+            // 誰の領土でもない場合
+            evalValue = V[x][y] * params.wa;
+        } else if (state.owner[x][y] == player) {
+            // 自分の領土の場合
+            if (state.level[x][y] < U) {
+                evalValue = V[x][y] * params.wb;
+            } else {
+                evalValue = 0.0;  // レベル上限
+            }
+        } else {
+            // 他のプレイヤーの領土の場合
+            if (state.level[x][y] == 1) {
+                evalValue = V[x][y] * params.wc;
+            } else {
+                evalValue = V[x][y] * params.wd;
+            }
+        }
+        
+        scored.push_back({evalValue, {x, y}});
+    }
+    
+    // 評価値でソート（降順）
+    sort(all(scored), greater<pair<ld, pl>>());
+    
+    // 貪欲行動を想定（確率1-εで最大評価値を選ぶ）
+    // εは小さいと仮定して、常に最大評価値を選ぶ
+    return scored[0].second;
+}
+
+// AIの実際の行動からパラメータを学習
+void learnAIParams(const State& prevState, const State& currentState, int player, pl actualMove) {
+    vector<pl> candidates = getCandidatesForPlayer(prevState, player);
+    
+    if (candidates.empty() || candidates.size() < 2) return;
+    
+    AIParams& params = aiParams[player - 1];
+    
+    // 実際に選ばれた手のマスの状態を確認
+    auto [mx, my] = actualMove;
+    int cellOwner = prevState.owner[mx][my];
+    int cellLevel = prevState.level[mx][my];
+    
+    // 各候補の評価値を計算
+    vector<pair<ld, pl>> scored;
+    for (auto [x, y] : candidates) {
+        ld evalValue = 0.0;
+        
+        if (prevState.owner[x][y] == -1) {
+            evalValue = V[x][y] * params.wa;
+        } else if (prevState.owner[x][y] == player) {
+            if (prevState.level[x][y] < U) {
+                evalValue = V[x][y] * params.wb;
+            }
+        } else {
+            if (prevState.level[x][y] == 1) {
+                evalValue = V[x][y] * params.wc;
+            } else {
+                evalValue = V[x][y] * params.wd;
+            }
+        }
+        
+        scored.push_back({evalValue, {x, y}});
+    }
+    
+    sort(all(scored), greater<pair<ld, pl>>());
+    
+    // 実際の手が最高評価でない場合、パラメータを調整
+    if (scored[0].second != actualMove) {
+        // 学習率
+        const ld learningRate = 0.1;
+        
+        // 選ばれた手のタイプに応じてパラメータを増やす
+        if (cellOwner == -1) {
+            params.wa += learningRate;
+        } else if (cellOwner == player) {
+            if (cellLevel < U) {
+                params.wb += learningRate;
+            }
+        } else {
+            if (cellLevel == 1) {
+                params.wc += learningRate;
+            } else {
+                params.wd += learningRate;
+            }
+        }
+        
+        // パラメータの正規化（合計を一定に保つ）
+        ld sum = params.wa + params.wb + params.wc + params.wd;
+        if (sum > 0) {
+            params.wa = params.wa / sum * 5.0;
+            params.wb = params.wb / sum * 5.0;
+            params.wc = params.wc / sum * 5.0;
+            params.wd = params.wd / sum * 5.0;
+        }
+    }
 }
 
 // 全プレイヤーの手を決定してシミュレート
@@ -476,6 +585,9 @@ void GetFirstInput(){
 void solve(){
     GetFirstInput();
     
+    // AIパラメータの初期化
+    aiParams.resize(M - 1);  // AIプレイヤーの数
+    
     State currentState;
     
     // 初期状態の所有者とレベルを設定
@@ -487,6 +599,9 @@ void solve(){
     currentState.positions = FP;
     
     rep(turn, 0, T) {
+        // 前の状態を保存（学習用）
+        State prevState = currentState;
+        
         // ゲーム木探索で最善手を決定
         pl move = searchBestMove(currentState);
         
@@ -497,6 +612,13 @@ void solve(){
         Get g;
         g.Getinit();
         
+        // AIの実際の行動から学習（ターン2以降）
+        if (turn > 0) {
+            rep(i, 1, M) {
+                learnAIParams(prevState, currentState, i, g.TP[i]);
+            }
+        }
+        
         // 状態を更新
         currentState.positions = g.EP;
         currentState.owner = g.O;
@@ -504,7 +626,7 @@ void solve(){
     }
 }
 
-// ビームサーチに変更
+// ビームサーチ + AIパラメータ学習（フィードバックあり）
 int main(){
     solve();
     return 0;
