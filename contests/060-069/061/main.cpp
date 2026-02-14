@@ -1,5 +1,6 @@
 #include <bits/stdc++.h>
 #include <atcoder/all>
+#include <chrono>
 using namespace std;
 using ll = long long;
 using ld = long double;
@@ -17,6 +18,8 @@ using vs = vector<string>;
 using vvs = vector<vs>;
 using pl = pair<ll, ll>;
 using vpl = vector<pl>;
+using Clock = chrono::high_resolution_clock;
+using TimePoint = chrono::time_point<Clock>;
 #define rep(i, a, b) for (ll i = (a); i < (ll)(b); i++)
 #define all(v) v.begin(), v.end()
 
@@ -62,6 +65,11 @@ struct AIParams {
 };
 vector<AIParams> aiParams;  // 各AIプレイヤーのパラメータ
 int currentTurn = 0;  // 現在のターン数
+TimePoint gameStartTime;  // ゲーム開始時刻
+TimePoint turnStartTime;  // 現在の10ターン周期の開始時刻
+const ll TOTAL_TIME_LIMIT_MS = 2000;  // 全体の制限時間(ミリ秒) = 2秒
+const ll TIME_BUFFER_MS = 100;  // 安全バッファ(100ms)
+int cachedBeamWidth = 0;  // キャッシュされたビーム幅（10ターンごとに更新）
 
 // 敵の数に応じてビーム幅を決定
 int getBeamWidth() {
@@ -75,6 +83,57 @@ int getBeamWidth() {
     return 40;  // M=8
 }
 
+// ゲーム開始からの経過時間を取得(ミリ秒)
+ll getElapsedTimeMs() {
+    auto now = Clock::now();
+    return chrono::duration_cast<chrono::milliseconds>(now - gameStartTime).count();
+}
+
+// 残りの時間バジェットを取得(ミリ秒)
+ll getRemainingBudgetMs() {
+    return TOTAL_TIME_LIMIT_MS - TIME_BUFFER_MS - getElapsedTimeMs();
+}
+
+// 現在のターンで使える目標時間を計算(ミリ秒)
+ll getTargetTimePerTurn() {
+    ll remainingBudget = getRemainingBudgetMs();
+    ll remainingTurns = T - currentTurn;
+    if (remainingTurns <= 0) return 100;  // 最低保証
+    
+    // 残りターンで均等配分（ただし最大2000ms、最小100ms）
+    ll targetTime = remainingBudget / remainingTurns;
+    return max(100LL, min(2000LL, targetTime));
+}
+
+// 10ターン周期の開始からの経過時間を取得(ミリ秒)
+ll getElapsedInCycleMs() {
+    auto now = Clock::now();
+    return chrono::duration_cast<chrono::milliseconds>(now - turnStartTime).count();
+}
+
+// 残り時間バジェットに応じてビーム幅を計算して更新（10ターンごとに呼ばれる）
+void updateBeamWidth() {
+    ll remainingBudget = getRemainingBudgetMs();
+    int baseWidth = getBeamWidth();
+    
+    // 余裕がなくなった時に幅を小さくする
+    if (remainingBudget > TOTAL_TIME_LIMIT_MS * 0.2) {
+        // 十分な時間がある（20%以上残っている）：通常の幅
+        cachedBeamWidth = baseWidth;
+    } else if (remainingBudget > TOTAL_TIME_LIMIT_MS * 0.1) {
+        // 時間が少なくなってきた（10-20%残っている）：半分に減らす
+        cachedBeamWidth = baseWidth / 2;
+    } else {
+        // 時間切迫（10%未満）：大幅に減らす
+        cachedBeamWidth = max(10, baseWidth / 4);
+    }
+}
+
+// キャッシュされたビーム幅を取得
+int getAdaptiveBeamWidth() {
+    return cachedBeamWidth;
+}
+
 // 盤面状態を表す構造体
 struct State {
     vpl positions;  // 各プレイヤーの位置
@@ -82,6 +141,7 @@ struct State {
     vvl level;      // 各マスのレベル
     pl myFirstMove; // 自分の最初の手
     ld score;       // 評価値
+    vl tileCounts;  // 各プレイヤーの所有マス数（差分更新用）
     
     State() {
         positions = vpl(M);
@@ -89,10 +149,21 @@ struct State {
         level = vvl(N, vl(N, 0));
         myFirstMove = {-1, -1};
         score = 0.0;
+        tileCounts = vl(M, 0);
     }
     
     State(const vpl& pos, const vvl& o, const vvl& l) 
-        : positions(pos), owner(o), level(l), myFirstMove({-1, -1}), score(0.0) {}
+        : positions(pos), owner(o), level(l), myFirstMove({-1, -1}), score(0.0) {
+        // マス数を計算
+        tileCounts = vl(M, 0);
+        rep(i, 0, N) {
+            rep(j, 0, N) {
+                if (owner[i][j] >= 0) {
+                    tileCounts[owner[i][j]]++;
+                }
+            }
+        }
+    }
     
     // 各プレイヤーのスコアを計算
     vl calcScores() const {
@@ -143,16 +214,30 @@ struct State {
         return components;
     }
     
-    // 評価値（プレイヤー0のスコア比率 + 連結性ボーナス）
+    // 評価値（敵が多い場合は前半マス数、少ない場合はスコア + 連結性ボーナス）
     ld evaluate() const {
-        vl scores = calcScores();
-        ll maxAI = 0;
-        rep(i, 1, M) {
-            chmax(maxAI, scores[i]);
-        }
-        if (maxAI == 0) return 1000.0;  // AIスコアが0の場合は高評価
+        bool isManyEnemies = (M >= 4);  // 敵が多い場合
+        bool isExpansionPhase = (currentTurn < T / 2);
+        ld baseScore;
         
-        ld baseScore = (ld)scores[0] / maxAI;
+        if (isManyEnemies && isExpansionPhase) {
+            // 敵が多く前半：マス目の数で評価
+            ll maxAITiles = 0;
+            rep(i, 1, M) {
+                chmax(maxAITiles, tileCounts[i]);
+            }
+            if (maxAITiles == 0) return 1000.0;
+            baseScore = (ld)tileCounts[0] / maxAITiles;
+        } else {
+            // それ以外：スコアで評価
+            vl scores = calcScores();
+            ll maxAI = 0;
+            rep(i, 1, M) {
+                chmax(maxAI, scores[i]);
+            }
+            if (maxAI == 0) return 1000.0;
+            baseScore = (ld)scores[0] / maxAI;
+        }
         
         // 連結性ボーナス：連結成分が少ないほど良い
         int myComponents = countConnectedComponents(0);
@@ -276,12 +361,12 @@ vector<pl> getCandidatesForPlayer(const State& state, int player) {
         
         // 所有状況によって重み付け
         if (state.owner[x][y] == -1) {
-            score *= isExpansionPhase ? 5.0 : 1.5;  // 未占領は前半で超高評価
+            score *= isExpansionPhase ? 10.0 : 1.5;  // 未占領は前半で超高評価
         } else if (state.owner[x][y] == player) {
             if (state.level[x][y] < U) {
                 score *= isExpansionPhase ? 0.01 : 0.8;  // 自陣強化は前半でほぼ除外
             } else {
-                score *= 0.1;  // レベル上限は低評価
+                score *= isExpansionPhase ? 0.01 : 0.8; // レベル上限は低評価
             }
         } else {
             score *= 2.0;  // 敵陣攻撃は高評価
@@ -356,6 +441,7 @@ State simulate(const State& state, const vpl& moves) {
             // 占領
             nextState.owner[x][y] = i;
             nextState.level[x][y] = 1;
+            nextState.tileCounts[i]++;  // マス数を更新
         } else if (cellOwner == i) {
             // 強化
             if (nextState.level[x][y] < U) {
@@ -367,6 +453,8 @@ State simulate(const State& state, const vpl& moves) {
             if (nextState.level[x][y] == 0) {
                 nextState.owner[x][y] = i;
                 nextState.level[x][y] = 1;
+                nextState.tileCounts[cellOwner]--;  // 元の所有者のマス数を減らす
+                nextState.tileCounts[i]++;          // 新しい所有者のマス数を増やす
             } else {
                 collected[i] = true;
             }
@@ -514,12 +602,13 @@ State simulateOneTurn(const State& state, pl myMove) {
 
 // ビームサーチで最善手を探索
 pl beamSearch(const State& initialState) {
-    int BEAM_WIDTH = getBeamWidth();  // 敵の数に応じたビーム幅
-    
     vector<State> beam;
     beam.push_back(initialState);
     
     rep(depth, 0, MAX_DEPTH) {
+        // 残り時間に応じてビーム幅を動的に調整
+        int BEAM_WIDTH = getAdaptiveBeamWidth();
+        
         vector<State> nextBeam;
         
         for (const State& state : beam) {
@@ -595,6 +684,8 @@ void GetFirstInput(){
 void solve(){
     GetFirstInput();
     
+    gameStartTime = Clock::now();  // ゲーム開始時刻を記録
+    
     // AIパラメータの初期化
     aiParams.resize(M - 1);  // AIプレイヤーの数
     
@@ -610,6 +701,12 @@ void solve(){
     
     rep(turn, 0, T) {
         currentTurn = turn;  // グローバル変数を更新
+        
+        // 10ターンごとに時間を測定してビーム幅を更新
+        if (turn % 10 == 0) {
+            turnStartTime = Clock::now();  // ターン開始時刻を記録
+            updateBeamWidth();  // ビーム幅を計算・キャッシュ
+        }
         
         // 前の状態を保存（学習用）
         State prevState = currentState;
