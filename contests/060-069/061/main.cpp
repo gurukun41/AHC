@@ -460,8 +460,8 @@ void learnAIParams(const State& prevState, const State& currentState, int player
     
     // 実際の手が最高評価でない場合、パラメータを調整
     if (scored[0].second != actualMove) {
-        // 学習率
-        const ld learningRate = 0.1;
+        // 学習率を軽く（εでランダム行動もあるため）
+        const ld learningRate = 0.02;
         
         // 選ばれた手のタイプに応じてパラメータを増やす
         if (cellOwner == -1) {
