@@ -1,6 +1,8 @@
 #include <bits/stdc++.h>
 #include <atcoder/all>
 #include <chrono>
+#include <random>
+#include <unordered_set>
 using namespace std;
 using ll = long long;
 using ld = long double;
@@ -41,16 +43,45 @@ inline bool chmin(T &a, const T &b) {
     return false;
 }
 
+// グローバル変数：盤面サイズ、プレイヤー数、ターン数、レベル上限
 ll N, M, T, U;
-vvl V;
-vpl FP;
-vpl dir = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};
+vvl V;  // 各マスの価値
+vpl FP;  // 各プレイヤーの初期位置
+vpl dir = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};  // 4方向
 
-const int MAX_DEPTH = 2;
-const int MY_CANDIDATES = 100;
+// --- Zobrist Hashing 用 ---
+// 64bit乱数生成
+uint64_t rng64() {
+    static mt19937_64 mt(12345);
+    return mt();
+}
 
+// ハッシュ用テーブル (サイズは適宜余裕を持つ)
+// owner: -1(未所属)〜M-1 まで。indexは owner+1 でアクセス
+uint64_t z_owner[55][55][20]; 
+// level: 0〜U。最大レベル+α
+uint64_t z_level[55][55][305];
+// pos: プレイヤー0〜M-1 の位置
+uint64_t z_pos[20][55][55];
+
+void initZobrist() {
+    rep(i, 0, 55) rep(j, 0, 55) {
+        rep(k, 0, 20) z_owner[i][j][k] = rng64();
+        rep(k, 0, 305) z_level[i][j][k] = rng64();
+    }
+    rep(i, 0, 20) rep(x, 0, 55) rep(y, 0, 55) {
+        z_pos[i][x][y] = rng64();
+    }
+}
+// ------------------------
+
+// ビームサーチのパラメータ
+const int MAX_DEPTH = 5;  // 先読みする深さ
+const int MY_CANDIDATES = 100;  // 自分の手の候補数上限
+
+// AIの評価パラメータ（学習用）
 struct AIParams {
-    ld wa, wb, wc, wd;
+    ld wa, wb, wc, wd;  // 各状況での重み
     AIParams() : wa(0.6), wb(0.6), wc(0.6), wd(0.6) {}
 };
 vector<AIParams> aiParams;
@@ -60,7 +91,9 @@ TimePoint gameStartTime;
 const ll TOTAL_TIME_LIMIT_MS = 1900;
 const ll TIME_BUFFER_MS = 100;
 
+// プレイヤー数に応じてビーム幅を調整（敵が多いほど計算量増加のため幅を削減）
 int getBeamWidth() {
+    return 20;
     if (M <= 2) return 200;
     if (M == 3) return 150;
     if (M == 4) return 100;
@@ -74,10 +107,11 @@ int getAdaptiveBeamWidth() {
     return getBeamWidth();
 }
 
-// 高速化用バッファ
+// 高速化用バッファ（BFSで使用）
 int visited[55][55];
 int visited_token = 0;
 
+// ゲームの状態を表す構造体
 struct State {
     vpl positions;
     vvl owner;
@@ -85,6 +119,7 @@ struct State {
     pl myFirstMove;
     ld score;
     vl tileCounts;
+    uint64_t hash; // ★ ハッシュ値を追加
     
     State() {
         positions = vpl(M);
@@ -93,14 +128,36 @@ struct State {
         myFirstMove = {-1, -1};
         score = 0.0;
         tileCounts = vl(M, 0);
+        hash = 0;
     }
     
     State(const vpl& pos, const vvl& o, const vvl& l) 
-        : positions(pos), owner(o), level(l), myFirstMove({-1, -1}), score(0.0) {
+        : positions(pos), owner(o), level(l), myFirstMove({-1, -1}), score(0.0), hash(0) {
         tileCounts = vl(M, 0);
         rep(i, 0, N) rep(j, 0, N) if (owner[i][j] >= 0) tileCounts[owner[i][j]]++;
+        computeHash(); // 初期化時に計算
+    }
+
+    // ハッシュ値を現在の盤面から計算する
+    // simulate毎に呼ぶとO(N^2)かかるが、状態コピーもO(N^2)なので許容範囲とする
+    // 高速化したい場合はsimulate内で差分更新(XOR)を行う
+    void computeHash() {
+        hash = 0;
+        rep(i, 0, N) rep(j, 0, N) {
+            // owner: -1 -> index 0, 0 -> index 1 ...
+            if (owner[i][j] + 1 < 20) {
+                hash ^= z_owner[i][j][owner[i][j] + 1];
+            }
+            if (level[i][j] < 305) {
+                hash ^= z_level[i][j][level[i][j]];
+            }
+        }
+        rep(i, 0, M) {
+            hash ^= z_pos[i][positions[i].first][positions[i].second];
+        }
     }
     
+    // 各プレイヤーのスコアを計算
     vl calcScores() const {
         vl scores(M, 0);
         rep(i, 0, N) {
@@ -113,6 +170,7 @@ struct State {
         return scores;
     }
     
+    // 指定プレイヤーの連結成分数をカウント（領土の分断度合いを評価）
     int countConnectedComponents(int player) const {
         visited_token++;
         int components = 0;
@@ -142,17 +200,20 @@ struct State {
         return components;
     }
     
+    // 状態の評価値を計算（スコア比率 + 連結性ボーナス）
     ld evaluate() const {
         bool isManyEnemies = (M >= 4);
         bool isExpansionPhase = (currentTurn < (T / 2) );
         ld baseScore;
         
+        // 敵が多く序盤の場合：タイル数で評価（早期拡張を優先）
         if (isManyEnemies && isExpansionPhase) {
             /*ll maxAITiles = 0;
             rep(i, 1, M) chmax(maxAITiles, tileCounts[i]);
             if (maxAITiles == 0) return 1000.0;*/
             baseScore = (ld)tileCounts[0] ; // / maxAITiles;
         } else {
+            // それ以外：最強AI対比のスコア比率で評価
             vl scores = calcScores();            
             ll maxAI = 0;
             rep(i, 1, M) chmax(maxAI, scores[i]);
@@ -160,6 +221,7 @@ struct State {
             baseScore = (ld)scores[0] / maxAI;
         }
         
+        // 連結性ボーナス：領土が分断されていると減点（1連結が理想）
         int myComponents = countConnectedComponents(0);
         ld connectivityBonus = 0.0;
         if (myComponents > 0) {
@@ -171,9 +233,10 @@ struct State {
     bool operator>(const State& other) const { return score > other.score; }
 };
 
+// ターン終了時の情報を受け取る構造体
 struct Get {
-    vpl TP, EP;
-    vvl O, L;
+    vpl TP, EP;  // 移動先と確定位置
+    vvl O, L;    // 所有者とレベル
     Get(){
         TP = vpl(M); EP = vpl(M);
         O = vvl(N, vl(N)); L = vvl(N, vl(N));
@@ -186,7 +249,9 @@ struct Get {
     }
 };
 
+// 指定プレイヤーが移動可能なマスをスコア順に取得
 vector<pl> getCandidatesForPlayer(const State& state, int player) {
+    // BFSで到達可能領土を探索（自分の領土を辿って到達できる範囲）
     visited_token++;
     vpl reachable;
     static pl q[2500];
@@ -208,6 +273,7 @@ vector<pl> getCandidatesForPlayer(const State& state, int player) {
         }
     }
     
+    // 到達可能領土とその隣接マスが移動候補
     int candidate_token = ++visited_token;
     vpl candidates;
     for (auto [rx, ry] : reachable) {
@@ -237,13 +303,17 @@ vector<pl> getCandidatesForPlayer(const State& state, int player) {
         }
     }
 
+    // 候補マスをスコアリング（序盤は拡張優先、終盤は強化優先）
     vector<pair<ld, pl>> scored;
     bool isExpansionPhase = (currentTurn < T / 2);
     for (auto [x, y] : candidates) {
-        if (state.owner[x][y] == player && state.level[x][y] >= U) continue;
+        if (state.owner[x][y] == player && state.level[x][y] >= U) continue;  // 上限到達は除外
         ld score = V[x][y];
+        // 未占領：序盤は高評価、終盤はやや低評価
         if (state.owner[x][y] == -1) score *= isExpansionPhase ? 10.0 : 1.5;
+        // 自領土：序盤は低評価、終盤は標準
         else if (state.owner[x][y] == player) score *= isExpansionPhase ? 0.01 : 0.8;
+        // 敵領土：攻撃は常に高評価
         else score *= 2.0;
         scored.push_back({score, {x, y}});
     }
@@ -254,11 +324,12 @@ vector<pl> getCandidatesForPlayer(const State& state, int player) {
     return result;
 }
 
+// 全プレイヤーの手を適用してシミュレーション（差分ハッシュ更新付き）
 State simulate(const State& state, const vpl& moves) {
     State nextState = state;
     vpl targetPos = moves;
     
-    // 競合解決を元のロジック（map使用）から変更せず再現
+    // 競合解決：同じマスに複数の駒が移動した場合の処理
     map<pl, vector<int>> conflicts;
     rep(i, 0, M) conflicts[targetPos[i]].push_back(i);
     
@@ -279,32 +350,61 @@ State simulate(const State& state, const vpl& moves) {
         }
     }
     
+    // 各プレイヤーの移動先での領土更新（差分ハッシュ更新）
     rep(i, 0, M) {
-        if (collected[i]) continue;
+        if (collected[i]) continue;  // 回収済みはスキップ
         auto [x, y] = targetPos[i];
         int cellOwner = state.owner[x][y];
+        
+        // ★ 変更前の状態をハッシュから除去
+        if (cellOwner + 1 < 20) nextState.hash ^= z_owner[x][y][cellOwner + 1];
+        if (state.level[x][y] < 305) nextState.hash ^= z_level[x][y][state.level[x][y]];
+        
         if (cellOwner == -1) {
+            // 占領：未占領マスを自領土に
             nextState.owner[x][y] = i;
             nextState.level[x][y] = 1;
             nextState.tileCounts[i]++;
         } else if (cellOwner == i) {
+            // 強化：自領土のレベルアップ（上限Uまで）
             if (nextState.level[x][y] < U) nextState.level[x][y]++;
         } else {
+            // 攻撃：敵領土のレベルダウン
             nextState.level[x][y]--;
             if (nextState.level[x][y] == 0) {
+                // レベル0になったら奪取成功
                 nextState.owner[x][y] = i;
                 nextState.level[x][y] = 1;
                 nextState.tileCounts[cellOwner]--;
                 nextState.tileCounts[i]++;
             } else {
+                // レベルが残っていたら攻撃失敗で駒回収
                 collected[i] = true;
             }
         }
+        
+        // ★ 変更後の状態をハッシュに追加
+        if (nextState.owner[x][y] + 1 < 20) nextState.hash ^= z_owner[x][y][nextState.owner[x][y] + 1];
+        if (nextState.level[x][y] < 305) nextState.hash ^= z_level[x][y][nextState.level[x][y]];
     }
-    rep(i, 0, M) nextState.positions[i] = collected[i] ? state.positions[i] : targetPos[i];
+    
+    // 駒の位置を更新（差分ハッシュ更新）
+    rep(i, 0, M) {
+        auto oldPos = state.positions[i];
+        auto newPos = collected[i] ? state.positions[i] : targetPos[i];
+        
+        // ★ 位置が変わった場合のみハッシュ更新
+        if (oldPos != newPos) {
+            nextState.hash ^= z_pos[i][oldPos.first][oldPos.second];  // 古い位置を除去
+            nextState.hash ^= z_pos[i][newPos.first][newPos.second];  // 新しい位置を追加
+        }
+        nextState.positions[i] = newPos;
+    }
+    
     return nextState;
 }
 
+// AIプレイヤーの次の手を予測（貪欲法）
 pl predictAIMove(const State& state, int player) {
     vpl candidates = getCandidatesForPlayer(state, player);
     AIParams& params = aiParams[player - 1];
@@ -323,28 +423,46 @@ pl predictAIMove(const State& state, int player) {
     return bestMove;
 }
 
+// ビームサーチで最善手を探索
 pl beamSearch(const State& initialState) {
     vector<State> beam;
     beam.push_back(initialState);
-    rep(depth, 0, MAX_DEPTH) {
+    // 残りターン数に応じて深さを調整（最後のターンが探索の最後になるように）
+    int searchDepth = min((ll)MAX_DEPTH, T - currentTurn);
+    // searchDepth手先まで読んでビーム展開
+    rep(depth, 0, searchDepth) {
         int BEAM_WIDTH = getAdaptiveBeamWidth();
         vector<State> nextBeam;
+        
+        // ★重複除去用のセット（この深さで既に見たハッシュを保持）
+        unordered_set<uint64_t> seenHashes;
+
         for (const State& state : beam) {
-            // ここで敵の手を1回だけ予測
+            // 各AIプレイヤーの行動を予測（貪欲法）
             vpl allMoves(M);
             rep(i, 1, M) allMoves[i] = predictAIMove(state, i);
             
+            // 自分の手の候補を取得（上位MY_CANDIDATES個に絞る）
             vpl myCandidates = getCandidatesForPlayer(state, 0);
             if (myCandidates.size() > MY_CANDIDATES) myCandidates.resize(MY_CANDIDATES);
             
+            // 各候補手について次状態を生成
             for (pl move : myCandidates) {
                 allMoves[0] = move;
                 State nextState = simulate(state, allMoves);
-                nextState.myFirstMove = (depth == 0) ? move : state.myFirstMove;
+                
+                // ★ハッシュは差分更新済みなので、重複チェックのみ
+                if (seenHashes.count(nextState.hash)) {
+                    continue; // 既に同じ状態が存在するのでスキップ
+                }
+                seenHashes.insert(nextState.hash);
+
+                nextState.myFirstMove = (depth == 0) ? move : state.myFirstMove;  // 最初の手を記憶
                 nextState.score = nextState.evaluate();
                 nextBeam.push_back(nextState);
             }
         }
+        // スコア順にソートして上位BEAM_WIDTH個を保持
         sort(all(nextBeam), greater<State>());
         if (nextBeam.size() > BEAM_WIDTH) nextBeam.resize(BEAM_WIDTH);
         beam = nextBeam;
@@ -352,7 +470,12 @@ pl beamSearch(const State& initialState) {
     return beam.empty() ? initialState.positions[0] : beam[0].myFirstMove;
 }
 
+// メイン処理
 void solve() {
+    // ★Zobrist初期化
+    initZobrist();
+
+    // 初期入力
     cin >> N >> M >> T >> U;
     V.assign(N, vl(N));
     rep(i, 0, N) rep(j, 0, N) cin >> V[i][j];
@@ -368,29 +491,34 @@ void solve() {
         currentState.level[x][y] = 1;
     }
     currentState.positions = FP;
+    currentState.computeHash(); // 初期ハッシュ計算
 
+    // ターンループ
     rep(turn, 0, T) {
         currentTurn = turn;
         State prevState = currentState;
+        // ビームサーチで最善手を決定
         pl move = beamSearch(currentState);
         cout << move.first << " " << move.second << endl;
+        // ターン終了時の状態を取得
         Get g;
         g.Getinit();
+        // AIパラメータの学習（観測した行動から重みを更新）
         if (turn > 0) rep(i, 1, M) {
             vector<pl> cand = getCandidatesForPlayer(prevState, i);
-            if (cand.size() < 2) continue;
+            if (cand.size() < 2) continue;  // 選択肢が1つしかない場合は学習なし
             auto [mx, my] = g.TP[i];
             int cO = prevState.owner[mx][my], cL = prevState.level[mx][my];
-            const ld lr = 0.02;
+            const ld lr = 0.02;  // 学習率
             AIParams& p = aiParams[i-1];
             
-            // パラメータを更新
-            if (cO == -1) p.wa += lr;
-            else if (cO == i) { if (cL < U) p.wb += lr; }
-            else if (cL == 1) p.wc += lr;
-            else p.wd += lr;
+            // AIが選んだマスの種類に応じて対応する重みを増加
+            if (cO == -1) p.wa += lr;  // 未占領を選んだ
+            else if (cO == i) { if (cL < U) p.wb += lr; }  // 自領土強化を選んだ
+            else if (cL == 1) p.wc += lr;  // レベル1の敵領土攻撃
+            else p.wd += lr;  // レベル2+の敵領土攻撃
             
-            // 正規化（合計を一定に保つ）
+            // 正規化（合計を一定に保つ：4パラメータで平均0.6）
             ld sum = p.wa + p.wb + p.wc + p.wd;
             if (sum > 0) {
                 p.wa = p.wa / sum * 2.4;
@@ -399,11 +527,15 @@ void solve() {
                 p.wd = p.wd / sum * 2.4;
             }
         }
+        // 受け取った情報で状態を更新
         currentState.positions = g.EP;
         currentState.owner = g.O;
         currentState.level = g.L;
+        // タイル数を再計算
         currentState.tileCounts.assign(M, 0);
         rep(i, 0, N) rep(j, 0, N) if (currentState.owner[i][j] >= 0) currentState.tileCounts[currentState.owner[i][j]]++;
+        // ターン更新時にもハッシュ再計算
+        currentState.computeHash();
     }
 }
 

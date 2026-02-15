@@ -1,8 +1,6 @@
 #include <bits/stdc++.h>
 #include <atcoder/all>
 #include <chrono>
-#include <random>
-#include <unordered_set>
 using namespace std;
 using ll = long long;
 using ld = long double;
@@ -49,32 +47,6 @@ vvl V;  // 各マスの価値
 vpl FP;  // 各プレイヤーの初期位置
 vpl dir = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};  // 4方向
 
-// --- Zobrist Hashing 用 ---
-// 64bit乱数生成
-uint64_t rng64() {
-    static mt19937_64 mt(12345);
-    return mt();
-}
-
-// ハッシュ用テーブル (サイズは適宜余裕を持つ)
-// owner: -1(未所属)〜M-1 まで。indexは owner+1 でアクセス
-uint64_t z_owner[55][55][20]; 
-// level: 0〜U。最大レベル+α
-uint64_t z_level[55][55][305];
-// pos: プレイヤー0〜M-1 の位置
-uint64_t z_pos[20][55][55];
-
-void initZobrist() {
-    rep(i, 0, 55) rep(j, 0, 55) {
-        rep(k, 0, 20) z_owner[i][j][k] = rng64();
-        rep(k, 0, 305) z_level[i][j][k] = rng64();
-    }
-    rep(i, 0, 20) rep(x, 0, 55) rep(y, 0, 55) {
-        z_pos[i][x][y] = rng64();
-    }
-}
-// ------------------------
-
 // ビームサーチのパラメータ
 const int MAX_DEPTH = 2;  // 先読みする深さ
 const int MY_CANDIDATES = 100;  // 自分の手の候補数上限
@@ -118,7 +90,6 @@ struct State {
     pl myFirstMove;
     ld score;
     vl tileCounts;
-    uint64_t hash; // ★ ハッシュ値を追加
     
     State() {
         positions = vpl(M);
@@ -127,33 +98,12 @@ struct State {
         myFirstMove = {-1, -1};
         score = 0.0;
         tileCounts = vl(M, 0);
-        hash = 0;
     }
     
     State(const vpl& pos, const vvl& o, const vvl& l) 
-        : positions(pos), owner(o), level(l), myFirstMove({-1, -1}), score(0.0), hash(0) {
+        : positions(pos), owner(o), level(l), myFirstMove({-1, -1}), score(0.0) {
         tileCounts = vl(M, 0);
         rep(i, 0, N) rep(j, 0, N) if (owner[i][j] >= 0) tileCounts[owner[i][j]]++;
-        computeHash(); // 初期化時に計算
-    }
-
-    // ハッシュ値を現在の盤面から計算する
-    // simulate毎に呼ぶとO(N^2)かかるが、状態コピーもO(N^2)なので許容範囲とする
-    // 高速化したい場合はsimulate内で差分更新(XOR)を行う
-    void computeHash() {
-        hash = 0;
-        rep(i, 0, N) rep(j, 0, N) {
-            // owner: -1 -> index 0, 0 -> index 1 ...
-            if (owner[i][j] + 1 < 20) {
-                hash ^= z_owner[i][j][owner[i][j] + 1];
-            }
-            if (level[i][j] < 305) {
-                hash ^= z_level[i][j][level[i][j]];
-            }
-        }
-        rep(i, 0, M) {
-            hash ^= z_pos[i][positions[i].first][positions[i].second];
-        }
     }
     
     // 各プレイヤーのスコアを計算
@@ -304,16 +254,25 @@ vector<pl> getCandidatesForPlayer(const State& state, int player) {
 
     // 候補マスをスコアリング（序盤は拡張優先、終盤は強化優先）
     vector<pair<ld, pl>> scored;
+    bool isManyEnemies = (M >= 4);
     bool isExpansionPhase = (currentTurn < T / 2);
+    bool isManyAndEarly = (isManyEnemies && isExpansionPhase);
+    
     for (auto [x, y] : candidates) {
         if (state.owner[x][y] == player && state.level[x][y] >= U) continue;  // 上限到達は除外
         ld score = V[x][y];
-        // 未占領：序盤は高評価、終盤はやや低評価
-        if (state.owner[x][y] == -1) score *= isExpansionPhase ? 10.0 : 1.5;
-        // 自領土：序盤は低評価、終盤は標準
-        else if (state.owner[x][y] == player) score *= isExpansionPhase ? 0.01 : 0.8;
-        // 敵領土：攻撃は常に高評価
-        else score *= 2.0;
+        
+        if (isManyAndEarly && isExpansionPhase) {
+            // 前半かつ多人数：拡張を最優先
+            if (state.owner[x][y] == -1) score *= 10.0;
+            else if (state.owner[x][y] == player) score *= 0.01;
+            else score *= 2.0;
+        } else {
+            // それ以外：固定の評価
+            if (state.owner[x][y] == -1) score *= 10.0;
+            else if (state.owner[x][y] == player) score *= 0.8;
+            else score *= 2.0;
+        }
         scored.push_back({score, {x, y}});
     }
     sort(all(scored), greater<pair<ld, pl>>());
@@ -408,10 +367,6 @@ pl beamSearch(const State& initialState) {
     rep(depth, 0, MAX_DEPTH) {
         int BEAM_WIDTH = getAdaptiveBeamWidth();
         vector<State> nextBeam;
-        
-        // ★重複除去用のセット（この深さで既に見たハッシュを保持）
-        unordered_set<uint64_t> seenHashes;
-
         for (const State& state : beam) {
             // 各AIプレイヤーの行動を予測（貪欲法）
             vpl allMoves(M);
@@ -425,14 +380,6 @@ pl beamSearch(const State& initialState) {
             for (pl move : myCandidates) {
                 allMoves[0] = move;
                 State nextState = simulate(state, allMoves);
-                
-                // ★ハッシュ計算と重複チェック
-                nextState.computeHash();
-                if (seenHashes.count(nextState.hash)) {
-                    continue; // 既に同じ状態が存在するのでスキップ
-                }
-                seenHashes.insert(nextState.hash);
-
                 nextState.myFirstMove = (depth == 0) ? move : state.myFirstMove;  // 最初の手を記憶
                 nextState.score = nextState.evaluate();
                 nextBeam.push_back(nextState);
@@ -448,9 +395,6 @@ pl beamSearch(const State& initialState) {
 
 // メイン処理
 void solve() {
-    // ★Zobrist初期化
-    initZobrist();
-
     // 初期入力
     cin >> N >> M >> T >> U;
     V.assign(N, vl(N));
@@ -467,7 +411,6 @@ void solve() {
         currentState.level[x][y] = 1;
     }
     currentState.positions = FP;
-    currentState.computeHash(); // 初期ハッシュ計算
 
     // ターンループ
     rep(turn, 0, T) {
@@ -510,8 +453,6 @@ void solve() {
         // タイル数を再計算
         currentState.tileCounts.assign(M, 0);
         rep(i, 0, N) rep(j, 0, N) if (currentState.owner[i][j] >= 0) currentState.tileCounts[currentState.owner[i][j]]++;
-        // ターン更新時にもハッシュ再計算
-        currentState.computeHash();
     }
 }
 
