@@ -76,7 +76,7 @@ void initZobrist() {
 // ------------------------
 
 // ビームサーチのパラメータ
-const int MAX_DEPTH = 5;  // 先読みする深さ
+const int MAX_DEPTH = 2;  // 先読みする深さ
 const int MY_CANDIDATES = 100;  // 自分の手の候補数上限
 
 // AIの評価パラメータ（学習用）
@@ -93,7 +93,6 @@ const ll TIME_BUFFER_MS = 100;
 
 // プレイヤー数に応じてビーム幅を調整（敵が多いほど計算量増加のため幅を削減）
 int getBeamWidth() {
-    return 20;
     if (M <= 2) return 200;
     if (M == 3) return 150;
     if (M == 4) return 100;
@@ -303,6 +302,19 @@ vector<pl> getCandidatesForPlayer(const State& state, int player) {
         }
     }
 
+    // 最もスコアが高い敵を特定（プレイヤー0の視点で）
+    int strongestEnemy = -1;
+    ll maxEnemyScore = 0;
+    if (player == 0) {
+        vl scores = state.calcScores();
+        rep(i, 1, M) {
+            if (scores[i] > maxEnemyScore) {
+                maxEnemyScore = scores[i];
+                strongestEnemy = i;
+            }
+        }
+    }
+    
     // 候補マスをスコアリング（序盤は拡張優先、終盤は強化優先）
     vector<pair<ld, pl>> scored;
     bool isExpansionPhase = (currentTurn < T / 2);
@@ -313,8 +325,13 @@ vector<pl> getCandidatesForPlayer(const State& state, int player) {
         if (state.owner[x][y] == -1) score *= isExpansionPhase ? 10.0 : 1.5;
         // 自領土：序盤は低評価、終盤は標準
         else if (state.owner[x][y] == player) score *= isExpansionPhase ? 0.01 : 0.8;
-        // 敵領土：攻撃は常に高評価
-        else score *= 2.0;
+        // 敵領土：攻撃は常に高評価、最強の敵ならさらにボーナス
+        else {
+            score *= 2.0;
+            if (player == 0 && state.owner[x][y] == strongestEnemy) {
+                score *= 300.0;  // 最強の敵を攻撃する場合は300倍のボーナス
+            }
+        }
         scored.push_back({score, {x, y}});
     }
     sort(all(scored), greater<pair<ld, pl>>());
@@ -324,7 +341,7 @@ vector<pl> getCandidatesForPlayer(const State& state, int player) {
     return result;
 }
 
-// 全プレイヤーの手を適用してシミュレーション（差分ハッシュ更新付き）
+// 全プレイヤーの手を適用してシミュレーション
 State simulate(const State& state, const vpl& moves) {
     State nextState = state;
     vpl targetPos = moves;
@@ -350,16 +367,11 @@ State simulate(const State& state, const vpl& moves) {
         }
     }
     
-    // 各プレイヤーの移動先での領土更新（差分ハッシュ更新）
+    // 各プレイヤーの移動先での領土更新
     rep(i, 0, M) {
         if (collected[i]) continue;  // 回収済みはスキップ
         auto [x, y] = targetPos[i];
         int cellOwner = state.owner[x][y];
-        
-        // ★ 変更前の状態をハッシュから除去
-        if (cellOwner + 1 < 20) nextState.hash ^= z_owner[x][y][cellOwner + 1];
-        if (state.level[x][y] < 305) nextState.hash ^= z_level[x][y][state.level[x][y]];
-        
         if (cellOwner == -1) {
             // 占領：未占領マスを自領土に
             nextState.owner[x][y] = i;
@@ -382,25 +394,8 @@ State simulate(const State& state, const vpl& moves) {
                 collected[i] = true;
             }
         }
-        
-        // ★ 変更後の状態をハッシュに追加
-        if (nextState.owner[x][y] + 1 < 20) nextState.hash ^= z_owner[x][y][nextState.owner[x][y] + 1];
-        if (nextState.level[x][y] < 305) nextState.hash ^= z_level[x][y][nextState.level[x][y]];
     }
-    
-    // 駒の位置を更新（差分ハッシュ更新）
-    rep(i, 0, M) {
-        auto oldPos = state.positions[i];
-        auto newPos = collected[i] ? state.positions[i] : targetPos[i];
-        
-        // ★ 位置が変わった場合のみハッシュ更新
-        if (oldPos != newPos) {
-            nextState.hash ^= z_pos[i][oldPos.first][oldPos.second];  // 古い位置を除去
-            nextState.hash ^= z_pos[i][newPos.first][newPos.second];  // 新しい位置を追加
-        }
-        nextState.positions[i] = newPos;
-    }
-    
+    rep(i, 0, M) nextState.positions[i] = collected[i] ? state.positions[i] : targetPos[i];
     return nextState;
 }
 
@@ -427,10 +422,8 @@ pl predictAIMove(const State& state, int player) {
 pl beamSearch(const State& initialState) {
     vector<State> beam;
     beam.push_back(initialState);
-    // 残りターン数に応じて深さを調整（最後のターンが探索の最後になるように）
-    int searchDepth = min((ll)MAX_DEPTH, T - currentTurn);
-    // searchDepth手先まで読んでビーム展開
-    rep(depth, 0, searchDepth) {
+    // MAX_DEPTH手先まで読んでビーム展開
+    rep(depth, 0, MAX_DEPTH) {
         int BEAM_WIDTH = getAdaptiveBeamWidth();
         vector<State> nextBeam;
         
@@ -451,7 +444,8 @@ pl beamSearch(const State& initialState) {
                 allMoves[0] = move;
                 State nextState = simulate(state, allMoves);
                 
-                // ★ハッシュは差分更新済みなので、重複チェックのみ
+                // ★ハッシュ計算と重複チェック
+                nextState.computeHash();
                 if (seenHashes.count(nextState.hash)) {
                     continue; // 既に同じ状態が存在するのでスキップ
                 }
