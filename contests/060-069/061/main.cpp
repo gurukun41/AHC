@@ -46,7 +46,7 @@ vvl V;
 vpl FP;
 vpl dir = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};
 
-const int MAX_DEPTH = 2;
+const int MAX_DEPTH = 5;
 const int MY_CANDIDATES = 100;
 
 struct AIParams {
@@ -61,13 +61,13 @@ const ll TOTAL_TIME_LIMIT_MS = 1900;
 const ll TIME_BUFFER_MS = 100;
 
 int getBeamWidth() {
-    if (M <= 2) return 200;
-    if (M == 3) return 150;
-    if (M == 4) return 100;
-    if (M == 5) return 80;
-    if (M == 6) return 60;
-    if (M == 7) return 50;
-    return 40;
+    if (M <= 2) return 20;
+    if (M == 3) return 15;
+    if (M == 4) return 10;
+    if (M == 5) return 8;
+    if (M == 6) return 6;
+    if (M == 7) return 5;
+    return 4;
 }
 
 int getAdaptiveBeamWidth() {
@@ -151,9 +151,9 @@ struct State {
             /*ll maxAITiles = 0;
             rep(i, 1, M) chmax(maxAITiles, tileCounts[i]);
             if (maxAITiles == 0) return 1000.0;*/
-            baseScore = (ld)tileCounts[0]; // / maxAITiles;
+            baseScore = (ld)tileCounts[0] ; // / maxAITiles;
         } else {
-            vl scores = calcScores();
+            vl scores = calcScores();            
             ll maxAI = 0;
             rep(i, 1, M) chmax(maxAI, scores[i]);
             if (maxAI == 0) return 1000.0;
