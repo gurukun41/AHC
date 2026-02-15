@@ -144,16 +144,16 @@ struct State {
     
     ld evaluate() const {
         bool isManyEnemies = (M >= 4);
-        bool isExpansionPhase = (currentTurn < T / 2);
+        bool isExpansionPhase = (currentTurn < (T / 2) );
         ld baseScore;
         
         if (isManyEnemies && isExpansionPhase) {
             /*ll maxAITiles = 0;
             rep(i, 1, M) chmax(maxAITiles, tileCounts[i]);
             if (maxAITiles == 0) return 1000.0;*/
-            baseScore = (ld)tileCounts[0]; // / maxAITiles;
+            baseScore = (ld)tileCounts[0] ; // / maxAITiles;
         } else {
-            vl scores = calcScores();
+            vl scores = calcScores();            
             ll maxAI = 0;
             rep(i, 1, M) chmax(maxAI, scores[i]);
             if (maxAI == 0) return 1000.0;
