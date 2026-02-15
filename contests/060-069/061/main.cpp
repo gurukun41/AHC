@@ -82,6 +82,21 @@ int getAdaptiveBeamWidth() {
 int visited[55][55];
 int visited_token = 0;
 
+// CNN風の3*3畳み込みフィルタ：指定マスを中心とした3*3の価値合計を計算
+ll getConvolutionValue(ll cx, ll cy) {
+    ll sum = 0;
+    for (ll dx = -1; dx <= 1; dx++) {
+        for (ll dy = -1; dy <= 1; dy++) {
+            ll nx = cx + dx;
+            ll ny = cy + dy;
+            if (nx >= 0 && nx < N && ny >= 0 && ny < N) {
+                sum += V[nx][ny];
+            }
+        }
+    }
+    return sum;
+}
+
 // ゲームの状態を表す構造体
 struct State {
     vpl positions;
@@ -258,9 +273,19 @@ vector<pl> getCandidatesForPlayer(const State& state, int player) {
     bool isExpansionPhase = (currentTurn < T / 2);
     bool isManyAndEarly = (isManyEnemies && isExpansionPhase);
     
+    // U>=2かつM>=3の場合は3*3畳み込みフィルタ評価を使用
+    bool useConvolution = (U >= 2 && M >= 3);
+    
     for (auto [x, y] : candidates) {
         if (state.owner[x][y] == player && state.level[x][y] >= U) continue;  // 上限到達は除外
-        ld score = V[x][y];
+        ld score;
+        
+        // CNN風の畳み込みフィルタ：各マスの価値をそのマスを中心とした3*3の合計値に変更
+        if (useConvolution) {
+            score = getConvolutionValue(x, y);
+        } else {
+            score = V[x][y];
+        }
         
         if (isManyAndEarly && isExpansionPhase) {
             // 前半かつ多人数：拡張を最優先
