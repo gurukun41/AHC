@@ -48,7 +48,6 @@ ll N, M, T, U;
 vvl V;  // 各マスの価値
 vpl FP;  // 各プレイヤーの初期位置
 vpl dir = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};  // 4方向
-vector<vvl> targetAreas;  // 各プレイヤーの焼きなましで求めた目標領域（レベル配列）
 
 // --- Zobrist Hashing 用 ---
 // 64bit乱数生成
@@ -110,247 +109,6 @@ int getAdaptiveBeamWidth() {
 // 高速化用バッファ（BFSで使用）
 int visited[55][55];
 int visited_token = 0;
-
-// 焼きなまし法で目標領域を探索（指定プレイヤーの視点で）
-// N*N/M回の行動で最大価値を得る戦略を探索（行動=新規占領 or レベルアップ）
-vvl findTargetAreaByAnnealing(ll targetActions, int playerID) {
-    // 温度パラメータ
-    const ld T0 = 100.0, T1 = 1.0;
-    const int ITER = 100000;
-    
-    // 初期解：初期位置から貪欲にBFSで高価値マスを追加
-    vvl current(N, vl(N, 0));
-    auto [sx, sy] = FP[playerID];
-    current[sx][sy] = 1;
-    
-    priority_queue<pair<ld, pl>> pq;
-    map<pl, bool> inPQ;
-    
-    // 初期位置の隣接マスをキューに追加（新規占領の候補）
-    for (auto [dx, dy] : dir) {
-        ll nx = sx + dx, ny = sy + dy;
-        if (nx >= 0 && nx < N && ny >= 0 && ny < N) {
-            pq.push({(ld)V[nx][ny], {nx, ny}});
-            inPQ[{nx, ny}] = true;
-        }
-    }
-    
-    // 貪欲に行動を追加（新規占領 or レベルアップ）
-    ll usedActions = 1;  // 初期マス占領で1行動使用
-    while (usedActions < targetActions && !pq.empty()) {
-        auto [value, pos] = pq.top();
-        pq.pop();
-        auto [x, y] = pos;
-        
-        if (current[x][y] == 0) {
-            // 新規占領
-            current[x][y] = 1;
-            usedActions++;
-            
-            // 新たな境界を追加
-            for (auto [dx, dy] : dir) {
-                ll nx = x + dx, ny = y + dy;
-                if (nx >= 0 && nx < N && ny >= 0 && ny < N && current[nx][ny] == 0 && !inPQ[{nx, ny}]) {
-                    pq.push({(ld)V[nx][ny], {nx, ny}});
-                    inPQ[{nx, ny}] = true;
-                }
-            }
-            
-            // レベルアップの候補としても追加
-            if (current[x][y] < U) {
-                pq.push({(ld)V[x][y], {x, y}});
-            }
-        } else if (current[x][y] < U) {
-            // レベルアップ
-            current[x][y]++;
-            usedActions++;
-            
-            // まだレベルアップ可能なら再度キューに追加
-            if (current[x][y] < U) {
-                pq.push({(ld)V[x][y], {x, y}});
-            }
-        }
-    }
-    
-    // 現在の領域の価値を計算
-    auto calcValue = [&](const vvl& area) {
-        ll sum = 0;
-        rep(i, 0, N) rep(j, 0, N) sum += V[i][j] * area[i][j];
-        return sum;
-    };
-    
-    // 使用した行動数を計算（レベルの総和）
-    auto calcActions = [&](const vvl& area) {
-        ll sum = 0;
-        rep(i, 0, N) rep(j, 0, N) sum += area[i][j];
-        return sum;
-    };
-    
-    // レベルアップ可能なマスを取得
-    auto getLevelUpCandidates = [&](const vvl& area) {
-        vpl candidates;
-        rep(i, 0, N) rep(j, 0, N) {
-            if (area[i][j] > 0 && area[i][j] < U) {
-                candidates.push_back({i, j});
-            }
-        }
-        return candidates;
-    };
-    
-    // レベルダウン可能なマスを取得（レベル1のマスは削除になるので除外）
-    auto getLevelDownCandidates = [&](const vvl& area) {
-        vpl candidates;
-        rep(i, 0, N) rep(j, 0, N) {
-            if (area[i][j] > 1) {
-                candidates.push_back({i, j});
-            }
-        }
-        return candidates;
-    };
-    
-    // 削除可能なマスを取得（レベル1で境界のマス）
-    auto getRemovableTiles = [&](const vvl& area) {
-        vpl candidates;
-        rep(i, 0, N) rep(j, 0, N) {
-            if (area[i][j] != 1) continue;
-            // 境界チェック（領域外に隣接）
-            bool isBoundary = false;
-            for (auto [dx, dy] : dir) {
-                ll ni = i + dx, nj = j + dy;
-                if (ni >= 0 && ni < N && nj >= 0 && nj < N && area[ni][nj] == 0) {
-                    isBoundary = true;
-                    break;
-                }
-            }
-            if (isBoundary) candidates.push_back({i, j});
-        }
-        return candidates;
-    };
-    
-    // 新規占領可能なマスを取得（領域外で境界に隣接）
-    auto getExpandableTiles = [&](const vvl& area) {
-        vpl candidates;
-        map<pl, bool> checked;
-        rep(i, 0, N) rep(j, 0, N) {
-            if (area[i][j] == 0 && !checked[{i, j}]) {
-                bool isAdjacent = false;
-                for (auto [dx, dy] : dir) {
-                    ll ni = i + dx, nj = j + dy;
-                    if (ni >= 0 && ni < N && nj >= 0 && nj < N && area[ni][nj] > 0) {
-                        isAdjacent = true;
-                        break;
-                    }
-                }
-                if (isAdjacent) {
-                    candidates.push_back({i, j});
-                    checked[{i, j}] = true;
-                }
-            }
-        }
-        return candidates;
-    };
-    
-    // 連結性チェック（初期位置を含む連結成分のマス数を返す）
-    auto checkConnectivity = [&](const vvl& area) {
-        visited_token++;
-        static pl q[2500];
-        int head = 0, tail = 0;
-        q[tail++] = FP[playerID];
-        visited[FP[playerID].first][FP[playerID].second] = visited_token;
-        ll count = 1;
-        
-        while (head < tail) {
-            auto [cx, cy] = q[head++];
-            for (auto [dx, dy] : dir) {
-                ll nx = cx + dx, ny = cy + dy;
-                if (nx >= 0 && nx < N && ny >= 0 && ny < N) {
-                    if (area[nx][ny] > 0 && visited[nx][ny] != visited_token) {
-                        visited[nx][ny] = visited_token;
-                        q[tail++] = {nx, ny};
-                        count++;
-                    }
-                }
-            }
-        }
-        return count;
-    };
-    
-    ll bestValue = calcValue(current);
-    vvl best = current;
-    ll currentValue = bestValue;
-    ll currentActions = usedActions;
-    
-    mt19937 rng(42);
-    
-    // 焼きなまし
-    rep(iter, 0, ITER) {
-        ld temp = T0 + (T1 - T0) * iter / ITER;
-        
-        vvl next = current;
-        
-        // 近傍操作：4種類の操作からランダムに選択
-        int opType = rng() % 4;
-        
-        if (opType == 0) {
-            // 新規占領（行動+1）
-            vpl candidates = getExpandableTiles(current);
-            if (!candidates.empty()) {
-                auto [x, y] = candidates[rng() % candidates.size()];
-                next[x][y] = 1;
-            }
-        } else if (opType == 1) {
-            // レベルアップ（行動+1）
-            vpl candidates = getLevelUpCandidates(current);
-            if (!candidates.empty()) {
-                auto [x, y] = candidates[rng() % candidates.size()];
-                next[x][y]++;
-            }
-        } else if (opType == 2) {
-            // レベルダウン（行動-1）
-            vpl candidates = getLevelDownCandidates(current);
-            if (!candidates.empty()) {
-                auto [x, y] = candidates[rng() % candidates.size()];
-                next[x][y]--;
-            }
-        } else {
-            // マス削除（行動-1）
-            vpl candidates = getRemovableTiles(current);
-            if (!candidates.empty()) {
-                auto [x, y] = candidates[rng() % candidates.size()];
-                next[x][y] = 0;
-            }
-        }
-        
-        // 連結性チェック
-        ll nextTiles = 0;
-        rep(i, 0, N) rep(j, 0, N) if (next[i][j] > 0) nextTiles++;
-        ll connectedTiles = checkConnectivity(next);
-        if (connectedTiles != nextTiles) continue;  // 非連結なら棄却
-        
-        ll nextActions = calcActions(next);
-        ll nextValue = calcValue(next);
-        
-        // 行動数制約のペナルティ
-        ll actionDiff = abs(nextActions - targetActions);
-        ld penalty = actionDiff * 10.0;
-        ld score = nextValue - penalty;
-        ld currentScore = currentValue - abs(currentActions - targetActions) * 10.0;
-        
-        // 遷移判定
-        if (score > currentScore || exp((score - currentScore) / temp) > (ld)rng() / rng.max()) {
-            current = next;
-            currentActions = nextActions;
-            currentValue = nextValue;
-            
-            if (currentValue > bestValue) {
-                bestValue = currentValue;
-                best = current;
-            }
-        }
-    }
-    
-    return best;
-}
 
 // ゲームの状態を表す構造体
 struct State {
@@ -468,7 +226,6 @@ struct State {
         if (myComponents > 0) {
             connectivityBonus = max(0.0, 0.05 * (4.0 - myComponents) / 3.0);
         }
-        
         return baseScore * (1.0 + connectivityBonus);
     }
     
@@ -575,18 +332,6 @@ vector<pl> getCandidatesForPlayer(const State& state, int player) {
                 score *= 300.0;  // 最強の敵を攻撃する場合は300倍のボーナス
             }
         }
-        
-        // 目標領域ボーナス：プレイヤー0の場合、序盤で目標領域内のマスを優先
-        if (player == 0 && isExpansionPhase && targetAreas[0][x][y] > 0 && targetAreas[0][x][y] <= state.level[x][y]) {
-            
-            // 他プレイヤーの目標領域と重なっている場合はボーナス（競合地点を積極的に取る）
-            int overlapCount = 0;
-            rep(i, 1, M) {
-                if (targetAreas[i][x][y] > 0) overlapCount++;
-            }
-            score *= (1.0 + overlapCount * 1.0);  // 重複するプレイヤー数に応じてボーナス
-        }
-        
         scored.push_back({score, {x, y}});
     }
     sort(all(scored), greater<pair<ld, pl>>());
@@ -730,14 +475,6 @@ void solve() {
     rep(i, 0, N) rep(j, 0, N) cin >> V[i][j];
     FP.resize(M);
     rep(i, 0, M) cin >> FP[i].first >> FP[i].second;
-
-    // 全プレイヤーの目標領域の計算
-    // N*N/M回の行動で最適な戦略を探索
-    ll targetActions = (N * N) / M;
-    targetAreas.resize(M);
-    rep(i, 0, M) {
-        targetAreas[i] = findTargetAreaByAnnealing(targetActions, i);
-    }
 
     gameStartTime = Clock::now();
     aiParams.resize(M - 1);
