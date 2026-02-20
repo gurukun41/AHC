@@ -80,8 +80,8 @@ void initZobrist() {
 // ------------------------
 
 // ビームサーチのパラメータ
-const int MAX_DEPTH = 30;  // 先読みする深さ
-const int MY_CANDIDATES = 100;  // 自分の手の候補数上限
+const int MAX_DEPTH = 50;  // 先読みする深さ
+const int MY_CANDIDATES = 500;  // 自分の手の候補数上限
 
 // AIの評価パラメータ（学習用）
 struct AIParams {
@@ -97,13 +97,13 @@ const ll TIME_BUFFER_MS = 100;
 
 // プレイヤー数に応じてビーム幅を調整（敵が多いほど計算量増加のため幅を削減）
 int getBeamWidth() {
-    if (M <= 2) return 50;
-    if (M == 3) return 45;
-    if (M == 4) return 40;
-    if (M == 5) return 35;
-    if (M == 6) return 30;
-    if (M == 7) return 28;
-    return 25;
+    if (M <= 2) return 300;
+    if (M == 3) return 250;
+    if (M == 4) return 200;
+    if (M == 5) return 150;
+    if (M == 6) return 120;
+    if (M == 7) return 100;
+    return 80; // M = 8
 }
 
 int getAdaptiveBeamWidth() {
@@ -257,18 +257,15 @@ struct State {
         return components;
     }
     
-    // 状態の評価値を計算（スコア比率 + 連結性ボーナス）
-    double evaluate() const {
+    // 1段階目：軽量なベース評価（BFSなし）
+    double evaluateBase() const {
         bool isManyEnemies = (M >= 4);
         bool isExpansionPhase = (currentTurn < (T / 2) );
         double baseScore;
         
         // 敵が多く序盤の場合：タイル数で評価（早期拡張を優先）
         if (isManyEnemies && isExpansionPhase) {
-            /*ll maxAITiles = 0;
-            rep(i, 1, M) chmax(maxAITiles, tileCounts[i]);
-            if (maxAITiles == 0) return 1000.0;*/
-            baseScore = (double)tileCounts[0] ; // / maxAITiles;
+            baseScore = (double)tileCounts[0];
         } else {
             // それ以外：最強AI対比のスコア比率で評価
             auto scores = calcScores();            
@@ -277,14 +274,18 @@ struct State {
             if (maxAI == 0) return 1000.0;
             baseScore = (double)scores[0] / maxAI;
         }
-        
-        // 連結性ボーナス：領土が分断されていると減点（1連結が理想）
+        return baseScore;
+    }
+    
+    // 2段階目：重い評価（連結性チェック）を適用してスコアを最終更新
+    void applyHeavyEvaluation() {
         int myComponents = countConnectedComponents(0);
         double connectivityBonus = 0.0;
         if (myComponents > 0) {
+            // 分断されていない（1連結）ほどボーナスが高い
             connectivityBonus = max(0.0, 0.05 * (4.0 - myComponents) / 3.0);
         }
-        return baseScore * (1.0 + connectivityBonus);
+        score = score * (1.0 + connectivityBonus);
     }
     
     bool operator>(const State& other) const { return score > other.score; }
@@ -531,10 +532,10 @@ pl beamSearch(const State& initialState) {
     auto turn_start = Clock::now();
     
     int depth = 0;
-    const int MAX_LIMIT_DEPTH = 15; // 行き過ぎ防止（15手読めれば十分すぎるため）
+    const int LIMIT_DEPTH = min(MAX_DEPTH, (int)(T - currentTurn)); // ターン数に応じて最大深さを調整
     
     // 時間が許す限り深く探索を続ける（反復深化）
-    while (depth < MAX_LIMIT_DEPTH) {
+    while (depth < LIMIT_DEPTH) {
         int BEAM_WIDTH = getAdaptiveBeamWidth();
         vector<State> nextBeam;
         unordered_set<uint64_t> seenHashes;
@@ -567,22 +568,36 @@ pl beamSearch(const State& initialState) {
                 seenHashes.insert(nextState.hash);
 
                 nextState.setFirstMove((depth == 0) ? move : state.getFirstMove());
-                nextState.score = nextState.evaluate();
+                
+                // 【変更点1】ここではまず軽量な評価だけを行う
+                nextState.score = nextState.evaluateBase(); 
                 nextBeam.push_back(nextState);
             }
         }
         
-        // 途中で時間切れになった場合、中途半端な探索結果 (nextBeam) は捨てて終了
-        if (timeout) {
-            break; 
-        }
-        
-        // 有効な手が一つもなければ終了
+        if (timeout) break; 
         if (nextBeam.empty()) break;
         
-        // スコア順にソートして上位 BEAM_WIDTH 個を保持
+        // --- 【変更点2】2段階評価（Two-stage evaluation）による絞り込み ---
+        
+        // 1. まず軽量評価で緩く絞り込む (ビーム幅の3倍の数だけ残す)
+        int pre_beam_size = min((int)nextBeam.size(), BEAM_WIDTH * 3);
+        if (nextBeam.size() > pre_beam_size) {
+            // nth_elementを使うと、完全なソートを行わずに上位 N 個を高速に抽出できます
+            nth_element(nextBeam.begin(), nextBeam.begin() + pre_beam_size, nextBeam.end(), greater<State>());
+            nextBeam.resize(pre_beam_size);
+        }
+        
+        // 2. 残った有望なノードに対してのみ、重いBFS評価(連結性チェック)を適用する
+        for (State& st : nextBeam) {
+            st.applyHeavyEvaluation();
+        }
+        
+        // 3. 最終的なスコアでソートし、本来の BEAM_WIDTH 個に絞る
         sort(all(nextBeam), greater<State>());
         if (nextBeam.size() > BEAM_WIDTH) nextBeam.resize(BEAM_WIDTH);
+        
+        // ------------------------------------------------------------------
         
         // ビームを更新し、この「完了した深さ」での最善手を記録
         beam = nextBeam;
@@ -666,7 +681,7 @@ void solve() {
         currentState.computeHash();
     }
 }
-// 超攻撃深さ変更
+// ビームの評価で重いものは最後に、幅を変更
 int main() {
     cin.tie(0); ios::sync_with_stdio(0);
     solve();
