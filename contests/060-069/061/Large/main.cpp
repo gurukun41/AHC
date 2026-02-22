@@ -89,22 +89,12 @@ struct AIParams {
     AIParams() : wa(0.6), wb(0.6), wc(0.6), wd(0.6) {}
 };
 
-// 環境変数から初期パラメータを取得
+// 初期パラメータ
 struct GameParams {
-    double initial_wa, initial_wb, initial_wc, initial_wd;
-    
-    GameParams() {
-        // 環境変数から読み取り、設定されていなければデフォルト値を使用
-        const char* wa_env = getenv("AHC_WA");
-        const char* wb_env = getenv("AHC_WB");
-        const char* wc_env = getenv("AHC_WC");
-        const char* wd_env = getenv("AHC_WD");
-        
-        initial_wa = wa_env ? atof(wa_env) : 0.6;
-        initial_wb = wb_env ? atof(wb_env) : 0.6;
-        initial_wc = wc_env ? atof(wc_env) : 0.6;
-        initial_wd = wd_env ? atof(wd_env) : 0.6;
-    }
+    double initial_wa = 0.6;
+    double initial_wb = 0.6;
+    double initial_wc = 0.6;
+    double initial_wd = 0.6;
 };
 
 vector<AIParams> aiParams;

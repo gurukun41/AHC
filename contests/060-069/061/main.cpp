@@ -88,6 +88,15 @@ struct AIParams {
     double wa, wb, wc, wd;  // 各状況での重み
     AIParams() : wa(0.6), wb(0.6), wc(0.6), wd(0.6) {}
 };
+
+// 初期パラメータ
+struct GameParams {
+    double initial_wa = 0.6;
+    double initial_wb = 0.6;
+    double initial_wc = 0.6;
+    double initial_wd = 0.6;
+};
+
 vector<AIParams> aiParams;
 int currentTurn = 0;
 TimePoint gameStartTime;
@@ -182,9 +191,8 @@ struct State {
                 if (owner[i][j] + 1 < 20) {
                     hash ^= z_owner[i][j][owner[i][j] + 1];
                 }
-                if (level[i][j] < 305) {
-                    hash ^= z_level[i][j][level[i][j]];
-                }
+                // level[i][j]はint8_tなので常に305未満（最大127）
+                hash ^= z_level[i][j][level[i][j]];
             }
         }
         for (int i = 0; i < M; ++i) {
@@ -624,7 +632,17 @@ void solve() {
     rep(i, 0, M) cin >> FP[i].first >> FP[i].second;
 
     gameStartTime = Clock::now();
+    
+    // AIパラメータを環境変数から初期化
+    GameParams gameParams;
     aiParams.resize(M - 1);
+    for (auto& p : aiParams) {
+        p.wa = gameParams.initial_wa;
+        p.wb = gameParams.initial_wb;
+        p.wc = gameParams.initial_wc;
+        p.wd = gameParams.initial_wd;
+    }
+    
     State currentState;
     rep(i, 0, M) {
         auto [x, y] = FP[i];
@@ -650,8 +668,34 @@ void solve() {
             if (cand.size() < 2) continue;  // 選択肢が1つしかない場合は学習なし
             auto [mx, my] = g.TP[i];
             int cO = prevState.owner[mx][my], cL = prevState.level[mx][my];
-            const double lr = 0.02;  // 学習率
             AIParams& p = aiParams[i-1];
+            
+            // AIが選んだマスがそのカテゴリで最も価値が高いかチェック
+            // （そうでない場合はランダム行動なので学習しない）
+            double selectedValue = V[mx][my];
+            double maxValueInCategory = 0.0;
+            
+            // 同じカテゴリの全候補から最大価値を探す
+            for (auto [cx, cy] : cand) {
+                int tO = prevState.owner[cx][cy], tL = prevState.level[cx][cy];
+                bool sameCategory = false;
+                
+                if (cO == -1 && tO == -1) sameCategory = true;  // 両方未占領
+                else if (cO == i && tO == i && cL < U && tL < U) sameCategory = true;  // 両方自領土強化可能
+                else if (cO != -1 && cO != i && tO != -1 && tO != i) {
+                    // 両方敵領土
+                    if ((cL == 1 && tL == 1) || (cL > 1 && tL > 1)) sameCategory = true;
+                }
+                
+                if (sameCategory) {
+                    chmax(maxValueInCategory, (double)V[cx][cy]);
+                }
+            }
+            
+            // 選んだマスがそのカテゴリで最大価値でない場合は学習しない
+            if (selectedValue < maxValueInCategory - 1e-9) continue;
+            
+            const double lr = 0.02;  // 学習率
             
             // AIが選んだマスの種類に応じて対応する重みを増加
             if (cO == -1) p.wa += lr;  // 未占領を選んだ
@@ -659,7 +703,7 @@ void solve() {
             else if (cL == 1) p.wc += lr;  // レベル1の敵領土攻撃
             else p.wd += lr;  // レベル2+の敵領土攻撃
             
-            // 正規化（合計を一定に保つ：4パラメータで平均20.6）
+            // 正規化（合計を一定に保つ：4パラメータで平均2.4）
             double sum = p.wa + p.wb + p.wc + p.wd;
             if (sum > 0) {
                 p.wa = p.wa / sum * 2.4;
