@@ -398,13 +398,16 @@ pl beamSearch(const State& initialState) {
     auto turn_start = Clock::now();
     
     int depth = 0;
-    const int LIMIT_DEPTH = min(50, (int)(T - currentTurn));
+    const int LIMIT_DEPTH = min(70, (int)(T - currentTurn));
+    int BEAM_WIDTH = getAdaptiveBeamWidth();
+    
+
     
     while (depth < LIMIT_DEPTH) {
-        int BEAM_WIDTH = getAdaptiveBeamWidth();
         int nextBeamSize = 0;
         unordered_set<uint64_t> seenHashes;
         seenHashes.reserve(BEAM_WIDTH * 50); // メモリ再確保防止
+
         bool timeout = false;
         int time_check_counter = 0;
 
@@ -543,7 +546,7 @@ void solve() {
     }
 }
 
-// 限界高速化
+// 高速化70
 int main() {
     cin.tie(0); ios::sync_with_stdio(0);
     solve();
