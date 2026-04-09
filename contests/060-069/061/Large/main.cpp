@@ -36,6 +36,10 @@ uint64_t rng64() {
     return x;
 }
 
+inline float frand01() {
+    return (float)(rng64() % 100000) / 100000.0f;
+}
+
 // ハッシュ用テーブル (サイズを最小化してキャッシュ効率を上げる)
 uint64_t z_owner[MAX_N][MAX_N][MAX_M + 1]; // owner: -1〜7 -> index 0〜8
 uint64_t z_level[MAX_N][MAX_N][128];      // level: 0〜127
@@ -57,7 +61,7 @@ AIParams aiParams[MAX_M];
 int currentTurn = 0;
 TimePoint gameStartTime;
 
-const ll TOTAL_TIME_LIMIT_MS = 1900;
+const ll TOTAL_TIME_LIMIT_MS = 1950;
 
 int getAdaptiveBeamWidth() {
     if (M <= 2) return 300;
@@ -284,6 +288,136 @@ int getCandidates(const State& state, int player, MyCand out_cands[]) {
     return out_sz;
 }
 
+// --- 粒子フィルタによるAIパラメータ推定 ---
+constexpr int NUM_PARTICLES = 200;
+
+struct ParticleParams {
+    float wa, wb, wc, wd, eps;
+};
+
+struct PlayerParticleFilter {
+    ParticleParams ptcls[NUM_PARTICLES];
+    float wts[NUM_PARTICLES];
+
+    void init() {
+        for (int k = 0; k < NUM_PARTICLES; ++k) {
+            ptcls[k].wa  = 0.1f + frand01() * 2.9f;
+            ptcls[k].wb  = 0.1f + frand01() * 2.9f;
+            ptcls[k].wc  = 0.1f + frand01() * 2.9f;
+            ptcls[k].wd  = 0.1f + frand01() * 2.9f;
+            ptcls[k].eps = frand01() * 0.3f;
+            wts[k] = 1.0f / NUM_PARTICLES;
+        }
+    }
+
+    // 観測行動から尤度を計算して重みを更新
+    void update(const State& prevState, int player, int obs_x, int obs_y) {
+        MyCand cands[256];
+        int cand_sz = getCandidates(prevState, player, cands);
+        if (cand_sz == 0) return;
+
+        // 各候補のカテゴリと価値を事前計算
+        // cat: 0=空地, 1=自領土(lv<U), 2=自領土(lv=U), 3=敵領土lv1, 4=敵領土lv2+
+        int8_t cat[256];
+        int    bv[256];
+        int obs_idx = -1;
+
+        for (int i = 0; i < cand_sz; ++i) {
+            int cx = cands[i].x, cy = cands[i].y;
+            int o  = prevState.owner[cx][cy];
+            int l  = prevState.level[cx][cy];
+            bv[i]  = V[cx][cy];
+            if      (o == -1)     cat[i] = 0;
+            else if (o == player) cat[i] = (l < U) ? 1 : 2;
+            else                  cat[i] = (l == 1) ? 3 : 4;
+            if (cx == obs_x && cy == obs_y) obs_idx = i;
+        }
+
+        // 観測が候補内にない場合はスキップ
+        if (obs_idx < 0) return;
+
+        float total_wt = 0.0f;
+        for (int k = 0; k < NUM_PARTICLES; ++k) {
+            const ParticleParams& p = ptcls[k];
+            // W[cat] = 各カテゴリの重み (cat=2 は評価値0)
+            const float W[5] = {p.wa, p.wb, 0.0f, p.wc, p.wd};
+
+            float obs_sc  = (float)bv[obs_idx] * W[cat[obs_idx]];
+            float max_sc  = -1e9f;
+            int   max_cnt = 0;
+
+            for (int i = 0; i < cand_sz; ++i) {
+                float sc = (float)bv[i] * W[cat[i]];
+                if      (sc > max_sc + 1e-5f) { max_sc = sc; max_cnt = 1; }
+                else if (sc > max_sc - 1e-5f) { max_cnt++; }
+            }
+
+            // 観測行動の確率 = 貪欲行動 or ランダム行動
+            bool  greedy = (obs_sc >= max_sc - 1e-5f);
+            float eps    = p.eps;
+            float prob   = greedy
+                ? (1.0f - eps) / max_cnt + eps / cand_sz
+                :  eps / cand_sz;
+
+            wts[k] *= max(prob, 1e-7f);
+            total_wt += wts[k];
+        }
+
+        // 正規化
+        if (total_wt > 1e-30f) {
+            for (int k = 0; k < NUM_PARTICLES; ++k) wts[k] /= total_wt;
+        } else {
+            for (int k = 0; k < NUM_PARTICLES; ++k) wts[k] = 1.0f / NUM_PARTICLES;
+        }
+
+        // ESS (実効サンプルサイズ) が低ければリサンプリング
+        float ess_inv = 0.0f;
+        for (int k = 0; k < NUM_PARTICLES; ++k) ess_inv += wts[k] * wts[k];
+        if (1.0f / ess_inv < NUM_PARTICLES * 0.5f) resample();
+    }
+
+    // 系統サンプリング + 小ノイズで粒子多様性を維持
+    void resample() {
+        float cum[NUM_PARTICLES];
+        cum[0] = wts[0];
+        for (int k = 1; k < NUM_PARTICLES; ++k) cum[k] = cum[k-1] + wts[k];
+
+        float step = 1.0f / NUM_PARTICLES;
+        float u    = frand01() * step;
+        int   j    = 0;
+        ParticleParams np[NUM_PARTICLES];
+        for (int k = 0; k < NUM_PARTICLES; ++k, u += step) {
+            while (j < NUM_PARTICLES - 1 && cum[j] < u) ++j;
+            np[k] = ptcls[j];
+            // 乗算ノイズ (±2%) で粒子の縮退を防ぐ
+            const float noise = 0.02f;
+            np[k].wa  = max(0.01f, np[k].wa  * (1.0f + (frand01()*2.0f-1.0f)*noise));
+            np[k].wb  = max(0.01f, np[k].wb  * (1.0f + (frand01()*2.0f-1.0f)*noise));
+            np[k].wc  = max(0.01f, np[k].wc  * (1.0f + (frand01()*2.0f-1.0f)*noise));
+            np[k].wd  = max(0.01f, np[k].wd  * (1.0f + (frand01()*2.0f-1.0f)*noise));
+            np[k].eps = max(0.0f, min(0.5f, np[k].eps + (frand01()*2.0f-1.0f)*0.01f));
+        }
+        for (int k = 0; k < NUM_PARTICLES; ++k) {
+            ptcls[k] = np[k];
+            wts[k]   = 1.0f / NUM_PARTICLES;
+        }
+    }
+
+    // 加重平均で最良推定値を返す
+    AIParams getEstimate() const {
+        double wa = 0, wb = 0, wc = 0, wd = 0;
+        for (int k = 0; k < NUM_PARTICLES; ++k) {
+            wa += wts[k] * ptcls[k].wa;
+            wb += wts[k] * ptcls[k].wb;
+            wc += wts[k] * ptcls[k].wc;
+            wd += wts[k] * ptcls[k].wd;
+        }
+        return {wa, wb, wc, wd};
+    }
+};
+
+PlayerParticleFilter playerPF[MAX_M];
+
 // AIの行動予測（共通関数を利用して軽量に）
 pl predictAIMove(const State& state, int player) {
     MyCand cands[256];
@@ -473,6 +607,7 @@ void solve() {
     for(int i=0; i<N; ++i) for(int j=0; j<N; ++j) cin >> V[i][j];
     FP.resize(M);
     for(int i=0; i<M; ++i) cin >> FP[i].first >> FP[i].second;
+    for (int i = 0; i < M-1; ++i) playerPF[i].init();
 
     gameStartTime = Clock::now();
     State currentState;
@@ -501,52 +636,18 @@ void solve() {
         for(int i=0; i<N; ++i) for(int j=0; j<N; ++j) cin >> O[i][j];
         for(int i=0; i<N; ++i) for(int j=0; j<N; ++j) cin >> L[i][j];
 
-        // AIの学習ロジック（そのまま）
-        if (turn > 0) {
-            for(int i=1; i<M; ++i) {
-                MyCand cand[256];
-                int c_sz = getCandidates(prevState, i, cand);
-                if (c_sz < 2) continue;
-                
-                auto [mx, my] = TP[i];
-                int cO = prevState.owner[mx][my], cL = prevState.level[mx][my];
-                AIParams& p = aiParams[i-1];
-                
-                double selectedValue = V[mx][my], maxValueInCategory = 0.0;
-                for (int c_idx=0; c_idx<c_sz; ++c_idx) {
-                    int cx = cand[c_idx].x, cy = cand[c_idx].y;
-                    int tO = prevState.owner[cx][cy], tL = prevState.level[cx][cy];
-                    bool sameCategory = false;
-                    
-                    if (cO == -1 && tO == -1) sameCategory = true;
-                    else if (cO == i && tO == i && cL < U && tL < U) sameCategory = true;
-                    else if (cO != -1 && cO != i && tO != -1 && tO != i) {
-                        if ((cL == 1 && tL == 1) || (cL > 1 && tL > 1)) sameCategory = true;
-                    }
-                    if (sameCategory) maxValueInCategory = max(maxValueInCategory, (double)V[cx][cy]);
-                }
-                
-                if (selectedValue < maxValueInCategory - 1e-9) continue;
-                const double lr = 0.02;
-                if (cO == -1) p.wa += lr;
-                else if (cO == i) { if (cL < U) p.wb += lr; }
-                else if (cL == 1) p.wc += lr;
-                else p.wd += lr;
-                
-                double sum = p.wa + p.wb + p.wc + p.wd;
-                if (sum > 0) {
-                    p.wa = p.wa / sum * 2.4; p.wb = p.wb / sum * 2.4;
-                    p.wc = p.wc / sum * 2.4; p.wd = p.wd / sum * 2.4;
-                }
-            }
+        // 粒子フィルタによるAIパラメータ推定
+        for (int i = 1; i < M; ++i) {
+            playerPF[i-1].update(prevState, i, TP[i].first, TP[i].second);
+            aiParams[i-1] = playerPF[i-1].getEstimate();
         }
-        
+
         // 実際の盤面情報から状態を完璧に同期
         currentState.syncFromActual(O, L, EP);
     }
 }
 
-// 高速化70
+// after
 int main() {
     cin.tie(0); ios::sync_with_stdio(0);
     solve();

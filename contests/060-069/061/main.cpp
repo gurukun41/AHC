@@ -60,6 +60,7 @@ TimePoint gameStartTime;
 const ll TOTAL_TIME_LIMIT_MS = 1900;
 
 int getAdaptiveBeamWidth() {
+    return 300;
     if (M <= 2) return 300;
     if (M == 3) return 250;
     if (M == 4) return 200;
