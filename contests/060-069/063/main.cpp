@@ -260,7 +260,7 @@ inline int getDirToCellFast(int tx, int ty, const FastState &s) {
 }
 
 constexpr int MAX_OPS = 100000;
-inline int searchOpsCap() { return min(MAX_OPS, M * 100); }
+inline int searchOpsCap() { return /*min(MAX_OPS, M * 100)*/100000; }
 
 // === ビームサーチの中核 ===
 
