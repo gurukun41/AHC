@@ -1,3 +1,7 @@
+#pragma GCC target("avx2")
+#pragma GCC optimize("O3")
+#pragma GCC optimize("unroll-loops")
+
 #include <bits/stdc++.h>
 using namespace std;
 using ll = long long;
@@ -268,30 +272,16 @@ constexpr ll BEAM_PREF_WEIGHT = 10000LL;
 constexpr ll BEAM_MATCH_POS_WEIGHT = 30LL;
 constexpr ll BEAM_CUT_PENALTY_WEIGHT = 30000LL;
 constexpr ll BEAM_CUT_MISMATCHED_WEIGHT = 300LL;
-constexpr ll BEAM_LEN_WEIGHT = 120LL;
 
-constexpr ll PREEND_PREF_WEIGHT = 4500LL;
-constexpr ll PREEND_MATCH_POS_WEIGHT = 24LL;
-constexpr ll PREEND_CUT_PENALTY_WEIGHT = 22000LL;
-constexpr ll PREEND_CUT_MISMATCHED_WEIGHT = 220LL;
-constexpr ll PREEND_LEN_WEIGHT = 900LL;
-
-inline ll beamEvalFast(const FastState &s, bool preEndMode) {
-    const ll prefW = preEndMode ? PREEND_PREF_WEIGHT : BEAM_PREF_WEIGHT;
-    const ll matchW = preEndMode ? PREEND_MATCH_POS_WEIGHT : BEAM_MATCH_POS_WEIGHT;
-    const ll cutPenaltyW = preEndMode ? PREEND_CUT_PENALTY_WEIGHT : BEAM_CUT_PENALTY_WEIGHT;
-    const ll cutMismatchedW = preEndMode ? PREEND_CUT_MISMATCHED_WEIGHT : BEAM_CUT_MISMATCHED_WEIGHT;
-    const ll lenW = preEndMode ? PREEND_LEN_WEIGHT : BEAM_LEN_WEIGHT;
-
+inline ll beamEvalFast(const FastState &s) {
     return (ll)s.used
-         + prefW * (ll)(M - s.pref)
-         + matchW * (ll)(M - s.matchCnt)
-         + cutPenaltyW * s.cutPenalty
-         - cutMismatchedW * s.cutMismatchGain
-         - lenW * (ll)s.len;
+         + BEAM_PREF_WEIGHT * (ll)(M - s.pref)
+         + BEAM_MATCH_POS_WEIGHT * (ll)(M - s.matchCnt)
+         + BEAM_CUT_PENALTY_WEIGHT * s.cutPenalty
+         - BEAM_CUT_MISMATCHED_WEIGHT * s.cutMismatchGain;
 }
 
-int chooseBeamNextDirFast(const FastState &startState, int beamWidth, int lookahead, bool preEndMode) {
+int chooseBeamNextDirFast(const FastState &startState, int beamWidth = 40, int lookahead = 100) {
     // vectorの再利用により、ループ内でのメモリ確保を完全に防ぐ
     static vector<FastState> cur, nxt, picked;
     cur.clear();
@@ -304,7 +294,7 @@ int chooseBeamNextDirFast(const FastState &startState, int beamWidth, int lookah
     cur.push_back(startState);
     cur[0].used = 0;
     cur[0].firstDir = -1;
-    cur[0].evalScore = beamEvalFast(cur[0], preEndMode);
+    cur[0].evalScore = beamEvalFast(cur[0]);
 
     for (int depth = 0; depth < lookahead; depth++) {
         nxt.clear();
@@ -327,11 +317,14 @@ int chooseBeamNextDirFast(const FastState &startState, int beamWidth, int lookah
 
                 int biteIdx = applyMoveLocalFast(dir, z);
                 z.used++;
+                ll ev = nd.evalScore + 1LL;
                 if (z.firstDir == -1) z.firstDir = dir;
                 z.matchCnt += addedMatch;
+                if (addedMatch) ev -= BEAM_MATCH_POS_WEIGHT;
 
                 if (nextFood != 0 && z.pref == lenBefore && lenBefore < M && nextFood == d_arr[lenBefore]) {
                     z.pref++;
+                    ev -= BEAM_PREF_WEIGHT;
                 }
 
                 if (biteIdx != -1) {
@@ -343,18 +336,21 @@ int chooseBeamNextDirFast(const FastState &startState, int beamWidth, int lookah
                     }
                     if (nextFood != 0 && lenBefore < M && nextFood == d_arr[lenBefore]) removedMatch++;
                     z.matchCnt -= removedMatch;
+                    ev += BEAM_MATCH_POS_WEIGHT * (ll)removedMatch;
                     z.cutMismatchGain += (ll)removedMismatch;
+                    ev -= BEAM_CUT_MISMATCHED_WEIGHT * (ll)removedMismatch;
 
                     int newLen = biteIdx + 1;
                     if (z.pref > newLen) {
                         int prefDrop = z.pref - newLen;
                         z.cutPenalty += (ll)prefDrop;
                         z.pref = newLen;
+                        ev += (BEAM_PREF_WEIGHT + BEAM_CUT_PENALTY_WEIGHT) * (ll)prefDrop;
                     }
                 }
                 if (z.targetIdx < M && nextFood == d_arr[z.targetIdx]) z.targetIdx++;
 
-                z.evalScore = beamEvalFast(z, preEndMode);
+                z.evalScore = ev;
 
                 nxt.push_back(z);
             }
@@ -435,11 +431,7 @@ vi beamConstructMoves(const FastState &initialState,
 
     int remFood = 0;
     for (int i = 0; i < 256; i++) if (s.f[i] != 0) remFood++;
-    bool preEndMode = false;
     bool collectAllMode = false;
-
-    const double endgameThresholdMs = 80.0;
-    const double preEndThresholdMs = 3000.0;
 
     auto calcOfficialScore = [&](const FastState &stt, int usedOps) -> ll {
         int k = stt.len;
@@ -496,7 +488,6 @@ vi beamConstructMoves(const FastState &initialState,
     }
 
     // デバッグ情報は残す
-    int preEndModeTurns = 0;
     int collectModeTurns = 0;
     int totalTurns = 0;
 
@@ -516,9 +507,7 @@ vi beamConstructMoves(const FastState &initialState,
         saveIfComplete();
 
         if (!collectAllMode) {
-            double remMs = limitMs - ms;
-            if (!preEndMode && remMs <= preEndThresholdMs) preEndMode = true;
-            if (remMs <= endgameThresholdMs) collectAllMode = true;
+            if (limitMs - ms <= 120.0) collectAllMode = true;
         }
 
         int dir = -1;
@@ -551,7 +540,7 @@ vi beamConstructMoves(const FastState &initialState,
         } else {
             int remainCap = opsCap - (int)ans.size();
             int la = min(lookahead, max(1, remainCap));
-            dir = chooseBeamNextDirFast(s, beamWidth, la, preEndMode);
+            dir = chooseBeamNextDirFast(s, beamWidth, la);
             if (dir == -1) dir = getSafeDirFast(s);
         }
 
@@ -595,7 +584,6 @@ vi beamConstructMoves(const FastState &initialState,
 
         ans.push_back(dir);
         if (collectAllMode) collectModeTurns++;
-        else if (preEndMode) preEndModeTurns++;
         totalTurns++;
         {
             uint64_t hs = snakeHash(s);
@@ -623,7 +611,6 @@ vi beamConstructMoves(const FastState &initialState,
     cerr << "DEBUG: bw=" << beamWidth
          << " la=" << lookahead
          << " cap=" << bestPerfectTurnsCap
-            << " preEndMode_turns=" << preEndModeTurns
          << " collectAllMode_turns=" << collectModeTurns
          << " totalTurns=" << totalTurns
          << " totalMoves=" << ans.size()
@@ -756,7 +743,7 @@ int main() {
     ios::sync_with_stdio(0);
 
     auto globalStart = chrono::steady_clock::now();
-    const double TL_MS = 1800.0;
+    const double TL_MS = 1950.0;
     const double SAFETY_MS = 30.0;
 
     cin >> N >> M >> C;
@@ -793,7 +780,7 @@ int main() {
         };
 
         // まずは従来相当の1本探索で基準解を作る
-        double firstBudget = min(remainMs, 1750.0);
+        double firstBudget = min(remainMs, 1950.0);
         ansDir = beamConstructMoves(initialState, firstBudget, 80, 24, -1);
         EvalResult baseEv = evalMoves(initialState, ansDir);
 
