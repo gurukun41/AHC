@@ -23,27 +23,23 @@ inline int posYFast(int p) { return p & 15; }
 int N, M, C;
 int d_arr[512];
 
-// 状態を1つの構造体にパックし、動的確保をなくす
-struct FastState {
-    uint8_t pos[512]; // ヘビの座標 (x * 16 + y)
-    uint8_t col[512]; // ヘビの色
-    uint8_t f[256];   // 盤面の餌 (x * 16 + y)
-    
-    int len;          // ヘビの長さ
-    
-    // ビームサーチ用メタデータ
+// 状態構造体をサイズダウンし、メモリコピーのコストを劇的に下げる
+struct alignas(32) FastState {
+    uint8_t pos[260]; // 256で十分だが念のためマージン
+    uint8_t col[260];
+    uint8_t f[256];
+    ll cutPenalty;
+    ll cutMismatchGain;
+    ll evalScore;
+    int len;
     int pref;
     int matchCnt;
     int targetIdx;
     int used;
     int firstDir;
-    
-    ll cutPenalty;
-    ll cutMismatchGain;
-    ll evalScore;
 };
 
-// 状態の1手進める関数 (非常に高速に動作する)
+// 状態の1手進める関数 (memchrでさらに高速化)
 inline int applyMoveLocalFast(int dir, FastState &s) {
     int hpos = s.pos[0];
     int nx = posXFast(hpos) + DX[dir], ny = posYFast(hpos) + DY[dir];
@@ -51,7 +47,6 @@ inline int applyMoveLocalFast(int dir, FastState &s) {
 
     uint8_t old_tail_pos = s.pos[s.len - 1];
 
-    // 配列のシフトによる移動処理
     memmove(s.pos + 1, s.pos, s.len - 1);
     s.pos[0] = npos;
 
@@ -64,13 +59,14 @@ inline int applyMoveLocalFast(int dir, FastState &s) {
         s.len++;
     }
 
-    // 噛みちぎり判定
     int k = s.len;
     int h = -1;
-    for (int i = 1; i <= k - 2; i++) {
-        if (s.pos[i] == s.pos[0]) {
-            h = i;
-            break;
+    
+    // 噛みちぎり判定 (memchrによる高速検索)
+    if (k > 2) {
+        void* ptr = memchr(s.pos + 1, npos, k - 2);
+        if (ptr != nullptr) {
+            h = (int)((uint8_t*)ptr - s.pos);
         }
     }
 
@@ -88,8 +84,7 @@ inline int applyMoveLocalFast(int dir, FastState &s) {
 
 inline int getSafeDirFast(const FastState &s) {
     uint8_t occ[256] = {0};
-    for (int i = 0; i < s.len; i++) occ[s.pos[i]] = 1;
-    occ[s.pos[s.len - 1]] = 0;
+    for (int i = 0; i < s.len - 1; i++) occ[s.pos[i]] = 1;
 
     int hx = posXFast(s.pos[0]), hy = posYFast(s.pos[0]);
     int ut_pos = (s.len >= 2) ? s.pos[1] : -1;
@@ -113,15 +108,15 @@ inline int getSafeDirFast(const FastState &s) {
 
 inline int getDirToNearestColorFast(int targetColor, const FastState &s) {
     uint8_t occ[256] = {0};
-    for (int i = 0; i < s.len; i++) occ[s.pos[i]] = 1;
-    occ[s.pos[s.len - 1]] = 0;
+    for (int i = 0; i < s.len - 1; i++) occ[s.pos[i]] = 1;
 
     int hpos = s.pos[0];
     int ut_pos = (s.len >= 2) ? s.pos[1] : -1;
 
-    int dist[256];
-    int prevDir[256];
-    for (int i = 0; i < 256; i++) { dist[i] = -1; prevDir[i] = -1; }
+    uint8_t dist[256];
+    int8_t prevDir[256];
+    memset(dist, 255, sizeof(dist));
+    memset(prevDir, -1, sizeof(prevDir));
 
     int q[256];
     int qhead = 0, qtail = 0;
@@ -143,7 +138,7 @@ inline int getDirToNearestColorFast(int targetColor, const FastState &s) {
             if (nx < 0 || nx >= N || ny < 0 || ny >= N) continue;
             int npos = packPosFast(nx, ny);
 
-            if (dist[npos] != -1 || (curr == hpos && npos == ut_pos) || occ[npos]) continue;
+            if (dist[npos] != 255 || (curr == hpos && npos == ut_pos) || occ[npos]) continue;
 
             dist[npos] = dist[curr] + 1;
             prevDir[npos] = dir;
@@ -165,15 +160,15 @@ inline int getDirToNearestColorFast(int targetColor, const FastState &s) {
 
 inline int getDirToNearestFoodFast(const FastState &s) {
     uint8_t occ[256] = {0};
-    for (int i = 0; i < s.len; i++) occ[s.pos[i]] = 1;
-    occ[s.pos[s.len - 1]] = 0;
+    for (int i = 0; i < s.len - 1; i++) occ[s.pos[i]] = 1;
 
     int hpos = s.pos[0];
     int ut_pos = (s.len >= 2) ? s.pos[1] : -1;
 
-    int dist[256];
-    int prevDir[256];
-    for (int i = 0; i < 256; i++) { dist[i] = -1; prevDir[i] = -1; }
+    uint8_t dist[256];
+    int8_t prevDir[256];
+    memset(dist, 255, sizeof(dist));
+    memset(prevDir, -1, sizeof(prevDir));
 
     int q[256];
     int qhead = 0, qtail = 0;
@@ -195,7 +190,7 @@ inline int getDirToNearestFoodFast(const FastState &s) {
             if (nx < 0 || nx >= N || ny < 0 || ny >= N) continue;
             int npos = packPosFast(nx, ny);
 
-            if (dist[npos] != -1 || (curr == hpos && npos == ut_pos) || occ[npos]) continue;
+            if (dist[npos] != 255 || (curr == hpos && npos == ut_pos) || occ[npos]) continue;
 
             dist[npos] = dist[curr] + 1;
             prevDir[npos] = dir;
@@ -217,16 +212,16 @@ inline int getDirToNearestFoodFast(const FastState &s) {
 
 inline int getDirToCellFast(int tx, int ty, const FastState &s) {
     uint8_t occ[256] = {0};
-    for (int i = 0; i < s.len; i++) occ[s.pos[i]] = 1;
-    occ[s.pos[s.len - 1]] = 0;
+    for (int i = 0; i < s.len - 1; i++) occ[s.pos[i]] = 1;
 
     int hpos = s.pos[0];
     int ut_pos = (s.len >= 2) ? s.pos[1] : -1;
     int tpos = packPosFast(tx, ty);
 
-    int dist[256];
-    int prevDir[256];
-    for (int i = 0; i < 256; i++) { dist[i] = -1; prevDir[i] = -1; }
+    uint8_t dist[256];
+    int8_t prevDir[256];
+    memset(dist, 255, sizeof(dist));
+    memset(prevDir, -1, sizeof(prevDir));
 
     int q[256];
     int qhead = 0, qtail = 0;
@@ -243,14 +238,14 @@ inline int getDirToCellFast(int tx, int ty, const FastState &s) {
             if (nx < 0 || nx >= N || ny < 0 || ny >= N) continue;
             int npos = packPosFast(nx, ny);
 
-            if (dist[npos] != -1 || (curr == hpos && npos == ut_pos) || occ[npos]) continue;
+            if (dist[npos] != 255 || (curr == hpos && npos == ut_pos) || occ[npos]) continue;
 
             dist[npos] = dist[curr] + 1;
             prevDir[npos] = dir;
             q[qtail++] = npos;
         }
     }
-    if (dist[tpos] == -1) return -1;
+    if (dist[tpos] == 255) return -1;
 
     int curr = tpos;
     while (curr != hpos) {
@@ -264,7 +259,7 @@ inline int getDirToCellFast(int tx, int ty, const FastState &s) {
 }
 
 constexpr int MAX_OPS = 100000;
-inline int searchOpsCap() { return /*min(MAX_OPS, M * 100)*/100000; }
+inline int searchOpsCap() { return 100000; }
 
 // === ビームサーチの中核 ===
 
@@ -282,11 +277,9 @@ inline ll beamEvalFast(const FastState &s) {
 }
 
 int chooseBeamNextDirFast(const FastState &startState, int beamWidth = 40, int lookahead = 100) {
-    // vectorの再利用により、ループ内でのメモリ確保を完全に防ぐ
     static vector<FastState> cur, nxt, picked;
-    cur.clear();
-    nxt.clear();
-    picked.clear();
+    static vector<int> idx;
+    cur.clear(); nxt.clear(); picked.clear();
     cur.reserve(max(beamWidth, 16));
     nxt.reserve(max(beamWidth * 4, 64));
     picked.reserve(max(beamWidth, 16));
@@ -308,7 +301,10 @@ int chooseBeamNextDirFast(const FastState &startState, int beamWidth = 40, int l
 
                 if (nd.len >= 2 && nd.pos[1] == npos) continue;
 
-                FastState z = nd; // 高速な構造体コピー
+                // コピーを避け、末尾に直接追加して操作する
+                nxt.push_back(nd);
+                FastState &z = nxt.back();
+
                 int nextFood = z.f[npos];
                 int lenBefore = z.len;
 
@@ -331,8 +327,8 @@ int chooseBeamNextDirFast(const FastState &startState, int beamWidth = 40, int l
                     int removedMatch = 0;
                     int removedMismatch = 0;
                     for (int i = biteIdx + 1; i < lenBefore; i++) {
-                        if (i < M && nd.col[i] == d_arr[i]) removedMatch++;
-                        if (i < M && nd.col[i] != d_arr[i]) removedMismatch++;
+                        if (i < M && z.col[i] == d_arr[i]) removedMatch++;
+                        if (i < M && z.col[i] != d_arr[i]) removedMismatch++;
                     }
                     if (nextFood != 0 && lenBefore < M && nextFood == d_arr[lenBefore]) removedMatch++;
                     z.matchCnt -= removedMatch;
@@ -351,45 +347,47 @@ int chooseBeamNextDirFast(const FastState &startState, int beamWidth = 40, int l
                 if (z.targetIdx < M && nextFood == d_arr[z.targetIdx]) z.targetIdx++;
 
                 z.evalScore = ev;
-
-                nxt.push_back(z);
             }
         }
 
         if (nxt.empty()) break;
 
         int keep = min(beamWidth, (int)nxt.size());
-        // 通常評価枠とは別に、正答率が高い状態を少数だけ温存する
         int keepAcc = 0;
         if (keep >= 8) keepAcc = max(1, keep / 10);
         if (keepAcc > keep) keepAcc = keep;
         int keepEval = keep - keepAcc;
 
-        auto byAcc = [&](const FastState &a, const FastState &b) {
-            if (a.pref != b.pref) return a.pref > b.pref;
-            if (a.matchCnt != b.matchCnt) return a.matchCnt > b.matchCnt;
-            return a.evalScore < b.evalScore;
+        // インデックスのみでソートし、巨大な構造体のスワップを防止
+        auto byAccIdx = [&](int a, int b) {
+            const FastState &sa = nxt[a], &sb = nxt[b];
+            if (sa.pref != sb.pref) return sa.pref > sb.pref;
+            if (sa.matchCnt != sb.matchCnt) return sa.matchCnt > sb.matchCnt;
+            return sa.evalScore < sb.evalScore;
         };
-        auto byEval = [&](const FastState &a, const FastState &b) {
-            if (a.evalScore != b.evalScore) return a.evalScore < b.evalScore;
-            return a.pref > b.pref;
+        auto byEvalIdx = [&](int a, int b) {
+            const FastState &sa = nxt[a], &sb = nxt[b];
+            if (sa.evalScore != sb.evalScore) return sa.evalScore < sb.evalScore;
+            return sa.pref > sb.pref;
         };
 
+        idx.resize(nxt.size());
+        iota(idx.begin(), idx.end(), 0);
         picked.clear();
 
         if (keepAcc > 0) {
-            nth_element(nxt.begin(), nxt.begin() + keepAcc - 1, nxt.end(), byAcc);
-            for (int i = 0; i < keepAcc; i++) picked.push_back(nxt[i]);
+            nth_element(idx.begin(), idx.begin() + keepAcc - 1, idx.end(), byAccIdx);
+            for (int i = 0; i < keepAcc; i++) picked.push_back(nxt[idx[i]]);
         }
 
         if (keepEval > 0) {
-            auto remBegin = nxt.begin() + keepAcc;
-            auto remEnd = nxt.end();
+            auto remBegin = idx.begin() + keepAcc;
+            auto remEnd = idx.end();
             int remSize = (int)(remEnd - remBegin);
             int take = min(keepEval, remSize);
             if (take > 0) {
-                nth_element(remBegin, remBegin + take - 1, remEnd, byEval);
-                for (int i = 0; i < take; i++) picked.push_back(*(remBegin + i));
+                nth_element(remBegin, remBegin + take - 1, remEnd, byEvalIdx);
+                for (int i = 0; i < take; i++) picked.push_back(nxt[*(remBegin + i)]);
             }
         }
 
@@ -455,13 +453,11 @@ vi beamConstructMoves(const FastState &initialState,
         }
     };
 
+    // ハッシュ関数も軽量化
     auto snakeHash = [&](const FastState &stt) -> uint64_t {
         uint64_t h = 1469598103934665603ULL;
-        h ^= (uint64_t)stt.len + 0x9e3779b97f4a7c15ULL;
-        h *= 1099511628211ULL;
         for (int i = 0; i < stt.len; i++) {
-            uint64_t v = (uint64_t)(stt.pos[i] + 1);
-            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            h ^= stt.pos[i];
             h *= 1099511628211ULL;
         }
         return h;
@@ -487,7 +483,6 @@ vi beamConstructMoves(const FastState &initialState,
         recentFreq[h0] = 1;
     }
 
-    // デバッグ情報は残す
     int collectModeTurns = 0;
     int totalTurns = 0;
 
@@ -603,7 +598,6 @@ vi beamConstructMoves(const FastState &initialState,
         saveIfComplete();
 
         if (remFood == 0 && s.matchCnt == M) {
-            // 完全一致(E=0, k=M)を達成したら、このランでこれ以上続けても T しか増えず改善しない
             break;
         }
     }
@@ -622,7 +616,7 @@ vi beamConstructMoves(const FastState &initialState,
     return hasSavedComplete ? savedCompleteAns : ans;
 }
 
-// === 初期の移動ルート構築（ビームサーチを使わない時間帯用） ===
+// === 初期の移動ルート構築 ===
 
 vector<Pos> collectInitialFoodsFast(const FastState &s) {
     vector<Pos> foods;
@@ -779,7 +773,6 @@ int main() {
             {80, 24}, {96, 20}, {64, 28}, {112, 16}, {48, 32}, {72, 26}
         };
 
-        // まずは従来相当の1本探索で基準解を作る
         double firstBudget = min(remainMs, 1950.0);
         ansDir = beamConstructMoves(initialState, firstBudget, 80, 24, -1);
         EvalResult baseEv = evalMoves(initialState, ansDir);
@@ -787,7 +780,6 @@ int main() {
         ll bestScore = baseEv.score;
         int bestPerfectTurns = baseEv.perfect ? baseEv.turns : -1;
 
-        // 完全一致が見つかった場合のみ、残り時間で幅/深さを変えて再探索
         if (bestPerfectTurns != -1) {
             int trial = 0;
             while (true) {
