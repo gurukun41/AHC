@@ -1,1357 +1,543 @@
 #include <bits/stdc++.h>
 using namespace std;
 
-static constexpr int N = 20;
-static constexpr int V = N * N;
-static constexpr int INF = 1e9;
-static constexpr int EXIT = N / 2; // id(0, N/2)
+using ll = long long;
 
-int id(int i, int j) { return i * N + j; }
-int rr(int x) { return x / N; }
-int cc(int x) { return x % N; }
+struct Timer {
+    chrono::steady_clock::time_point start;
 
-struct XorShift {
-    uint64_t x;
-    XorShift(uint64_t seed = 88172645463325252ull) : x(seed) {}
-    uint64_t next64() { x ^= x << 7; x ^= x >> 9; return x; }
-    int randint(int n) { return int(next64() % uint64_t(n)); }
-    double uniform01() { return (next64() >> 11) * (1.0 / 9007199254740992.0); }
+    Timer() : start(chrono::steady_clock::now()) {}
+
+    double elapsed_ms() const {
+        auto now = chrono::steady_clock::now();
+        return chrono::duration<double, milli>(now - start).count();
+    }
 };
 
-struct Candidate {
+struct XorShift {
+    uint64_t x = 88172645463325252ULL;
+
+    explicit XorShift(uint64_t seed = 88172645463325252ULL) : x(seed) {}
+
+    uint64_t next_u64() {
+        x ^= x << 7;
+        x ^= x >> 9;
+        return x;
+    }
+
+    int next_int(int l, int r) {
+        return l + (int)(next_u64() % (uint64_t)(r - l));
+    }
+
+    double next_double() {
+        return (next_u64() >> 11) * (1.0 / 9007199254740992.0);
+    }
+};
+
+struct Point {
+    int i;
+    int j;
+};
+
+struct Conveyor {
     vector<int> cells;
-    bool fixed = false;
+};
+
+struct Operation {
+    int m;
+    int d;
 };
 
 struct Move {
     int to;
-    int m;
-    int d;
+    Operation operation;
 };
 
-struct Op {
-    int m;
-    int d;
-};
-
-struct Plan {
-    vector<Op> ops;
-    int gain = 0;
-    bool ok = false;
-};
-
-struct State {
-    array<int, V> cell_box{};
-    array<int, V> box_cell{};
+struct BeamState {
+    vector<int> box_at;
+    vector<int> pos_of_box;
     int next_box = 0;
+    int cost = 0;
+    int trace_id = -1;
+    double eval = 0.0;
 };
 
-struct Context {
-    vector<vector<int>> loops;
-    vector<vector<Move>> moves;
-    vector<array<int, V>> nxt_pos; // 2*m+0 => d=-1, 2*m+1 => d=+1
-    array<int, V> dist{};
-    int unreachable = 0;
-    int total_len = 0;
+struct TraceNode {
+    int parent = -1;
+    vector<Operation> path;
 };
 
-void remove_ready(State& st) {
-    while (st.next_box < V && st.cell_box[EXIT] == st.next_box) {
-        int b = st.next_box;
-        st.cell_box[EXIT] = -1;
-        st.box_cell[b] = -1;
-        st.next_box++;
-    }
-}
+class Solver {
+  public:
+    static constexpr int TURN_LIMIT = 100000;
+    static constexpr int BEAM_WIDTH = 64;
+    static constexpr int PATH_CACHE_LIMIT = 48;
+    static constexpr int EXPAND_PATH_LIMIT = 16;
+    static constexpr int EXTRA_PATH_LEN = 4;
+    static constexpr int HEURISTIC_DEPTH = 24;
+    static constexpr int STATE_HASH_DEPTH = 40;
 
-vector<int> rectangle_loop(int top, int left, int h, int w) {
-    vector<int> res;
-
-    for (int j = left; j < left + w; j++) {
-        res.push_back(id(top, j));
-    }
-
-    for (int i = top + 1; i < top + h; i++) {
-        res.push_back(id(i, left + w - 1));
-    }
-
-    for (int j = left + w - 2; j >= left; j--) {
-        res.push_back(id(top + h - 1, j));
+    void run() {
+        read_input();
+        build_conveyors();
+        build_memberships();
+        build_initial_state();
+        build_graph();
+        build_distances();
+        solve_by_beam_search();
+        output();
     }
 
-    for (int i = top + h - 2; i > top; i--) {
-        res.push_back(id(i, left));
-    }
+  private:
+    int N;
+    vector<vector<int>> a;
+    vector<Conveyor> conveyors;
+    vector<Operation> operations;
+    vector<vector<pair<int, int>>> memberships;
+    vector<vector<Move>> graph;
+    vector<int> dist_to_exit;
+    vector<vector<vector<Operation>>> candidate_cache;
+    vector<char> candidate_ready;
 
-    return res;
-}
+    // box_at[cell] is the box currently on the cell, or -1 if the cell is empty.
+    vector<int> box_at;
+    vector<int> pos_of_box;
+    int next_box = 0;
+    int exit_cell = -1;
 
-void add_grid_edge(array<unsigned char, V>& mask, int a, int b) {
-    int ai = rr(a);
-    int aj = cc(a);
-    int bi = rr(b);
-    int bj = cc(b);
-
-    if (bi == ai - 1 && bj == aj) {
-        mask[a] |= 1;
-        mask[b] |= 2;
-    } else if (bi == ai + 1 && bj == aj) {
-        mask[a] |= 2;
-        mask[b] |= 1;
-    } else if (bi == ai && bj == aj - 1) {
-        mask[a] |= 4;
-        mask[b] |= 8;
-    } else if (bi == ai && bj == aj + 1) {
-        mask[a] |= 8;
-        mask[b] |= 4;
-    }
-}
-
-void remove_grid_edge(array<unsigned char, V>& mask, int a, int b) {
-    int ai = rr(a);
-    int aj = cc(a);
-    int bi = rr(b);
-    int bj = cc(b);
-
-    if (bi == ai - 1 && bj == aj) {
-        mask[a] &= ~1u;
-        mask[b] &= ~2u;
-    } else if (bi == ai + 1 && bj == aj) {
-        mask[a] &= ~2u;
-        mask[b] &= ~1u;
-    } else if (bi == ai && bj == aj - 1) {
-        mask[a] &= ~4u;
-        mask[b] &= ~8u;
-    } else if (bi == ai && bj == aj + 1) {
-        mask[a] &= ~8u;
-        mask[b] &= ~4u;
-    }
-}
-
-array<int, 4> block_cells(int top, int left) {
-    return {
-        id(top, left),
-        id(top, left + 1),
-        id(top + 1, left + 1),
-        id(top + 1, left)
-    };
-}
-
-vector<int> build_cycle_from_macro_tree(
-    int off_i,
-    int off_j,
-    int H,
-    int W,
-    const vector<int>& blocks,
-    const vector<pair<int, int>>& tree_edges
-) {
-    if (blocks.empty()) {
-        return {};
-    }
-
-    vector<unsigned char> in(H * W, 0);
-
-    for (int b : blocks) {
-        in[b] = 1;
-    }
-
-    array<unsigned char, V> mask{};
-    mask.fill(0);
-
-    vector<int> used_cells;
-    used_cells.reserve(4 * blocks.size());
-
-    for (int b : blocks) {
-        int r = b / W;
-        int c = b % W;
-        int top = off_i + 2 * r;
-        int left = off_j + 2 * c;
-
-        if (top < 0 || top + 1 >= N || left < 0 || left + 1 >= N) {
-            return {};
-        }
-
-        auto q = block_cells(top, left);
-
-        add_grid_edge(mask, q[0], q[1]);
-        add_grid_edge(mask, q[1], q[2]);
-        add_grid_edge(mask, q[2], q[3]);
-        add_grid_edge(mask, q[3], q[0]);
-
-        for (int x : q) {
-            used_cells.push_back(x);
+    void read_input() {
+        cin >> N;
+        a.assign(N, vector<int>(N));
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < N; j++) cin >> a[i][j];
         }
     }
 
-    for (auto [u, v] : tree_edges) {
-        int r1 = u / W;
-        int c1 = u % W;
-        int r2 = v / W;
-        int c2 = v % W;
+    void build_conveyors() {
+        conveyors.clear();
+        conveyors.reserve(N);
 
-        if (!in[u] || !in[v]) {
-            return {};
+        for (int band = 0; band < N / 2; band++) {
+            const int r0 = 2 * band;
+            const int r1 = r0 + 1;
+            vector<int> cells;
+            cells.reserve(2 * N);
+
+            for (int j = 0; j < N; j++) cells.push_back(id(r0, j));
+            for (int j = N - 1; j >= 0; j--) cells.push_back(id(r1, j));
+            conveyors.push_back({cells});
         }
 
-        if (abs(r1 - r2) + abs(c1 - c2) != 1) {
-            return {};
+        for (int band = 0; band < N / 2; band++) {
+            const int c0 = 2 * band;
+            const int c1 = c0 + 1;
+            vector<int> cells;
+            cells.reserve(2 * N);
+
+            for (int i = 0; i < N; i++) cells.push_back(id(i, c0));
+            for (int i = N - 1; i >= 0; i--) cells.push_back(id(i, c1));
+            conveyors.push_back({cells});
         }
 
-        if (r1 == r2) {
-            if (c1 > c2) {
-                swap(r1, r2);
-                swap(c1, c2);
+        validate_conveyors();
+    }
+
+    void build_memberships() {
+        memberships.assign(N * N, {});
+        for (int m = 0; m < (int)conveyors.size(); m++) {
+            const int L = (int)conveyors[m].cells.size();
+            for (int p = 0; p < L; p++) {
+                memberships[conveyors[m].cells[p]].push_back({m, p});
             }
+        }
 
-            auto A = block_cells(off_i + 2 * r1, off_j + 2 * c1);
-            auto B = block_cells(off_i + 2 * r2, off_j + 2 * c2);
+        for (int cell = 0; cell < N * N; cell++) {
+            assert((int)memberships[cell].size() <= 2);
+        }
+    }
 
-            remove_grid_edge(mask, A[1], A[2]);
-            remove_grid_edge(mask, B[0], B[3]);
-            add_grid_edge(mask, A[1], B[0]);
-            add_grid_edge(mask, A[2], B[3]);
-        } else {
-            if (r1 > r2) {
-                swap(r1, r2);
-                swap(c1, c2);
+    void build_initial_state() {
+        const int V = N * N;
+        exit_cell = id(0, N / 2);
+        box_at.assign(V, -1);
+        pos_of_box.assign(V, -1);
+
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                const int cell = id(i, j);
+                const int box = a[i][j];
+                box_at[cell] = box;
+                pos_of_box[box] = cell;
             }
+        }
 
-            auto A = block_cells(off_i + 2 * r1, off_j + 2 * c1);
-            auto B = block_cells(off_i + 2 * r2, off_j + 2 * c2);
-
-            remove_grid_edge(mask, A[2], A[3]);
-            remove_grid_edge(mask, B[0], B[1]);
-            add_grid_edge(mask, A[3], B[0]);
-            add_grid_edge(mask, A[2], B[1]);
+        // Only box 0 can be removed before the first operation.
+        if (box_at[exit_cell] == 0) {
+            box_at[exit_cell] = -1;
+            pos_of_box[0] = -1;
+            next_box = 1;
         }
     }
 
-    vector<unsigned char> mark(V, 0);
+    void build_graph() {
+        const int V = N * N;
+        graph.assign(V, {});
 
-    for (int c : used_cells) {
-        if (mark[c]) {
-            return {};
-        }
-
-        mark[c] = 1;
-    }
-
-    auto neighs = [&](int cur) {
-        vector<int> ns;
-        int i = rr(cur);
-        int j = cc(cur);
-
-        if ((mask[cur] & 1) && i > 0) {
-            ns.push_back(id(i - 1, j));
-        }
-
-        if ((mask[cur] & 2) && i + 1 < N) {
-            ns.push_back(id(i + 1, j));
-        }
-
-        if ((mask[cur] & 4) && j > 0) {
-            ns.push_back(id(i, j - 1));
-        }
-
-        if ((mask[cur] & 8) && j + 1 < N) {
-            ns.push_back(id(i, j + 1));
-        }
-
-        return ns;
-    };
-
-    for (int c : used_cells) {
-        if ((int)neighs(c).size() != 2) {
-            return {};
-        }
-    }
-
-    int start = used_cells[0];
-
-    vector<int> cyc;
-    cyc.reserve(used_cells.size());
-
-    vector<unsigned char> seen(V, 0);
-
-    int prev = -1;
-    int cur = start;
-
-    for (int step = 0; step < (int)used_cells.size(); step++) {
-        if (seen[cur]) {
-            return {};
-        }
-
-        seen[cur] = 1;
-        cyc.push_back(cur);
-
-        auto ns = neighs(cur);
-        int nxt = (ns[0] == prev ? ns[1] : ns[0]);
-
-        prev = cur;
-        cur = nxt;
-    }
-
-    if (cur != start) {
-        return {};
-    }
-
-    return cyc;
-}
-
-Context build_context_from_loops(const vector<vector<int>>& loops) {
-    Context ctx;
-
-    ctx.loops = loops;
-    ctx.moves.assign(V, {});
-    ctx.nxt_pos.resize(2 * loops.size());
-    ctx.total_len = 0;
-
-    for (auto& a : ctx.nxt_pos) {
-        a.fill(-1);
-    }
-
-    for (int m = 0; m < (int)loops.size(); m++) {
-        const auto& lp = loops[m];
-        int L = (int)lp.size();
-
-        ctx.total_len += L;
-
-        for (int i = 0; i < L; i++) {
-            int c = lp[i];
-            int plus = lp[(i + 1) % L];
-            int minus = lp[(i + L - 1) % L];
-
-            ctx.moves[c].push_back({plus, m, 1});
-            ctx.moves[c].push_back({minus, m, -1});
-
-            ctx.nxt_pos[2 * m + 1][c] = plus;
-            ctx.nxt_pos[2 * m + 0][c] = minus;
-        }
-    }
-
-    ctx.dist.fill(INF);
-
-    queue<int> q;
-    ctx.dist[EXIT] = 0;
-    q.push(EXIT);
-
-    while (!q.empty()) {
-        int v = q.front();
-        q.pop();
-
-        for (const auto& mv : ctx.moves[v]) {
-            if (ctx.dist[mv.to] > ctx.dist[v] + 1) {
-                ctx.dist[mv.to] = ctx.dist[v] + 1;
-                q.push(mv.to);
+        for (int cell = 0; cell < V; cell++) {
+            for (const auto &[m, pos] : memberships[cell]) {
+                const Conveyor &conveyor = conveyors[m];
+                const int L = (int)conveyor.cells.size();
+                for (const int d : {-1, 1}) {
+                    const int next_pos = (pos + d + L) % L;
+                    graph[cell].push_back({conveyor.cells[next_pos], {m, d}});
+                }
             }
         }
     }
 
-    ctx.unreachable = 0;
+    void build_distances() {
+        const int V = N * N;
+        dist_to_exit.assign(V, -1);
+        queue<int> que;
 
-    for (int c = 0; c < V; c++) {
-        if (ctx.dist[c] >= INF) {
-            ctx.unreachable++;
-        }
-    }
+        dist_to_exit[exit_cell] = 0;
+        que.push(exit_cell);
+        while (!que.empty()) {
+            const int cell = que.front();
+            que.pop();
 
-    return ctx;
-}
+            for (const Move &move : graph[cell]) {
+                const int next_cell = move.to;
+                if (dist_to_exit[next_cell] != -1) continue;
 
-void apply_operation(State& st, const Context& ctx, int m, int d, bool remove_boxes) {
-    const auto& lp = ctx.loops[m];
-    int L = (int)lp.size();
-
-    static int old[1000];
-
-    for (int i = 0; i < L; i++) {
-        old[i] = st.cell_box[lp[i]];
-    }
-
-    if (d == 1) {
-        for (int i = 0; i < L; i++) {
-            st.cell_box[lp[(i + 1) % L]] = old[i];
-        }
-    } else {
-        for (int i = 0; i < L; i++) {
-            st.cell_box[lp[(i + L - 1) % L]] = old[i];
-        }
-    }
-
-    for (int c : lp) {
-        int b = st.cell_box[c];
-
-        if (b >= 0) {
-            st.box_cell[b] = c;
-        }
-    }
-
-    if (remove_boxes) {
-        remove_ready(st);
-    }
-}
-
-int collateral_gain(const State& st, const Context& ctx, int target, int m, int d, int W) {
-    int idx = 2 * m + (d == 1 ? 1 : 0);
-    int gain = 0;
-
-    for (int b = target + 1; b < V && b <= target + W; b++) {
-        int p = st.box_cell[b];
-
-        if (p < 0) {
-            continue;
-        }
-
-        int q = ctx.nxt_pos[idx][p];
-
-        if (q < 0) {
-            continue;
-        }
-
-        if (ctx.dist[q] < ctx.dist[p]) {
-            int w = W - (b - target) + 1;
-            gain += w;
-        }
-    }
-
-    return gain;
-}
-
-Plan greedy_path_with_gain(const State& base, const Context& ctx, int target, int W) {
-    Plan res;
-
-    if (target >= V) {
-        res.ok = true;
-        return res;
-    }
-
-    int start = base.box_cell[target];
-
-    if (start < 0) {
-        res.ok = true;
-        return res;
-    }
-
-    if (start == EXIT) {
-        res.ok = true;
-        return res;
-    }
-
-    if (ctx.dist[start] >= INF) {
-        return res;
-    }
-
-    State tmp = base;
-    int guard = 0;
-
-    while (tmp.box_cell[target] != EXIT) {
-        int cur = tmp.box_cell[target];
-
-        if (++guard > 1000) {
-            return Plan{};
-        }
-
-        int best_i = -1;
-        int best_value = -INF;
-
-        for (int i = 0; i < (int)ctx.moves[cur].size(); i++) {
-            const auto& mv = ctx.moves[cur][i];
-
-            if (ctx.dist[mv.to] != ctx.dist[cur] - 1) {
-                continue;
-            }
-
-            int g = collateral_gain(tmp, ctx, target, mv.m, mv.d, W);
-            int value = g * 100 + (int)ctx.loops[mv.m].size();
-
-            if (value > best_value) {
-                best_value = value;
-                best_i = i;
+                dist_to_exit[next_cell] = dist_to_exit[cell] + 1;
+                que.push(next_cell);
             }
         }
 
-        if (best_i == -1) {
-            return Plan{};
+        for (int d : dist_to_exit) assert(d != -1);
+
+        candidate_cache.assign(V, {});
+        candidate_ready.assign(V, 0);
+    }
+
+    void solve_by_beam_search() {
+        const int V = N * N;
+        vector<TraceNode> trace;
+        trace.reserve(200000);
+        trace.push_back({-1, {}});
+
+        BeamState initial;
+        initial.box_at = box_at;
+        initial.pos_of_box = pos_of_box;
+        initial.next_box = next_box;
+        initial.cost = 0;
+        initial.trace_id = 0;
+        initial.eval = evaluate(initial);
+
+        vector<BeamState> beam;
+        beam.push_back(std::move(initial));
+
+        while (!beam.empty() && beam.front().next_box < V) {
+            const int target = beam.front().next_box;
+            vector<BeamState> pool;
+            pool.reserve(BEAM_WIDTH * EXPAND_PATH_LIMIT);
+
+            for (const BeamState &state : beam) {
+                assert(state.next_box == target);
+                const int start = state.pos_of_box[target];
+                assert(start >= 0);
+                assert(start != exit_cell);
+
+                const vector<vector<Operation>> &paths = candidate_paths(start);
+
+                struct LocalCandidate {
+                    BeamState state;
+                    int path_id;
+                    double score;
+                };
+
+                vector<LocalCandidate> local;
+                local.reserve(EXPAND_PATH_LIMIT + 1);
+
+                auto better_local = [](const LocalCandidate &lhs, const LocalCandidate &rhs) {
+                    if (lhs.score != rhs.score) return lhs.score < rhs.score;
+                    if (lhs.state.eval != rhs.state.eval) return lhs.state.eval < rhs.state.eval;
+                    return lhs.state.cost < rhs.state.cost;
+                };
+
+                for (int path_id = 0; path_id < (int)paths.size(); path_id++) {
+                    const vector<Operation> &path = paths[path_id];
+                    BeamState child;
+                    child.box_at = state.box_at;
+                    child.pos_of_box = state.pos_of_box;
+                    child.next_box = state.next_box;
+                    child.cost = state.cost + (int)path.size();
+                    if (child.cost > TURN_LIMIT) continue;
+
+                    for (const Operation &operation : path) {
+                        apply_operation(child, operation);
+                    }
+                    if (child.next_box != target + 1) continue;
+
+                    child.eval = evaluate(child);
+                    const double score = child.eval;
+
+                    LocalCandidate candidate{std::move(child), path_id, score};
+                    local.push_back(std::move(candidate));
+
+                    int pos = (int)local.size() - 1;
+                    while (pos > 0 && better_local(local[pos], local[pos - 1])) {
+                        swap(local[pos], local[pos - 1]);
+                        pos--;
+                    }
+
+                    if ((int)local.size() > EXPAND_PATH_LIMIT) {
+                        local.pop_back();
+                    }
+                }
+
+                for (LocalCandidate &candidate : local) {
+                    trace.push_back({state.trace_id, paths[candidate.path_id]});
+                    candidate.state.trace_id = (int)trace.size() - 1;
+                    pool.push_back(std::move(candidate.state));
+                }
+            }
+
+            assert(!pool.empty());
+            sort(pool.begin(), pool.end(), [](const BeamState &lhs, const BeamState &rhs) {
+                if (lhs.eval != rhs.eval) return lhs.eval < rhs.eval;
+                return lhs.cost < rhs.cost;
+            });
+
+            beam.clear();
+            unordered_set<uint64_t> seen;
+            seen.reserve(BEAM_WIDTH * 4);
+
+            for (BeamState &state : pool) {
+                const uint64_t h = state_hash(state);
+                if (!seen.insert(h).second) continue;
+
+                beam.push_back(std::move(state));
+                if ((int)beam.size() >= BEAM_WIDTH) break;
+            }
+
+            if (beam.empty()) {
+                beam.push_back(std::move(pool.front()));
+            }
         }
 
-        Move mv = ctx.moves[cur][best_i];
-        int g = collateral_gain(tmp, ctx, target, mv.m, mv.d, W);
+        assert(!beam.empty());
+        const BeamState *best = &beam.front();
+        for (const BeamState &state : beam) {
+            if (state.cost < best->cost) best = &state;
+        }
 
-        res.gain += g;
-        res.ops.push_back({mv.m, mv.d});
-
-        apply_operation(tmp, ctx, mv.m, mv.d, false);
+        operations = restore_operations(trace, best->trace_id);
+        assert((int)operations.size() <= TURN_LIMIT);
     }
 
-    res.ok = true;
-    return res;
-}
+    const vector<vector<Operation>> &candidate_paths(int start) {
+        if (candidate_ready[start]) return candidate_cache[start];
+        candidate_ready[start] = 1;
 
-Plan random_path_with_gain(
-    const State& base,
-    const Context& ctx,
-    int target,
-    int W,
-    int slack,
-    XorShift& rng
-) {
-    Plan res;
+        vector<vector<Operation>> paths;
+        if (start == exit_cell) {
+            paths.push_back({});
+            candidate_cache[start] = paths;
+            return candidate_cache[start];
+        }
 
-    int start = base.box_cell[target];
+        vector<int> order;
+        vector<char> visited(N * N, 0);
+        vector<Operation> current_path;
+        visited[start] = 1;
 
-    if (start < 0) {
-        res.ok = true;
-        return res;
+        const int base = dist_to_exit[start];
+        for (int limit = base; limit <= base + EXTRA_PATH_LEN && (int)paths.size() < PATH_CACHE_LIMIT; limit++) {
+            enumerate_paths(start, limit, visited, current_path, paths);
+        }
+
+        assert(!paths.empty());
+        candidate_cache[start] = paths;
+        return candidate_cache[start];
     }
 
-    if (start == EXIT) {
-        res.ok = true;
-        return res;
+    void enumerate_paths(int cell, int remaining, vector<char> &visited, vector<Operation> &current_path,
+                         vector<vector<Operation>> &paths) const {
+        if ((int)paths.size() >= PATH_CACHE_LIMIT) return;
+        if (dist_to_exit[cell] > remaining) return;
+
+        if (cell == exit_cell) {
+            paths.push_back(current_path);
+            return;
+        }
+        if (remaining == 0) return;
+
+        vector<Move> moves = graph[cell];
+        sort(moves.begin(), moves.end(), [&](const Move &lhs, const Move &rhs) {
+            if (dist_to_exit[lhs.to] != dist_to_exit[rhs.to]) {
+                return dist_to_exit[lhs.to] < dist_to_exit[rhs.to];
+            }
+            if (lhs.operation.m != rhs.operation.m) return lhs.operation.m < rhs.operation.m;
+            return lhs.operation.d < rhs.operation.d;
+        });
+
+        for (const Move &move : moves) {
+            const int next_cell = move.to;
+            if (visited[next_cell]) continue;
+            if (dist_to_exit[next_cell] > remaining - 1) continue;
+
+            visited[next_cell] = 1;
+            current_path.push_back(move.operation);
+            enumerate_paths(next_cell, remaining - 1, visited, current_path, paths);
+            current_path.pop_back();
+            visited[next_cell] = 0;
+
+            if ((int)paths.size() >= PATH_CACHE_LIMIT) return;
+        }
     }
 
-    if (ctx.dist[start] >= INF) {
-        return res;
-    }
-
-    int max_len = ctx.dist[start] + slack;
-
-    State tmp = base;
-
-    array<unsigned char, V> visit{};
-    visit.fill(0);
-    visit[start] = 1;
-
-    while (tmp.box_cell[target] != EXIT && (int)res.ops.size() < max_len) {
-        int cur = tmp.box_cell[target];
-
-        struct Cand {
-            Move mv;
-            double weight;
+    double evaluate(const BeamState &state) const {
+        static constexpr double weights[HEURISTIC_DEPTH] = {
+            1.10, 0.95, 0.80, 0.66, 0.54, 0.44, 0.36, 0.30,
+            0.25, 0.21, 0.18, 0.15, 0.13, 0.11, 0.09, 0.075,
+            0.062, 0.052, 0.043, 0.036, 0.030, 0.025, 0.020, 0.016,
         };
 
-        vector<Cand> cs;
-        double sum = 0.0;
+        double value = state.cost;
+        for (int k = 0; k < HEURISTIC_DEPTH; k++) {
+            const int box = state.next_box + k;
+            if (box >= N * N) break;
 
-        for (const auto& mv : ctx.moves[cur]) {
-            if (ctx.dist[mv.to] >= INF) {
-                continue;
+            const int pos = state.pos_of_box[box];
+            if (pos == -1) continue;
+            value += weights[k] * dist_to_exit[pos];
+        }
+        return value;
+    }
+
+    uint64_t state_hash(const BeamState &state) const {
+        uint64_t h = 1469598103934665603ULL;
+
+        auto mix = [&](uint64_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        };
+
+        mix((uint64_t)state.next_box);
+
+        for (int k = 0; k < STATE_HASH_DEPTH; k++) {
+            const int box = state.next_box + k;
+            if (box >= N * N) break;
+
+            mix((uint64_t)(state.pos_of_box[box] + 2));
+        }
+
+        return h;
+    }
+
+    vector<Operation> restore_operations(const vector<TraceNode> &trace, int trace_id) const {
+        vector<vector<Operation>> chunks;
+        while (trace_id != -1) {
+            chunks.push_back(trace[trace_id].path);
+            trace_id = trace[trace_id].parent;
+        }
+        reverse(chunks.begin(), chunks.end());
+
+        vector<Operation> result;
+        for (const vector<Operation> &chunk : chunks) {
+            result.insert(result.end(), chunk.begin(), chunk.end());
+        }
+        return result;
+    }
+
+    void apply_operation(BeamState &state, const Operation &operation) const {
+        rotate_conveyor(state, operation.m, operation.d);
+        eject_if_ready(state);
+    }
+
+    void rotate_conveyor(BeamState &state, int m, int d) const {
+        const Conveyor &conveyor = conveyors[m];
+        const int L = (int)conveyor.cells.size();
+        array<int, 64> old{};
+        assert(L <= (int)old.size());
+
+        for (int p = 0; p < L; p++) old[p] = state.box_at[conveyor.cells[p]];
+
+        for (int p = 0; p < L; p++) {
+            const int next_p = (p + d + L) % L;
+            const int next_cell = conveyor.cells[next_p];
+            const int box = old[p];
+            state.box_at[next_cell] = box;
+            if (box != -1) state.pos_of_box[box] = next_cell;
+        }
+    }
+
+    void eject_if_ready(BeamState &state) const {
+        if (state.next_box < N * N && state.box_at[exit_cell] == state.next_box) {
+            state.pos_of_box[state.next_box] = -1;
+            state.box_at[exit_cell] = -1;
+            state.next_box++;
+        }
+    }
+
+    int id(int i, int j) const {
+        return i * N + j;
+    }
+
+    Point point(int cell) const {
+        return {cell / N, cell % N};
+    }
+
+    static bool adjacent(const Point &a, const Point &b) {
+        return abs(a.i - b.i) + abs(a.j - b.j) == 1;
+    }
+
+    void validate_conveyors() const {
+        vector<int> used_count(N * N, 0);
+        for (const Conveyor &conveyor : conveyors) {
+            const int L = (int)conveyor.cells.size();
+            assert(L >= 2);
+
+            set<int> seen;
+            for (int p = 0; p < L; p++) {
+                const int cell = conveyor.cells[p];
+                assert(0 <= cell && cell < N * N);
+                assert(seen.insert(cell).second);
+                used_count[cell]++;
+
+                const Point cur = point(cell);
+                const Point nxt = point(conveyor.cells[(p + 1) % L]);
+                assert(adjacent(cur, nxt));
             }
+        }
 
-            if ((int)res.ops.size() + 1 + ctx.dist[mv.to] > max_len) {
-                continue;
+        for (int count : used_count) assert(count <= 2);
+    }
+
+    void output() const {
+        cout << conveyors.size() << '\n';
+        for (const Conveyor &conveyor : conveyors) {
+            cout << conveyor.cells.size();
+            for (int cell : conveyor.cells) {
+                const Point p = point(cell);
+                cout << ' ' << p.i << ' ' << p.j;
             }
-
-            int g = collateral_gain(tmp, ctx, target, mv.m, mv.d, W);
-            int detour = ctx.dist[mv.to] - max(0, ctx.dist[cur] - 1);
-
-            double quality = 0.27 * g
-                - 0.72 * detour
-                - 0.18 * (int)visit[mv.to]
-                + 0.006 * (int)ctx.loops[mv.m].size();
-
-            double weight = exp(max(-40.0, min(40.0, quality)));
-
-            cs.push_back({mv, weight});
-            sum += weight;
+            cout << '\n';
         }
 
-        if (cs.empty()) {
-            return greedy_path_with_gain(base, ctx, target, W);
-        }
-
-        double x = rng.uniform01() * sum;
-        Move chosen = cs.back().mv;
-
-        for (const auto& ca : cs) {
-            x -= ca.weight;
-
-            if (x <= 0) {
-                chosen = ca.mv;
-                break;
-            }
-        }
-
-        int g = collateral_gain(tmp, ctx, target, chosen.m, chosen.d, W);
-
-        res.gain += g;
-        res.ops.push_back({chosen.m, chosen.d});
-
-        apply_operation(tmp, ctx, chosen.m, chosen.d, false);
-
-        int now = tmp.box_cell[target];
-
-        if (now < 0) {
-            return Plan{};
-        }
-
-        if (visit[now] < 250) {
-            visit[now]++;
+        cout << operations.size() << '\n';
+        for (const Operation &operation : operations) {
+            cout << operation.m << ' ' << operation.d << '\n';
         }
     }
-
-    if (tmp.box_cell[target] != EXIT) {
-        return greedy_path_with_gain(base, ctx, target, W);
-    }
-
-    res.ok = true;
-    return res;
-}
-
-long long plan_score_secondary(const State& st_after, const Context& ctx, int target, int W) {
-    long long s = 0;
-
-    for (int b = target + 1; b < V && b <= target + W; b++) {
-        int p = st_after.box_cell[b];
-
-        if (p < 0) {
-            continue;
-        }
-
-        if (ctx.dist[p] >= INF) {
-            s += 10000;
-        } else {
-            s += 1LL * (W - (b - target) + 1) * ctx.dist[p];
-        }
-    }
-
-    return s;
-}
-
-Plan choose_plan(const State& st, const Context& ctx, int target, int W, int tries, XorShift& rng) {
-    Plan best = greedy_path_with_gain(st, ctx, target, W);
-
-    if (!best.ok) {
-        return best;
-    }
-
-    auto eval_plan = [&](const Plan& p) -> long long {
-        State tmp = st;
-
-        for (const auto& op : p.ops) {
-            apply_operation(tmp, ctx, op.m, op.d, false);
-        }
-
-        if (target < V && tmp.box_cell[target] != EXIT && tmp.box_cell[target] != -1) {
-            return (long long)4e18;
-        }
-
-        long long score = 0;
-
-        score += 1LL * p.ops.size() * 1000LL;
-        score -= 1LL * p.gain * 58LL;
-        score += plan_score_secondary(tmp, ctx, target, min(W, 18)) * 3LL;
-
-        return score;
-    };
-
-    long long best_score = eval_plan(best);
-
-    for (int t = 0; t < tries; t++) {
-        int slack = (t < tries / 3) ? rng.randint(3) : 2 + rng.randint(9);
-
-        Plan p = random_path_with_gain(st, ctx, target, W, slack, rng);
-
-        if (!p.ok) {
-            continue;
-        }
-
-        long long sc = eval_plan(p);
-
-        if (sc < best_score) {
-            best_score = sc;
-            best = move(p);
-        }
-    }
-
-    return best;
-}
+};
 
 int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
-    int inputN;
-    cin >> inputN;
-
-    State initial;
-
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            int a;
-            cin >> a;
-
-            int c = id(i, j);
-
-            initial.cell_box[c] = a;
-            initial.box_cell[a] = c;
-        }
-    }
-
-    initial.next_box = 0;
-    remove_ready(initial);
-
-    XorShift rng(
-        (uint64_t)chrono::high_resolution_clock::now()
-            .time_since_epoch()
-            .count()
-    );
-
-    vector<Candidate> cand;
-    vector<int> initial_selected;
-
-    auto valid_loop = [&](const vector<int>& lp) -> bool {
-        if ((int)lp.size() < 2 || (int)lp.size() > 72) {
-            return false;
-        }
-
-        array<unsigned char, V> seen{};
-        seen.fill(0);
-
-        for (int c : lp) {
-            if (c < 0 || c >= V || seen[c]) {
-                return false;
-            }
-
-            seen[c] = 1;
-        }
-
-        int L = (int)lp.size();
-
-        for (int i = 0; i < L; i++) {
-            int a = lp[i];
-            int b = lp[(i + 1) % L];
-
-            if (abs(rr(a) - rr(b)) + abs(cc(a) - cc(b)) != 1) {
-                return false;
-            }
-        }
-
-        return true;
-    };
-
-    auto add_candidate = [&](const vector<int>& cells, bool fixed = false) -> int {
-        if (!valid_loop(cells)) {
-            return -1;
-        }
-
-        int idx = (int)cand.size();
-        cand.push_back({cells, fixed});
-
-        return idx;
-    };
-
-    vector<int> fixed_base;
-
-    // Layer A: disjoint 2x2 loops. Fixed, short, and covers every cell exactly once.
-    for (int i = 0; i < N; i += 2) {
-        for (int j = 0; j < N; j += 2) {
-            int k = add_candidate(rectangle_loop(i, j, 2, 2), true);
-            fixed_base.push_back(k);
-            initial_selected.push_back(k);
-        }
-    }
-
-    // Layer B: shifted 2x2 loops. This gives initial local connectivity without any long conveyor.
-    for (int i = 1; i + 1 < N; i += 2) {
-        for (int j = 1; j + 1 < N; j += 2) {
-            int k = add_candidate(rectangle_loop(i, j, 2, 2), false);
-            initial_selected.push_back(k);
-        }
-    }
-
-    // All 2x2 positions are candidates.
-    for (int i = 0; i + 2 <= N; i++) {
-        for (int j = 0; j + 2 <= N; j++) {
-            add_candidate(rectangle_loop(i, j, 2, 2), false);
-        }
-    }
-
-    // Small rectangle candidates remain, but no long row/column stripe is included.
-    for (int h = 2; h <= 6; h++) {
-        for (int w = 2; w <= 6; w++) {
-            if (h == 2 && w == 2) {
-                continue;
-            }
-
-            for (int i = 0; i + h <= N; i++) {
-                for (int j = 0; j + w <= N; j++) {
-                    add_candidate(rectangle_loop(i, j, h, w), false);
-                }
-            }
-        }
-    }
-
-    int complex_start = (int)cand.size();
-
-    auto add_random_tree_cycles = [&](int off_i, int off_j, int H, int W, int count) {
-        if (H <= 0 || W <= 0) {
-            return;
-        }
-
-        for (int t = 0; t < count; t++) {
-            int target_blocks = 2 + rng.randint(15); // length <= 64
-            target_blocks = min(target_blocks, H * W);
-
-            vector<unsigned char> in(H * W, 0);
-            vector<int> blocks;
-            vector<pair<int, int>> edges;
-
-            int s = rng.randint(H * W);
-
-            in[s] = 1;
-            blocks.push_back(s);
-
-            vector<pair<int, int>> frontier;
-
-            auto push_frontier = [&](int u) {
-                int r = u / W;
-                int c = u % W;
-
-                const int dr[4] = {-1, 1, 0, 0};
-                const int dc[4] = {0, 0, -1, 1};
-
-                for (int z = 0; z < 4; z++) {
-                    int nr = r + dr[z];
-                    int nc = c + dc[z];
-
-                    if (nr < 0 || nr >= H || nc < 0 || nc >= W) {
-                        continue;
-                    }
-
-                    int v = nr * W + nc;
-
-                    if (!in[v]) {
-                        frontier.push_back({u, v});
-                    }
-                }
-            };
-
-            push_frontier(s);
-
-            while ((int)blocks.size() < target_blocks && !frontier.empty()) {
-                int p = rng.randint((int)frontier.size());
-
-                auto [u, v] = frontier[p];
-
-                frontier[p] = frontier.back();
-                frontier.pop_back();
-
-                if (in[v]) {
-                    continue;
-                }
-
-                in[v] = 1;
-                blocks.push_back(v);
-                edges.push_back({u, v});
-
-                push_frontier(v);
-            }
-
-            if ((int)blocks.size() >= 2) {
-                auto cyc = build_cycle_from_macro_tree(off_i, off_j, H, W, blocks, edges);
-
-                if (!cyc.empty()) {
-                    add_candidate(cyc, false);
-                }
-            }
-        }
-    };
-
-    add_random_tree_cycles(0, 0, 10, 10, 650);
-    add_random_tree_cycles(0, 1, 10, 9, 450);
-    add_random_tree_cycles(1, 0, 9, 10, 450);
-    add_random_tree_cycles(1, 1, 9, 9, 450);
-
-    const int C = (int)cand.size();
-
-    vector<vector<int>> cand_by_cell(V);
-
-    for (int k = 0; k < C; k++) {
-        for (int c : cand[k].cells) {
-            cand_by_cell[c].push_back(k);
-        }
-    }
-
-    vector<int> selected;
-    vector<int> pos(C, -1);
-    vector<unsigned char> used(C, 0);
-
-    array<unsigned char, V> cnt{};
-    cnt.fill(0);
-
-    auto add_loop_state = [&](int k) {
-        used[k] = 1;
-        pos[k] = (int)selected.size();
-        selected.push_back(k);
-
-        for (int c : cand[k].cells) {
-            cnt[c]++;
-        }
-    };
-
-    auto remove_loop_state = [&](int k) {
-        int p = pos[k];
-        int last = selected.back();
-
-        selected[p] = last;
-        pos[last] = p;
-
-        selected.pop_back();
-
-        pos[k] = -1;
-        used[k] = 0;
-
-        for (int c : cand[k].cells) {
-            cnt[c]--;
-        }
-    };
-
-    auto can_add = [&](int k) -> bool {
-        if (k < 0 || k >= C || used[k]) {
-            return false;
-        }
-
-        for (int c : cand[k].cells) {
-            if (cnt[c] >= 2) {
-                return false;
-            }
-        }
-
-        return true;
-    };
-
-    for (int k : initial_selected) {
-        add_loop_state(k);
-    }
-
-    auto selected_to_loops = [&](const vector<int>& sel) {
-        vector<vector<int>> loops;
-        loops.reserve(sel.size());
-
-        for (int k : sel) {
-            loops.push_back(cand[k].cells);
-        }
-
-        return loops;
-    };
-
-    auto evaluate_selected = [&](const vector<int>& sel, int tries_per_box) -> long long {
-        vector<vector<int>> loops = selected_to_loops(sel);
-
-        if (loops.empty()) {
-            return (long long)4e18;
-        }
-
-        Context ctx = build_context_from_loops(loops);
-
-        long long score = 0;
-
-        if (ctx.unreachable > 0) {
-            score += 1LL * ctx.unreachable * 3000000000LL;
-        }
-
-        score += 1LL * ctx.total_len * 2LL;
-
-        State st = initial;
-
-        const int K = 50;
-        const int W = 28;
-
-        int last_next = st.next_box;
-
-        while (st.next_box < V && st.next_box < K) {
-            remove_ready(st);
-
-            int target = st.next_box;
-
-            if (target >= K) {
-                break;
-            }
-
-            if (st.box_cell[target] < 0) {
-                st.next_box++;
-                continue;
-            }
-
-            if (ctx.dist[st.box_cell[target]] >= INF) {
-                score += 1000000000000LL;
-                break;
-            }
-
-            Plan p = choose_plan(st, ctx, target, W, tries_per_box, rng);
-
-            if (!p.ok) {
-                score += 1000000000000LL;
-                break;
-            }
-
-            // Main objective:
-            // fewer ops is good, but shared useful movement for future boxes is rewarded.
-            score += 1LL * p.ops.size() * 1000LL;
-            score -= 1LL * p.gain * 72LL;
-
-            for (const auto& op : p.ops) {
-                apply_operation(st, ctx, op.m, op.d, true);
-            }
-
-            remove_ready(st);
-
-            if (st.next_box == last_next) {
-                score += 1000000000000LL;
-                break;
-            }
-
-            last_next = st.next_box;
-        }
-
-        score -= 1LL * st.next_box * 3000LL;
-
-        long long tail = 0;
-        int lim = min(V, st.next_box + 80);
-
-        for (int b = st.next_box; b < lim; b++) {
-            int p = st.box_cell[b];
-
-            if (p < 0) {
-                continue;
-            }
-
-            tail += (ctx.dist[p] >= INF ? 10000 : ctx.dist[p]);
-        }
-
-        score += tail * 7LL;
-
-        return score;
-    };
-
-    long long cur_score = evaluate_selected(selected, 2);
-    long long best_score = cur_score;
-
-    vector<int> best_selected = selected;
-
-    auto start_time = chrono::high_resolution_clock::now();
-
-    auto elapsed = [&]() -> double {
-        return chrono::duration<double>(
-            chrono::high_resolution_clock::now() - start_time
-        ).count();
-    };
-
-    const double TIME_LIMIT = 1.35;
-    const double T0 = max(2000.0, (double)cur_score * 0.02);
-    const double T1 = 15.0;
-
-    auto pick_candidate_any = [&]() -> int {
-        int mode = rng.randint(100);
-
-        if (mode < 35 && complex_start < C) {
-            return complex_start + rng.randint(C - complex_start);
-        }
-
-        if (mode < 60) {
-            int ei = rr(EXIT);
-            int ej = cc(EXIT);
-
-            int ni = max(0, min(N - 1, ei + rng.randint(11) - 5));
-            int nj = max(0, min(N - 1, ej + rng.randint(11) - 5));
-
-            auto& v = cand_by_cell[id(ni, nj)];
-
-            if (!v.empty()) {
-                return v[rng.randint((int)v.size())];
-            }
-        }
-
-        if (mode < 85) {
-            int cell = rng.randint(V);
-            auto& v = cand_by_cell[cell];
-
-            if (!v.empty()) {
-                return v[rng.randint((int)v.size())];
-            }
-        }
-
-        return rng.randint(C);
-    };
-
-    auto pick_removable = [&]() -> int {
-        for (int trial = 0; trial < 80; trial++) {
-            int k = selected[rng.randint((int)selected.size())];
-
-            if (!cand[k].fixed) {
-                return k;
-            }
-        }
-
-        for (int k : selected) {
-            if (!cand[k].fixed) {
-                return k;
-            }
-        }
-
-        return -1;
-    };
-
-    auto collect_blockers_for = [&](int k) {
-        vector<pair<int, int>> scored;
-
-        array<unsigned char, V> need{};
-        need.fill(0);
-
-        for (int c : cand[k].cells) {
-            if (cnt[c] >= 2) {
-                need[c] = 1;
-            }
-        }
-
-        for (int s : selected) {
-            if (cand[s].fixed) {
-                continue;
-            }
-
-            int overlap = 0;
-
-            for (int c : cand[s].cells) {
-                if (need[c]) {
-                    overlap++;
-                }
-            }
-
-            if (overlap > 0) {
-                scored.push_back({-overlap, s});
-            }
-        }
-
-        sort(scored.begin(), scored.end());
-
-        vector<int> res;
-
-        for (auto [neg, s] : scored) {
-            res.push_back(s);
-        }
-
-        return res;
-    };
-
-    while (true) {
-        double t = elapsed();
-
-        if (t >= TIME_LIMIT) {
-            break;
-        }
-
-        double ptime = t / TIME_LIMIT;
-        double temp = T0 * pow(T1 / T0, ptime);
-
-        vector<int> removed;
-        vector<int> added;
-
-        int type = rng.randint(100);
-
-        if (type < 15) {
-            int k = pick_removable();
-
-            if (k != -1) {
-                remove_loop_state(k);
-                removed.push_back(k);
-            }
-        } else if (type < 82) {
-            int k = pick_candidate_any();
-
-            if (!used[k]) {
-                if (!can_add(k)) {
-                    vector<int> blockers = collect_blockers_for(k);
-
-                    int limit = (k >= complex_start ? 14 : 8);
-
-                    for (int s : blockers) {
-                        if (can_add(k)) {
-                            break;
-                        }
-
-                        if ((int)removed.size() >= limit) {
-                            break;
-                        }
-
-                        remove_loop_state(s);
-                        removed.push_back(s);
-                    }
-                }
-
-                if (can_add(k)) {
-                    add_loop_state(k);
-                    added.push_back(k);
-                }
-            }
-        } else {
-            int rmcnt = 1 + rng.randint(3);
-
-            for (int z = 0; z < rmcnt; z++) {
-                int k = pick_removable();
-
-                if (k == -1) {
-                    break;
-                }
-
-                remove_loop_state(k);
-                removed.push_back(k);
-            }
-
-            int addcnt = 1 + rng.randint(3);
-
-            for (int z = 0; z < addcnt; z++) {
-                int k = pick_candidate_any();
-
-                if (can_add(k)) {
-                    add_loop_state(k);
-                    added.push_back(k);
-                }
-            }
-        }
-
-        if (removed.empty() && added.empty()) {
-            continue;
-        }
-
-        long long nxt_score = evaluate_selected(selected, 1);
-        long long diff = nxt_score - cur_score;
-
-        bool accept = false;
-
-        if (diff <= 0) {
-            accept = true;
-        } else if (rng.uniform01() < exp(-(double)diff / max(1.0, temp))) {
-            accept = true;
-        }
-
-        if (accept) {
-            cur_score = nxt_score;
-
-            if (cur_score < best_score) {
-                best_score = cur_score;
-                best_selected = selected;
-            }
-        } else {
-            for (int k : added) {
-                remove_loop_state(k);
-            }
-
-            for (int i = (int)removed.size() - 1; i >= 0; i--) {
-                add_loop_state(removed[i]);
-            }
-        }
-    }
-
-    long long base_score = evaluate_selected(initial_selected, 4);
-    long long refined_best_score = evaluate_selected(best_selected, 4);
-
-    if (base_score < refined_best_score) {
-        best_selected = initial_selected;
-    }
-
-    vector<vector<int>> final_loops = selected_to_loops(best_selected);
-    Context final_ctx = build_context_from_loops(final_loops);
-
-    if (final_ctx.unreachable > 0) {
-        final_loops = selected_to_loops(initial_selected);
-        final_ctx = build_context_from_loops(final_loops);
-    }
-
-    State st = initial;
-
-    vector<pair<int, int>> answer_ops;
-    answer_ops.reserve(30000);
-
-    while (st.next_box < V && (int)answer_ops.size() < 100000) {
-        remove_ready(st);
-
-        int target = st.next_box;
-
-        if (target >= V) {
-            break;
-        }
-
-        if (st.box_cell[target] < 0) {
-            st.next_box++;
-            continue;
-        }
-
-        if (final_ctx.dist[st.box_cell[target]] >= INF) {
-            break;
-        }
-
-        Plan p = choose_plan(st, final_ctx, target, 34, 10, rng);
-
-        if (!p.ok || (p.ops.empty() && st.box_cell[target] != EXIT)) {
-            p = greedy_path_with_gain(st, final_ctx, target, 34);
-        }
-
-        if (!p.ok) {
-            break;
-        }
-
-        int before = st.next_box;
-
-        for (const auto& op : p.ops) {
-            if ((int)answer_ops.size() >= 100000) {
-                break;
-            }
-
-            answer_ops.push_back({op.m, op.d});
-            apply_operation(st, final_ctx, op.m, op.d, true);
-
-            if (st.next_box > before) {
-                break;
-            }
-        }
-
-        remove_ready(st);
-
-        if (st.next_box == before) {
-            int cur = st.box_cell[target];
-            bool moved = false;
-
-            for (const auto& mv : final_ctx.moves[cur]) {
-                if (final_ctx.dist[mv.to] == final_ctx.dist[cur] - 1) {
-                    if ((int)answer_ops.size() >= 100000) {
-                        break;
-                    }
-
-                    answer_ops.push_back({mv.m, mv.d});
-                    apply_operation(st, final_ctx, mv.m, mv.d, true);
-
-                    moved = true;
-                    break;
-                }
-            }
-
-            if (!moved) {
-                break;
-            }
-        }
-    }
-
-    cout << final_loops.size() << '\n';
-
-    for (const auto& lp : final_loops) {
-        cout << lp.size();
-
-        for (int c : lp) {
-            cout << ' ' << rr(c) << ' ' << cc(c);
-        }
-
-        cout << '\n';
-    }
-
-    if ((int)answer_ops.size() > 100000) {
-        answer_ops.resize(100000);
-    }
-
-    cout << answer_ops.size() << '\n';
-
-    for (auto [m, d] : answer_ops) {
-        cout << m << ' ' << d << '\n';
-    }
-
+    Solver solver;
+    solver.run();
     return 0;
 }
