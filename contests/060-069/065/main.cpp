@@ -1,474 +1,466 @@
 #include <bits/stdc++.h>
 using namespace std;
 
-using ll = long long;
-
-struct Timer {
-    chrono::steady_clock::time_point start;
-
-    Timer() : start(chrono::steady_clock::now()) {}
-
-    double elapsed_ms() const {
-        auto now = chrono::steady_clock::now();
-        return chrono::duration<double, milli>(now - start).count();
-    }
-};
-
 struct XorShift {
-    uint64_t x = 88172645463325252ULL;
+    uint64_t x;
+    XorShift(uint64_t seed = 88172645463325252ull) : x(seed) {}
 
-    explicit XorShift(uint64_t seed = 88172645463325252ULL) : x(seed) {}
-
-    uint64_t next_u64() {
+    uint64_t next64() {
         x ^= x << 7;
         x ^= x >> 9;
         return x;
     }
 
-    int next_int(int l, int r) {
-        return l + (int)(next_u64() % (uint64_t)(r - l));
+    int randint(int n) {
+        return (int)(next64() % (uint64_t)n);
     }
 
-    double next_double() {
-        return (next_u64() >> 11) * (1.0 / 9007199254740992.0);
-    }
-};
-
-struct Point {
-    int i;
-    int j;
-};
-
-struct Conveyor {
-    vector<int> cells;
-};
-
-struct Operation {
-    int m;
-    int d;
-};
-
-struct Move {
-    int to;
-    Operation operation;
-};
-
-struct BeamState {
-    vector<int> box_at;
-    vector<int> pos_of_box;
-    int next_box = 0;
-    int cost = 0;
-    int trace_id = -1;
-    double eval = 0.0;
-};
-
-struct TraceNode {
-    int parent = -1;
-    vector<Operation> path;
-};
-
-class Solver {
-  public:
-    static constexpr int TURN_LIMIT = 100000;
-    static constexpr int BEAM_WIDTH = 50;
-    static constexpr int CANDIDATE_LIMIT = 16;
-    static constexpr int EXTRA_PATH_LEN = 2;
-    static constexpr int HEURISTIC_DEPTH = 8;
-
-    void run() {
-        read_input();
-        build_conveyors();
-        build_memberships();
-        build_initial_state();
-        build_graph();
-        build_distances();
-        solve_by_beam_search();
-        output();
-    }
-
-  private:
-    int N;
-    vector<vector<int>> a;
-    vector<Conveyor> conveyors;
-    vector<Operation> operations;
-    vector<vector<pair<int, int>>> memberships;
-    vector<vector<Move>> graph;
-    vector<int> dist_to_exit;
-    vector<vector<vector<Operation>>> candidate_cache;
-    vector<char> candidate_ready;
-
-    // box_at[cell] is the box currently on the cell, or -1 if the cell is empty.
-    vector<int> box_at;
-    vector<int> pos_of_box;
-    int next_box = 0;
-    int exit_cell = -1;
-
-    void read_input() {
-        cin >> N;
-        a.assign(N, vector<int>(N));
-        for (int i = 0; i < N; i++) {
-            for (int j = 0; j < N; j++) cin >> a[i][j];
-        }
-    }
-
-    void build_conveyors() {
-        conveyors.clear();
-        conveyors.reserve(N);
-
-        for (int band = 0; band < N / 2; band++) {
-            const int r0 = 2 * band;
-            const int r1 = r0 + 1;
-            vector<int> cells;
-            cells.reserve(2 * N);
-
-            for (int j = 0; j < N; j++) cells.push_back(id(r0, j));
-            for (int j = N - 1; j >= 0; j--) cells.push_back(id(r1, j));
-            conveyors.push_back({cells});
-        }
-
-        for (int band = 0; band < N / 2; band++) {
-            const int c0 = 2 * band;
-            const int c1 = c0 + 1;
-            vector<int> cells;
-            cells.reserve(2 * N);
-
-            for (int i = 0; i < N; i++) cells.push_back(id(i, c0));
-            for (int i = N - 1; i >= 0; i--) cells.push_back(id(i, c1));
-            conveyors.push_back({cells});
-        }
-
-        validate_conveyors();
-    }
-
-    void build_memberships() {
-        memberships.assign(N * N, {});
-        for (int m = 0; m < (int)conveyors.size(); m++) {
-            const int L = (int)conveyors[m].cells.size();
-            for (int p = 0; p < L; p++) {
-                memberships[conveyors[m].cells[p]].push_back({m, p});
-            }
-        }
-
-        for (int cell = 0; cell < N * N; cell++) {
-            assert((int)memberships[cell].size() <= 2);
-        }
-    }
-
-    void build_initial_state() {
-        const int V = N * N;
-        exit_cell = id(0, N / 2);
-        box_at.assign(V, -1);
-        pos_of_box.assign(V, -1);
-
-        for (int i = 0; i < N; i++) {
-            for (int j = 0; j < N; j++) {
-                const int cell = id(i, j);
-                const int box = a[i][j];
-                box_at[cell] = box;
-                pos_of_box[box] = cell;
-            }
-        }
-
-        // Only box 0 can be removed before the first operation.
-        if (box_at[exit_cell] == 0) {
-            box_at[exit_cell] = -1;
-            pos_of_box[0] = -1;
-            next_box = 1;
-        }
-    }
-
-    void build_graph() {
-        const int V = N * N;
-        graph.assign(V, {});
-
-        for (int cell = 0; cell < V; cell++) {
-            for (const auto &[m, pos] : memberships[cell]) {
-                const Conveyor &conveyor = conveyors[m];
-                const int L = (int)conveyor.cells.size();
-                for (const int d : {-1, 1}) {
-                    const int next_pos = (pos + d + L) % L;
-                    graph[cell].push_back({conveyor.cells[next_pos], {m, d}});
-                }
-            }
-        }
-    }
-
-    void build_distances() {
-        const int V = N * N;
-        dist_to_exit.assign(V, -1);
-        queue<int> que;
-
-        dist_to_exit[exit_cell] = 0;
-        que.push(exit_cell);
-        while (!que.empty()) {
-            const int cell = que.front();
-            que.pop();
-
-            for (const Move &move : graph[cell]) {
-                const int next_cell = move.to;
-                if (dist_to_exit[next_cell] != -1) continue;
-
-                dist_to_exit[next_cell] = dist_to_exit[cell] + 1;
-                que.push(next_cell);
-            }
-        }
-
-        for (int d : dist_to_exit) assert(d != -1);
-
-        candidate_cache.assign(V, {});
-        candidate_ready.assign(V, 0);
-    }
-
-    void solve_by_beam_search() {
-        const int V = N * N;
-        vector<TraceNode> trace;
-        trace.reserve(200000);
-        trace.push_back({-1, {}});
-
-        BeamState initial;
-        initial.box_at = box_at;
-        initial.pos_of_box = pos_of_box;
-        initial.next_box = next_box;
-        initial.cost = 0;
-        initial.trace_id = 0;
-        initial.eval = evaluate(initial);
-
-        vector<BeamState> beam;
-        beam.push_back(std::move(initial));
-
-        while (!beam.empty() && beam.front().next_box < V) {
-            const int target = beam.front().next_box;
-            vector<BeamState> pool;
-            pool.reserve(BEAM_WIDTH * CANDIDATE_LIMIT);
-
-            for (const BeamState &state : beam) {
-                assert(state.next_box == target);
-                const int start = state.pos_of_box[target];
-                assert(start >= 0);
-                assert(start != exit_cell);
-
-                const vector<vector<Operation>> &paths = candidate_paths(start);
-                for (const vector<Operation> &path : paths) {
-                    BeamState child;
-                    child.box_at = state.box_at;
-                    child.pos_of_box = state.pos_of_box;
-                    child.next_box = state.next_box;
-                    child.cost = state.cost + (int)path.size();
-                    if (child.cost > TURN_LIMIT) continue;
-
-                    for (const Operation &operation : path) {
-                        apply_operation(child, operation);
-                    }
-                    if (child.next_box != target + 1) continue;
-
-                    trace.push_back({state.trace_id, path});
-                    child.trace_id = (int)trace.size() - 1;
-                    child.eval = evaluate(child);
-                    pool.push_back(std::move(child));
-                }
-            }
-
-            assert(!pool.empty());
-            sort(pool.begin(), pool.end(), [](const BeamState &lhs, const BeamState &rhs) {
-                if (lhs.eval != rhs.eval) return lhs.eval < rhs.eval;
-                return lhs.cost < rhs.cost;
-            });
-
-            beam.clear();
-            const int keep = min(BEAM_WIDTH, (int)pool.size());
-            for (int i = 0; i < keep; i++) beam.push_back(std::move(pool[i]));
-        }
-
-        assert(!beam.empty());
-        const BeamState *best = &beam.front();
-        for (const BeamState &state : beam) {
-            if (state.cost < best->cost) best = &state;
-        }
-
-        operations = restore_operations(trace, best->trace_id);
-        assert((int)operations.size() <= TURN_LIMIT);
-    }
-
-    const vector<vector<Operation>> &candidate_paths(int start) {
-        if (candidate_ready[start]) return candidate_cache[start];
-        candidate_ready[start] = 1;
-
-        vector<vector<Operation>> paths;
-        if (start == exit_cell) {
-            paths.push_back({});
-            candidate_cache[start] = paths;
-            return candidate_cache[start];
-        }
-
-        vector<int> order;
-        vector<char> visited(N * N, 0);
-        vector<Operation> current_path;
-        visited[start] = 1;
-
-        const int base = dist_to_exit[start];
-        for (int limit = base; limit <= base + EXTRA_PATH_LEN && (int)paths.size() < CANDIDATE_LIMIT; limit++) {
-            enumerate_paths(start, limit, visited, current_path, paths);
-        }
-
-        assert(!paths.empty());
-        candidate_cache[start] = paths;
-        return candidate_cache[start];
-    }
-
-    void enumerate_paths(int cell, int remaining, vector<char> &visited, vector<Operation> &current_path,
-                         vector<vector<Operation>> &paths) const {
-        if ((int)paths.size() >= CANDIDATE_LIMIT) return;
-        if (dist_to_exit[cell] > remaining) return;
-
-        if (cell == exit_cell) {
-            paths.push_back(current_path);
-            return;
-        }
-        if (remaining == 0) return;
-
-        vector<Move> moves = graph[cell];
-        sort(moves.begin(), moves.end(), [&](const Move &lhs, const Move &rhs) {
-            if (dist_to_exit[lhs.to] != dist_to_exit[rhs.to]) {
-                return dist_to_exit[lhs.to] < dist_to_exit[rhs.to];
-            }
-            if (lhs.operation.m != rhs.operation.m) return lhs.operation.m < rhs.operation.m;
-            return lhs.operation.d < rhs.operation.d;
-        });
-
-        for (const Move &move : moves) {
-            const int next_cell = move.to;
-            if (visited[next_cell]) continue;
-            if (dist_to_exit[next_cell] > remaining - 1) continue;
-
-            visited[next_cell] = 1;
-            current_path.push_back(move.operation);
-            enumerate_paths(next_cell, remaining - 1, visited, current_path, paths);
-            current_path.pop_back();
-            visited[next_cell] = 0;
-
-            if ((int)paths.size() >= CANDIDATE_LIMIT) return;
-        }
-    }
-
-    double evaluate(const BeamState &state) const {
-        static constexpr double weights[HEURISTIC_DEPTH] = {
-            0.90, 0.65, 0.45, 0.30, 0.20, 0.13, 0.08, 0.05,
-        };
-
-        double value = state.cost;
-        for (int k = 0; k < HEURISTIC_DEPTH; k++) {
-            const int box = state.next_box + k;
-            if (box >= N * N) break;
-
-            const int pos = state.pos_of_box[box];
-            if (pos == -1) continue;
-            value += weights[k] * dist_to_exit[pos];
-        }
-        return value;
-    }
-
-    vector<Operation> restore_operations(const vector<TraceNode> &trace, int trace_id) const {
-        vector<vector<Operation>> chunks;
-        while (trace_id != -1) {
-            chunks.push_back(trace[trace_id].path);
-            trace_id = trace[trace_id].parent;
-        }
-        reverse(chunks.begin(), chunks.end());
-
-        vector<Operation> result;
-        for (const vector<Operation> &chunk : chunks) {
-            result.insert(result.end(), chunk.begin(), chunk.end());
-        }
-        return result;
-    }
-
-    void apply_operation(BeamState &state, const Operation &operation) const {
-        rotate_conveyor(state, operation.m, operation.d);
-        eject_if_ready(state);
-    }
-
-    void rotate_conveyor(BeamState &state, int m, int d) const {
-        const Conveyor &conveyor = conveyors[m];
-        const int L = (int)conveyor.cells.size();
-        array<int, 64> old{};
-        assert(L <= (int)old.size());
-
-        for (int p = 0; p < L; p++) old[p] = state.box_at[conveyor.cells[p]];
-
-        for (int p = 0; p < L; p++) {
-            const int next_p = (p + d + L) % L;
-            const int next_cell = conveyor.cells[next_p];
-            const int box = old[p];
-            state.box_at[next_cell] = box;
-            if (box != -1) state.pos_of_box[box] = next_cell;
-        }
-    }
-
-    void eject_if_ready(BeamState &state) const {
-        if (state.next_box < N * N && state.box_at[exit_cell] == state.next_box) {
-            state.pos_of_box[state.next_box] = -1;
-            state.box_at[exit_cell] = -1;
-            state.next_box++;
-        }
-    }
-
-    int id(int i, int j) const {
-        return i * N + j;
-    }
-
-    Point point(int cell) const {
-        return {cell / N, cell % N};
-    }
-
-    static bool adjacent(const Point &a, const Point &b) {
-        return abs(a.i - b.i) + abs(a.j - b.j) == 1;
-    }
-
-    void validate_conveyors() const {
-        vector<int> used_count(N * N, 0);
-        for (const Conveyor &conveyor : conveyors) {
-            const int L = (int)conveyor.cells.size();
-            assert(L >= 2);
-
-            set<int> seen;
-            for (int p = 0; p < L; p++) {
-                const int cell = conveyor.cells[p];
-                assert(0 <= cell && cell < N * N);
-                assert(seen.insert(cell).second);
-                used_count[cell]++;
-
-                const Point cur = point(cell);
-                const Point nxt = point(conveyor.cells[(p + 1) % L]);
-                assert(adjacent(cur, nxt));
-            }
-        }
-
-        for (int count : used_count) assert(count <= 2);
-    }
-
-    void output() const {
-        cout << conveyors.size() << '\n';
-        for (const Conveyor &conveyor : conveyors) {
-            cout << conveyor.cells.size();
-            for (int cell : conveyor.cells) {
-                const Point p = point(cell);
-                cout << ' ' << p.i << ' ' << p.j;
-            }
-            cout << '\n';
-        }
-
-        cout << operations.size() << '\n';
-        for (const Operation &operation : operations) {
-            cout << operation.m << ' ' << operation.d << '\n';
-        }
+    double uniform01() {
+        return (next64() >> 11) * (1.0 / 9007199254740992.0);
     }
 };
+
+static const int N = 20;
+static const int L = N * N;
+static const int B = 10;
+static const int K = B * B;
+
+int cid(int i, int j) {
+    return i * N + j;
+}
+
+int rid(int x) {
+    return x / N;
+}
+
+int cjd(int x) {
+    return x % N;
+}
+
+int bid(int r, int c) {
+    return r * B + c;
+}
+
+vector<pair<int, int>> macro_edges;
+int edge_id[K][K];
+
+void add_grid_edge(array<unsigned char, L>& mask, int u, int v) {
+    int du = rid(v) - rid(u);
+    int dv = cjd(v) - cjd(u);
+
+    int bu = -1, bv = -1;
+
+    if (du == -1) {
+        bu = 0;
+        bv = 1;
+    } else if (du == 1) {
+        bu = 1;
+        bv = 0;
+    } else if (dv == -1) {
+        bu = 2;
+        bv = 3;
+    } else if (dv == 1) {
+        bu = 3;
+        bv = 2;
+    }
+
+    mask[u] |= (1u << bu);
+    mask[v] |= (1u << bv);
+}
+
+void remove_grid_edge(array<unsigned char, L>& mask, int u, int v) {
+    int du = rid(v) - rid(u);
+    int dv = cjd(v) - cjd(u);
+
+    int bu = -1, bv = -1;
+
+    if (du == -1) {
+        bu = 0;
+        bv = 1;
+    } else if (du == 1) {
+        bu = 1;
+        bv = 0;
+    } else if (dv == -1) {
+        bu = 2;
+        bv = 3;
+    } else if (dv == 1) {
+        bu = 3;
+        bv = 2;
+    }
+
+    mask[u] &= ~(1u << bu);
+    mask[v] &= ~(1u << bv);
+}
+
+array<int, 4> block4(int r, int c) {
+    int tl = cid(2 * r, 2 * c);
+    int tr = cid(2 * r, 2 * c + 1);
+    int br = cid(2 * r + 1, 2 * c + 1);
+    int bl = cid(2 * r + 1, 2 * c);
+    return {tl, tr, br, bl};
+}
+
+vector<int> build_cycle_from_tree(const vector<unsigned char>& in_tree) {
+    array<unsigned char, L> mask{};
+    mask.fill(0);
+
+    for (int r = 0; r < B; r++) {
+        for (int c = 0; c < B; c++) {
+            auto q = block4(r, c);
+            int tl = q[0];
+            int tr = q[1];
+            int br = q[2];
+            int bl = q[3];
+
+            add_grid_edge(mask, tl, tr);
+            add_grid_edge(mask, tr, br);
+            add_grid_edge(mask, br, bl);
+            add_grid_edge(mask, bl, tl);
+        }
+    }
+
+    for (int e = 0; e < (int)macro_edges.size(); e++) {
+        if (!in_tree[e]) continue;
+
+        auto [u, v] = macro_edges[e];
+
+        int r1 = u / B;
+        int c1 = u % B;
+        int r2 = v / B;
+        int c2 = v % B;
+
+        if (r1 == r2) {
+            if (c1 > c2) {
+                swap(r1, r2);
+                swap(c1, c2);
+            }
+
+            auto A = block4(r1, c1);
+            auto C = block4(r2, c2);
+
+            int tr1 = A[1];
+            int br1 = A[2];
+            int tl2 = C[0];
+            int bl2 = C[3];
+
+            remove_grid_edge(mask, tr1, br1);
+            remove_grid_edge(mask, tl2, bl2);
+
+            add_grid_edge(mask, tr1, tl2);
+            add_grid_edge(mask, br1, bl2);
+        } else {
+            if (r1 > r2) {
+                swap(r1, r2);
+                swap(c1, c2);
+            }
+
+            auto A = block4(r1, c1);
+            auto C = block4(r2, c2);
+
+            int br1 = A[2];
+            int bl1 = A[3];
+            int tl2 = C[0];
+            int tr2 = C[1];
+
+            remove_grid_edge(mask, bl1, br1);
+            remove_grid_edge(mask, tl2, tr2);
+
+            add_grid_edge(mask, bl1, tl2);
+            add_grid_edge(mask, br1, tr2);
+        }
+    }
+
+    vector<int> cyc;
+    cyc.reserve(L);
+
+    int cur = 0;
+    int prev = -1;
+
+    for (int step = 0; step < L; step++) {
+        cyc.push_back(cur);
+
+        int neigh[2];
+        int cnt = 0;
+
+        int i = rid(cur);
+        int j = cjd(cur);
+
+        if ((mask[cur] & 1) && i > 0) neigh[cnt++] = cid(i - 1, j);
+        if ((mask[cur] & 2) && i + 1 < N) neigh[cnt++] = cid(i + 1, j);
+        if ((mask[cur] & 4) && j > 0) neigh[cnt++] = cid(i, j - 1);
+        if ((mask[cur] & 8) && j + 1 < N) neigh[cnt++] = cid(i, j + 1);
+
+        int nxt = (neigh[0] == prev ? neigh[1] : neigh[0]);
+
+        prev = cur;
+        cur = nxt;
+    }
+
+    return cyc;
+}
 
 int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
-    Solver solver;
-    solver.run();
+    int n;
+    cin >> n;
+
+    vector<int> box_at_cell(L), cell_of_box(L);
+
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            int x;
+            cin >> x;
+
+            int c = cid(i, j);
+            box_at_cell[c] = x;
+            cell_of_box[x] = c;
+        }
+    }
+
+    memset(edge_id, -1, sizeof(edge_id));
+
+    for (int r = 0; r < B; r++) {
+        for (int c = 0; c < B; c++) {
+            int u = bid(r, c);
+
+            if (c + 1 < B) {
+                int v = bid(r, c + 1);
+                edge_id[u][v] = edge_id[v][u] = (int)macro_edges.size();
+                macro_edges.push_back({u, v});
+            }
+
+            if (r + 1 < B) {
+                int v = bid(r + 1, c);
+                edge_id[u][v] = edge_id[v][u] = (int)macro_edges.size();
+                macro_edges.push_back({u, v});
+            }
+        }
+    }
+
+    const int E = (int)macro_edges.size();
+
+    vector<unsigned char> in_tree(E, 0);
+
+    vector<int> order;
+    order.reserve(K);
+
+    for (int r = 0; r < B; r++) {
+        if (r % 2 == 0) {
+            for (int c = 0; c < B; c++) order.push_back(bid(r, c));
+        } else {
+            for (int c = B - 1; c >= 0; c--) order.push_back(bid(r, c));
+        }
+    }
+
+    for (int i = 0; i + 1 < (int)order.size(); i++) {
+        int e = edge_id[order[i]][order[i + 1]];
+        in_tree[e] = 1;
+    }
+
+    const int exit_cell = cid(0, N / 2);
+    const int first_box = (box_at_cell[exit_cell] == 0 ? 1 : 0);
+
+    auto calc_score = [&](const vector<int>& cyc) -> int {
+        int pos[L];
+
+        for (int i = 0; i < L; i++) {
+            pos[cyc[i]] = i;
+        }
+
+        int exit_pos = pos[exit_cell];
+
+        int cur = 0;
+        int total = 0;
+
+        for (int b = first_box; b < L; b++) {
+            int need = (exit_pos - pos[cell_of_box[b]] + L) % L;
+            int delta = (need - cur + L) % L;
+
+            total += min(delta, L - delta);
+            cur = need;
+        }
+
+        return total;
+    };
+
+    vector<int> cur_cycle = build_cycle_from_tree(in_tree);
+    int cur_score = calc_score(cur_cycle);
+
+    vector<unsigned char> best_tree = in_tree;
+    vector<int> best_cycle = cur_cycle;
+    int best_score = cur_score;
+
+    XorShift rng((uint64_t)chrono::high_resolution_clock::now().time_since_epoch().count());
+
+    auto start_time = chrono::high_resolution_clock::now();
+
+    const double TIME_LIMIT = 1.65;
+    const double T0 = 600.0;
+    const double T1 = 0.05;
+
+    double temp = T0;
+    int iter = 0;
+
+    auto find_path_edges = [&](const vector<unsigned char>& tree, int s, int t) {
+        int par[K];
+        int pare[K];
+
+        fill(par, par + K, -1);
+        fill(pare, pare + K, -1);
+
+        queue<int> q;
+        par[s] = s;
+        q.push(s);
+
+        while (!q.empty()) {
+            int u = q.front();
+            q.pop();
+
+            if (u == t) break;
+
+            int r = u / B;
+            int c = u % B;
+
+            const int dr[4] = {-1, 1, 0, 0};
+            const int dc[4] = {0, 0, -1, 1};
+
+            for (int z = 0; z < 4; z++) {
+                int nr = r + dr[z];
+                int nc = c + dc[z];
+
+                if (nr < 0 || nr >= B || nc < 0 || nc >= B) continue;
+
+                int v = bid(nr, nc);
+                int e = edge_id[u][v];
+
+                if (e < 0) continue;
+                if (!tree[e]) continue;
+                if (par[v] != -1) continue;
+
+                par[v] = u;
+                pare[v] = e;
+                q.push(v);
+            }
+        }
+
+        vector<int> path;
+
+        for (int v = t; v != s; v = par[v]) {
+            path.push_back(pare[v]);
+        }
+
+        return path;
+    };
+
+    while (true) {
+        if ((iter & 63) == 0) {
+            double elapsed = chrono::duration<double>(
+                chrono::high_resolution_clock::now() - start_time
+            ).count();
+
+            if (elapsed >= TIME_LIMIT) break;
+
+            double p = elapsed / TIME_LIMIT;
+            temp = T0 * pow(T1 / T0, p);
+        }
+
+        iter++;
+
+        int add_e;
+
+        do {
+            add_e = rng.randint(E);
+        } while (in_tree[add_e]);
+
+        int s = macro_edges[add_e].first;
+        int t = macro_edges[add_e].second;
+
+        vector<int> path = find_path_edges(in_tree, s, t);
+        int rem_e = path[rng.randint((int)path.size())];
+
+        in_tree[add_e] = 1;
+        in_tree[rem_e] = 0;
+
+        vector<int> new_cycle = build_cycle_from_tree(in_tree);
+        int new_score = calc_score(new_cycle);
+
+        int diff = new_score - cur_score;
+
+        bool accept = false;
+
+        if (diff <= 0) {
+            accept = true;
+        } else {
+            double prob = exp(-(double)diff / temp);
+            if (rng.uniform01() < prob) accept = true;
+        }
+
+        if (accept) {
+            cur_score = new_score;
+            cur_cycle.swap(new_cycle);
+
+            if (cur_score < best_score) {
+                best_score = cur_score;
+                best_tree = in_tree;
+                best_cycle = cur_cycle;
+            }
+        } else {
+            in_tree[add_e] = 0;
+            in_tree[rem_e] = 1;
+        }
+    }
+
+    int pos[L];
+
+    for (int i = 0; i < L; i++) {
+        pos[best_cycle[i]] = i;
+    }
+
+    int exit_pos = pos[exit_cell];
+
+    vector<pair<int, int>> ops;
+    ops.reserve(best_score);
+
+    int cur_offset = 0;
+
+    for (int b = first_box; b < L; b++) {
+        int need = (exit_pos - pos[cell_of_box[b]] + L) % L;
+        int delta = (need - cur_offset + L) % L;
+
+        if (delta <= L - delta) {
+            for (int z = 0; z < delta; z++) {
+                ops.push_back({0, 1});
+            }
+        } else {
+            for (int z = 0; z < L - delta; z++) {
+                ops.push_back({0, -1});
+            }
+        }
+
+        cur_offset = need;
+    }
+
+    cout << 1 << '\n';
+
+    cout << L;
+
+    for (int c : best_cycle) {
+        cout << ' ' << rid(c) << ' ' << cjd(c);
+    }
+
+    cout << '\n';
+
+    if ((int)ops.size() > 100000) {
+        ops.resize(100000);
+    }
+
+    cout << ops.size() << '\n';
+
+    for (auto [m, d] : ops) {
+        cout << m << ' ' << d << '\n';
+    }
+
     return 0;
 }
