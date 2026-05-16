@@ -40,7 +40,7 @@ struct Point {
 };
 
 struct Conveyor {
-    vector<Point> cells;
+    vector<int> cells;
 };
 
 struct Operation {
@@ -48,30 +48,60 @@ struct Operation {
     int d;
 };
 
+struct Move {
+    int to;
+    Operation operation;
+};
+
+struct BeamState {
+    vector<int> box_at;
+    vector<int> pos_of_box;
+    int next_box = 0;
+    int cost = 0;
+    int trace_id = -1;
+    double eval = 0.0;
+};
+
+struct TraceNode {
+    int parent = -1;
+    vector<Operation> path;
+};
+
 class Solver {
   public:
     static constexpr int TURN_LIMIT = 100000;
+    static constexpr int BEAM_WIDTH = 50;
+    static constexpr int CANDIDATE_LIMIT = 16;
+    static constexpr int EXTRA_PATH_LEN = 2;
+    static constexpr int HEURISTIC_DEPTH = 8;
 
     void run() {
         read_input();
-        build_cycle();
         build_conveyors();
+        build_memberships();
         build_initial_state();
-        solve_by_adjacent_swaps();
+        build_graph();
+        build_distances();
+        solve_by_beam_search();
         output();
     }
 
   private:
     int N;
     vector<vector<int>> a;
-    vector<Point> cycle;
     vector<Conveyor> conveyors;
     vector<Operation> operations;
+    vector<vector<pair<int, int>>> memberships;
+    vector<vector<Move>> graph;
+    vector<int> dist_to_exit;
+    vector<vector<vector<Operation>>> candidate_cache;
+    vector<char> candidate_ready;
 
-    // box_at[k] is the box currently on cycle[k], or -1 if the cell is empty.
+    // box_at[cell] is the box currently on the cell, or -1 if the cell is empty.
     vector<int> box_at;
     vector<int> pos_of_box;
     int next_box = 0;
+    int exit_cell = -1;
 
     void read_input() {
         cin >> N;
@@ -81,119 +111,347 @@ class Solver {
         }
     }
 
-    void build_cycle() {
-        const int exit_col = N / 2;
-        cycle.clear();
-        cycle.reserve(N * N);
+    void build_conveyors() {
+        conveyors.clear();
+        conveyors.reserve(N);
 
-        // Top row, from the exit to the right edge.
-        for (int j = exit_col; j < N; j++) cycle.push_back({0, j});
+        for (int band = 0; band < N / 2; band++) {
+            const int r0 = 2 * band;
+            const int r1 = r0 + 1;
+            vector<int> cells;
+            cells.reserve(2 * N);
 
-        // A vertical snake over rows 1..N-1.
-        for (int j = N - 1; j >= 0; j--) {
-            if ((N - 1 - j) % 2 == 0) {
-                for (int i = 1; i < N; i++) cycle.push_back({i, j});
-            } else {
-                for (int i = N - 1; i >= 1; i--) cycle.push_back({i, j});
+            for (int j = 0; j < N; j++) cells.push_back(id(r0, j));
+            for (int j = N - 1; j >= 0; j--) cells.push_back(id(r1, j));
+            conveyors.push_back({cells});
+        }
+
+        for (int band = 0; band < N / 2; band++) {
+            const int c0 = 2 * band;
+            const int c1 = c0 + 1;
+            vector<int> cells;
+            cells.reserve(2 * N);
+
+            for (int i = 0; i < N; i++) cells.push_back(id(i, c0));
+            for (int i = N - 1; i >= 0; i--) cells.push_back(id(i, c1));
+            conveyors.push_back({cells});
+        }
+
+        validate_conveyors();
+    }
+
+    void build_memberships() {
+        memberships.assign(N * N, {});
+        for (int m = 0; m < (int)conveyors.size(); m++) {
+            const int L = (int)conveyors[m].cells.size();
+            for (int p = 0; p < L; p++) {
+                memberships[conveyors[m].cells[p]].push_back({m, p});
             }
         }
 
-        // Top row, from the left edge back to the cell just left of the exit.
-        for (int j = 0; j < exit_col; j++) cycle.push_back({0, j});
-
-        assert((int)cycle.size() == N * N);
-        assert(cycle.front().i == 0 && cycle.front().j == exit_col);
-        assert(adjacent(cycle.back(), cycle.front()));
-    }
-
-    void build_conveyors() {
-        const int V = N * N;
-        conveyors.clear();
-        conveyors.reserve(V);
-        for (int k = 0; k < V; k++) {
-            conveyors.push_back({{cycle[k], cycle[(k + 1) % V]}});
+        for (int cell = 0; cell < N * N; cell++) {
+            assert((int)memberships[cell].size() <= 2);
         }
     }
 
     void build_initial_state() {
         const int V = N * N;
+        exit_cell = id(0, N / 2);
         box_at.assign(V, -1);
         pos_of_box.assign(V, -1);
 
-        for (int k = 0; k < V; k++) {
-            int box = a[cycle[k].i][cycle[k].j];
-            box_at[k] = box;
-            pos_of_box[box] = k;
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                const int cell = id(i, j);
+                const int box = a[i][j];
+                box_at[cell] = box;
+                pos_of_box[box] = cell;
+            }
         }
 
         // Only box 0 can be removed before the first operation.
-        if (box_at[0] == 0) {
-            box_at[0] = -1;
+        if (box_at[exit_cell] == 0) {
+            box_at[exit_cell] = -1;
             pos_of_box[0] = -1;
             next_box = 1;
         }
     }
 
-    void solve_by_adjacent_swaps() {
+    void build_graph() {
         const int V = N * N;
+        graph.assign(V, {});
 
-        while (next_box < V) {
-            const int target = next_box;
-            const int p = pos_of_box[target];
-            assert(p >= 0);
+        for (int cell = 0; cell < V; cell++) {
+            for (const auto &[m, pos] : memberships[cell]) {
+                const Conveyor &conveyor = conveyors[m];
+                const int L = (int)conveyor.cells.size();
+                for (const int d : {-1, 1}) {
+                    const int next_pos = (pos + d + L) % L;
+                    graph[cell].push_back({conveyor.cells[next_pos], {m, d}});
+                }
+            }
+        }
+    }
 
-            const int counter_clockwise = p;
-            const int clockwise = V - p;
+    void build_distances() {
+        const int V = N * N;
+        dist_to_exit.assign(V, -1);
+        queue<int> que;
 
-            if (counter_clockwise <= clockwise) {
-                for (int e = p - 1; e >= 0; e--) add_swap(e);
-            } else {
-                for (int e = p; e < V; e++) add_swap(e);
+        dist_to_exit[exit_cell] = 0;
+        que.push(exit_cell);
+        while (!que.empty()) {
+            const int cell = que.front();
+            que.pop();
+
+            for (const Move &move : graph[cell]) {
+                const int next_cell = move.to;
+                if (dist_to_exit[next_cell] != -1) continue;
+
+                dist_to_exit[next_cell] = dist_to_exit[cell] + 1;
+                que.push(next_cell);
+            }
+        }
+
+        for (int d : dist_to_exit) assert(d != -1);
+
+        candidate_cache.assign(V, {});
+        candidate_ready.assign(V, 0);
+    }
+
+    void solve_by_beam_search() {
+        const int V = N * N;
+        vector<TraceNode> trace;
+        trace.reserve(200000);
+        trace.push_back({-1, {}});
+
+        BeamState initial;
+        initial.box_at = box_at;
+        initial.pos_of_box = pos_of_box;
+        initial.next_box = next_box;
+        initial.cost = 0;
+        initial.trace_id = 0;
+        initial.eval = evaluate(initial);
+
+        vector<BeamState> beam;
+        beam.push_back(std::move(initial));
+
+        while (!beam.empty() && beam.front().next_box < V) {
+            const int target = beam.front().next_box;
+            vector<BeamState> pool;
+            pool.reserve(BEAM_WIDTH * CANDIDATE_LIMIT);
+
+            for (const BeamState &state : beam) {
+                assert(state.next_box == target);
+                const int start = state.pos_of_box[target];
+                assert(start >= 0);
+                assert(start != exit_cell);
+
+                const vector<vector<Operation>> &paths = candidate_paths(start);
+                for (const vector<Operation> &path : paths) {
+                    BeamState child;
+                    child.box_at = state.box_at;
+                    child.pos_of_box = state.pos_of_box;
+                    child.next_box = state.next_box;
+                    child.cost = state.cost + (int)path.size();
+                    if (child.cost > TURN_LIMIT) continue;
+
+                    for (const Operation &operation : path) {
+                        apply_operation(child, operation);
+                    }
+                    if (child.next_box != target + 1) continue;
+
+                    trace.push_back({state.trace_id, path});
+                    child.trace_id = (int)trace.size() - 1;
+                    child.eval = evaluate(child);
+                    pool.push_back(std::move(child));
+                }
             }
 
-            assert(pos_of_box[target] == -1);
-            assert((int)operations.size() <= TURN_LIMIT);
+            assert(!pool.empty());
+            sort(pool.begin(), pool.end(), [](const BeamState &lhs, const BeamState &rhs) {
+                if (lhs.eval != rhs.eval) return lhs.eval < rhs.eval;
+                return lhs.cost < rhs.cost;
+            });
+
+            beam.clear();
+            const int keep = min(BEAM_WIDTH, (int)pool.size());
+            for (int i = 0; i < keep; i++) beam.push_back(std::move(pool[i]));
+        }
+
+        assert(!beam.empty());
+        const BeamState *best = &beam.front();
+        for (const BeamState &state : beam) {
+            if (state.cost < best->cost) best = &state;
+        }
+
+        operations = restore_operations(trace, best->trace_id);
+        assert((int)operations.size() <= TURN_LIMIT);
+    }
+
+    const vector<vector<Operation>> &candidate_paths(int start) {
+        if (candidate_ready[start]) return candidate_cache[start];
+        candidate_ready[start] = 1;
+
+        vector<vector<Operation>> paths;
+        if (start == exit_cell) {
+            paths.push_back({});
+            candidate_cache[start] = paths;
+            return candidate_cache[start];
+        }
+
+        vector<int> order;
+        vector<char> visited(N * N, 0);
+        vector<Operation> current_path;
+        visited[start] = 1;
+
+        const int base = dist_to_exit[start];
+        for (int limit = base; limit <= base + EXTRA_PATH_LEN && (int)paths.size() < CANDIDATE_LIMIT; limit++) {
+            enumerate_paths(start, limit, visited, current_path, paths);
+        }
+
+        assert(!paths.empty());
+        candidate_cache[start] = paths;
+        return candidate_cache[start];
+    }
+
+    void enumerate_paths(int cell, int remaining, vector<char> &visited, vector<Operation> &current_path,
+                         vector<vector<Operation>> &paths) const {
+        if ((int)paths.size() >= CANDIDATE_LIMIT) return;
+        if (dist_to_exit[cell] > remaining) return;
+
+        if (cell == exit_cell) {
+            paths.push_back(current_path);
+            return;
+        }
+        if (remaining == 0) return;
+
+        vector<Move> moves = graph[cell];
+        sort(moves.begin(), moves.end(), [&](const Move &lhs, const Move &rhs) {
+            if (dist_to_exit[lhs.to] != dist_to_exit[rhs.to]) {
+                return dist_to_exit[lhs.to] < dist_to_exit[rhs.to];
+            }
+            if (lhs.operation.m != rhs.operation.m) return lhs.operation.m < rhs.operation.m;
+            return lhs.operation.d < rhs.operation.d;
+        });
+
+        for (const Move &move : moves) {
+            const int next_cell = move.to;
+            if (visited[next_cell]) continue;
+            if (dist_to_exit[next_cell] > remaining - 1) continue;
+
+            visited[next_cell] = 1;
+            current_path.push_back(move.operation);
+            enumerate_paths(next_cell, remaining - 1, visited, current_path, paths);
+            current_path.pop_back();
+            visited[next_cell] = 0;
+
+            if ((int)paths.size() >= CANDIDATE_LIMIT) return;
         }
     }
 
-    void add_swap(int edge_id) {
-        const int V = N * N;
-        assert(0 <= edge_id && edge_id < V);
-        assert((int)operations.size() < TURN_LIMIT);
+    double evaluate(const BeamState &state) const {
+        static constexpr double weights[HEURISTIC_DEPTH] = {
+            0.90, 0.65, 0.45, 0.30, 0.20, 0.13, 0.08, 0.05,
+        };
 
-        operations.push_back({edge_id, 1});
+        double value = state.cost;
+        for (int k = 0; k < HEURISTIC_DEPTH; k++) {
+            const int box = state.next_box + k;
+            if (box >= N * N) break;
 
-        int u = edge_id;
-        int v = (edge_id + 1) % V;
-        swap_cells(u, v);
-        eject_if_ready();
-    }
-
-    void swap_cells(int u, int v) {
-        int bu = box_at[u];
-        int bv = box_at[v];
-        swap(box_at[u], box_at[v]);
-        if (bu != -1) pos_of_box[bu] = v;
-        if (bv != -1) pos_of_box[bv] = u;
-    }
-
-    void eject_if_ready() {
-        if (next_box < N * N && box_at[0] == next_box) {
-            pos_of_box[next_box] = -1;
-            box_at[0] = -1;
-            next_box++;
+            const int pos = state.pos_of_box[box];
+            if (pos == -1) continue;
+            value += weights[k] * dist_to_exit[pos];
         }
+        return value;
+    }
+
+    vector<Operation> restore_operations(const vector<TraceNode> &trace, int trace_id) const {
+        vector<vector<Operation>> chunks;
+        while (trace_id != -1) {
+            chunks.push_back(trace[trace_id].path);
+            trace_id = trace[trace_id].parent;
+        }
+        reverse(chunks.begin(), chunks.end());
+
+        vector<Operation> result;
+        for (const vector<Operation> &chunk : chunks) {
+            result.insert(result.end(), chunk.begin(), chunk.end());
+        }
+        return result;
+    }
+
+    void apply_operation(BeamState &state, const Operation &operation) const {
+        rotate_conveyor(state, operation.m, operation.d);
+        eject_if_ready(state);
+    }
+
+    void rotate_conveyor(BeamState &state, int m, int d) const {
+        const Conveyor &conveyor = conveyors[m];
+        const int L = (int)conveyor.cells.size();
+        array<int, 64> old{};
+        assert(L <= (int)old.size());
+
+        for (int p = 0; p < L; p++) old[p] = state.box_at[conveyor.cells[p]];
+
+        for (int p = 0; p < L; p++) {
+            const int next_p = (p + d + L) % L;
+            const int next_cell = conveyor.cells[next_p];
+            const int box = old[p];
+            state.box_at[next_cell] = box;
+            if (box != -1) state.pos_of_box[box] = next_cell;
+        }
+    }
+
+    void eject_if_ready(BeamState &state) const {
+        if (state.next_box < N * N && state.box_at[exit_cell] == state.next_box) {
+            state.pos_of_box[state.next_box] = -1;
+            state.box_at[exit_cell] = -1;
+            state.next_box++;
+        }
+    }
+
+    int id(int i, int j) const {
+        return i * N + j;
+    }
+
+    Point point(int cell) const {
+        return {cell / N, cell % N};
     }
 
     static bool adjacent(const Point &a, const Point &b) {
         return abs(a.i - b.i) + abs(a.j - b.j) == 1;
     }
 
+    void validate_conveyors() const {
+        vector<int> used_count(N * N, 0);
+        for (const Conveyor &conveyor : conveyors) {
+            const int L = (int)conveyor.cells.size();
+            assert(L >= 2);
+
+            set<int> seen;
+            for (int p = 0; p < L; p++) {
+                const int cell = conveyor.cells[p];
+                assert(0 <= cell && cell < N * N);
+                assert(seen.insert(cell).second);
+                used_count[cell]++;
+
+                const Point cur = point(cell);
+                const Point nxt = point(conveyor.cells[(p + 1) % L]);
+                assert(adjacent(cur, nxt));
+            }
+        }
+
+        for (int count : used_count) assert(count <= 2);
+    }
+
     void output() const {
         cout << conveyors.size() << '\n';
         for (const Conveyor &conveyor : conveyors) {
             cout << conveyor.cells.size();
-            for (const Point &p : conveyor.cells) {
+            for (int cell : conveyor.cells) {
+                const Point p = point(cell);
                 cout << ' ' << p.i << ' ' << p.j;
             }
             cout << '\n';
