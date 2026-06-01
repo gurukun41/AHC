@@ -1287,6 +1287,124 @@ vector<char> build_program_with_p_macro(const Solver &solver, const vector<int> 
     return program;
 }
 
+void apply_buttons_with_macro(const Solver &solver, const vector<char> &buttons, const vector<char> &macro, int &cell, int &dir) {
+    for (char op : buttons) {
+        if (op == 'P') {
+            solver.apply_basic_ops(macro, cell, dir);
+        } else {
+            solver.apply_basic_op(op, cell, dir);
+        }
+    }
+}
+
+vector<char> expand_buttons_with_macro(const vector<char> &buttons, const vector<char> &macro) {
+    vector<char> expanded;
+    for (char op : buttons) {
+        if (op == 'P') {
+            expanded.insert(expanded.end(), macro.begin(), macro.end());
+        } else if (is_basic_op(op)) {
+            expanded.push_back(op);
+        }
+    }
+    return expanded;
+}
+
+vector<PMacroPlacement> normalize_p_macro_plan(vector<PMacroPlacement> plan, int leg_count) {
+    sort(plan.begin(), plan.end(), [](const PMacroPlacement &lhs, const PMacroPlacement &rhs) {
+        if (lhs.leg != rhs.leg) return lhs.leg < rhs.leg;
+        if (lhs.offset != rhs.offset) return lhs.offset < rhs.offset;
+        return lhs.len > rhs.len;
+    });
+
+    vector<PMacroPlacement> res;
+    int last_leg = -1;
+    for (PMacroPlacement p : plan) {
+        p.leg = max(0, min(p.leg, leg_count - 1));
+        p.offset = max(0, p.offset);
+        p.len = max(6, p.len);
+        if (p.leg == last_leg) continue;
+        res.push_back(p);
+        last_leg = p.leg;
+    }
+    return res;
+}
+
+vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<int> &order, vector<PMacroPlacement> plan) {
+    const int leg_count = (int)order.size() * 2;
+    plan = normalize_p_macro_plan(std::move(plan), leg_count);
+
+    vector<char> program;
+    vector<char> macro;
+    vector<int> macro_transition;
+    bool has_macro = false;
+    int cell = 0;
+    int dir = 1;
+    int leg = 0;
+    int plan_idx = 0;
+
+    auto append_and_apply = [&](const vector<char> &buttons, const vector<char> &active_macro) {
+        program.insert(program.end(), buttons.begin(), buttons.end());
+        apply_buttons_with_macro(solver, buttons, active_macro, cell, dir);
+    };
+
+    auto current_route = [&](int target) {
+        int end_cell, end_dir;
+        if (has_macro) {
+            return solver.macro_move_ops_with_transition(cell, dir, target, macro_transition, end_cell, end_dir);
+        }
+        return solver.basic_move_ops(cell, dir, target, end_cell, end_dir);
+    };
+
+    auto move_to = [&](int target) {
+        vector<char> route = current_route(target);
+
+        bool define_here = false;
+        PMacroPlacement def;
+        while (plan_idx < (int)plan.size() && plan[plan_idx].leg < leg) ++plan_idx;
+        if (plan_idx < (int)plan.size() && plan[plan_idx].leg == leg) {
+            def = plan[plan_idx];
+            if (def.offset + def.len <= (int)route.size()) {
+                define_here = true;
+            }
+            ++plan_idx;
+        }
+
+        if (!define_here) {
+            append_and_apply(route, macro);
+            ++leg;
+            return;
+        }
+
+        vector<char> prefix(route.begin(), route.begin() + def.offset);
+        append_and_apply(prefix, macro);
+
+        vector<char> definition_buttons(route.begin() + def.offset, route.begin() + def.offset + def.len);
+        vector<char> new_macro = expand_buttons_with_macro(definition_buttons, macro);
+
+        program.push_back('M');
+        program.insert(program.end(), definition_buttons.begin(), definition_buttons.end());
+        program.push_back('M');
+        apply_buttons_with_macro(solver, definition_buttons, macro, cell, dir);
+
+        macro = std::move(new_macro);
+        macro_transition = solver.build_macro_transition(macro);
+        has_macro = true;
+
+        vector<char> rest = current_route(target);
+        append_and_apply(rest, macro);
+        ++leg;
+    };
+
+    for (int k : order) {
+        move_to(solver.ball_cell(k));
+        program.push_back('S');
+        move_to(solver.basket_cell(k));
+        program.push_back('S');
+    }
+
+    return program;
+}
+
 int score_p_macro_program(const vector<char> &program, int limit) {
     int score = (int)program.size();
     int expanded = expanded_basic_count(program);
@@ -1381,6 +1499,763 @@ vector<char> anneal_p_macro_reroute(const Solver &solver, const vector<int> &ord
     return build_program_with_p_macro(solver, order, best);
 }
 
+vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int> &order, int limit, double time_limit_sec, int seed_rounds = 5, int seed_trials = 80, int max_defs = 10) {
+    vector<vector<char>> legs = build_basic_movement_legs(solver, order);
+    vector<PMacroPlacement> candidates = collect_p_macro_placements(legs);
+    if (candidates.empty()) return solver.build_ops(order);
+
+    auto repair = [&](PMacroPlacement p) {
+        p.leg = max(0, min(p.leg, (int)legs.size() - 1));
+        int leg_size = (int)legs[p.leg].size();
+        if (leg_size < 6) {
+            p.offset = 0;
+            p.len = 0;
+            return p;
+        }
+        p.offset = max(0, min(p.offset, leg_size - 6));
+        p.len = max(6, min(p.len, leg_size - p.offset));
+        return p;
+    };
+
+    auto random_def = [&]() {
+        if (rnd::get(100) < 85) return candidates[rnd::get((int)candidates.size())];
+        PMacroPlacement p;
+        p.leg = rnd::get((int)legs.size());
+        int leg_size = (int)legs[p.leg].size();
+        if (leg_size < 6) return candidates[rnd::get((int)candidates.size())];
+        p.offset = rnd::get(leg_size - 5);
+        p.len = 6 + rnd::get(min(160, leg_size - p.offset) - 5);
+        return p;
+    };
+
+    auto eval = [&](const vector<PMacroPlacement> &plan) {
+        vector<char> program = build_program_with_p_macro_plan(solver, order, plan);
+        return score_p_macro_program(program, limit);
+    };
+
+    vector<PMacroPlacement> current_plan;
+    int current_score = eval(current_plan);
+
+    for (int round = 0; round < seed_rounds; ++round) {
+        vector<PMacroPlacement> best_add_plan = current_plan;
+        int best_add_score = current_score;
+        for (int trial = 0; trial < seed_trials; ++trial) {
+            vector<PMacroPlacement> next_plan = current_plan;
+            next_plan.push_back(random_def());
+            int score = eval(next_plan);
+            if (score < best_add_score) {
+                best_add_score = score;
+                best_add_plan = std::move(next_plan);
+            }
+        }
+        if (best_add_score < current_score) {
+            current_plan = std::move(best_add_plan);
+            current_score = best_add_score;
+        }
+    }
+
+    vector<PMacroPlacement> best_plan = current_plan;
+    int best_score = current_score;
+
+    static double log_table[65536];
+    static bool initialized = false;
+    if (!initialized) {
+        for (int i = 0; i < 65536; ++i) log_table[i] = log((i + 0.5) / 65536.0);
+        rnd::shuffle(log_table);
+        initialized = true;
+    }
+
+    const double start_time = get_time();
+    const double T0 = 60.0;
+    const double T1 = 0.08;
+    double heat = T0;
+    int iter = 0;
+
+    while (true) {
+        if ((iter & 3) == 0) {
+            double progress = (get_time() - start_time) / time_limit_sec;
+            if (progress >= 1.0) break;
+            heat = T0 * pow(T1 / T0, progress);
+        }
+        ++iter;
+
+        vector<PMacroPlacement> next_plan = current_plan;
+        int type = rnd::get(8);
+
+        if (type == 0 || next_plan.empty()) {
+            if ((int)next_plan.size() < max_defs) next_plan.push_back(random_def());
+        } else if (type == 1) {
+            int idx = rnd::get((int)next_plan.size());
+            next_plan.erase(next_plan.begin() + idx);
+        } else if (type == 2) {
+            int idx = rnd::get((int)next_plan.size());
+            next_plan[idx] = random_def();
+        } else if (type == 3) {
+            int idx = rnd::get((int)next_plan.size());
+            next_plan[idx].leg += rnd::range(-5, 6);
+            next_plan[idx] = repair(next_plan[idx]);
+        } else if (type == 4) {
+            int idx = rnd::get((int)next_plan.size());
+            next_plan[idx].offset += rnd::range(-14, 15);
+            next_plan[idx] = repair(next_plan[idx]);
+        } else if (type == 5) {
+            int idx = rnd::get((int)next_plan.size());
+            next_plan[idx].len += rnd::range(-28, 29);
+            next_plan[idx] = repair(next_plan[idx]);
+        } else if (type == 6) {
+            int cnt = min(3, max(1, (int)next_plan.size()));
+            for (int i = 0; i < cnt; ++i) {
+                int idx = rnd::get((int)next_plan.size());
+                next_plan[idx] = random_def();
+            }
+        } else {
+            rnd::shuffle(next_plan);
+            while ((int)next_plan.size() > 1 && rnd::get(100) < 35) {
+                next_plan.erase(next_plan.begin() + rnd::get((int)next_plan.size()));
+            }
+            while ((int)next_plan.size() < 8 && rnd::get(100) < 55) {
+                next_plan.push_back(random_def());
+            }
+        }
+
+        for (PMacroPlacement &p : next_plan) p = repair(p);
+        next_plan.erase(remove_if(next_plan.begin(), next_plan.end(), [](const PMacroPlacement &p) {
+                            return p.len < 6;
+                        }),
+                        next_plan.end());
+        while ((int)next_plan.size() > max_defs) {
+            next_plan.erase(next_plan.begin() + rnd::get((int)next_plan.size()));
+        }
+
+        int next_score = eval(next_plan);
+        int delta = next_score - current_score;
+        double accept_margin = -heat * log_table[iter & 65535];
+        if (delta <= accept_margin) {
+            current_plan = std::move(next_plan);
+            current_score = next_score;
+            if (current_score < best_score) {
+                best_score = current_score;
+                best_plan = current_plan;
+            }
+        }
+    }
+
+    return build_program_with_p_macro_plan(solver, order, best_plan);
+}
+
+int eval_p_macro_plan(const Solver &solver, const vector<int> &order, const vector<PMacroPlacement> &plan, int limit) {
+    vector<char> program = build_program_with_p_macro_plan(solver, order, plan);
+    return score_p_macro_program(program, limit);
+}
+
+vector<PMacroPlacement> seed_p_macro_plan(const Solver &solver, const vector<int> &order, int limit, int rounds, int trials) {
+    vector<vector<char>> legs = build_basic_movement_legs(solver, order);
+    vector<PMacroPlacement> candidates = collect_p_macro_placements(legs);
+    vector<PMacroPlacement> plan;
+    if (candidates.empty()) return plan;
+
+    auto random_def = [&]() {
+        if (rnd::get(100) < 85) return candidates[rnd::get((int)candidates.size())];
+        PMacroPlacement p;
+        p.leg = rnd::get((int)legs.size());
+        int leg_size = (int)legs[p.leg].size();
+        if (leg_size < 6) return candidates[rnd::get((int)candidates.size())];
+        p.offset = rnd::get(leg_size - 5);
+        p.len = 6 + rnd::get(min(160, leg_size - p.offset) - 5);
+        return p;
+    };
+
+    int score = eval_p_macro_plan(solver, order, plan, limit);
+    for (int round = 0; round < rounds; ++round) {
+        vector<PMacroPlacement> best_plan = plan;
+        int best_score = score;
+        for (int trial = 0; trial < trials; ++trial) {
+            vector<PMacroPlacement> next = plan;
+            next.push_back(random_def());
+            int next_score = eval_p_macro_plan(solver, order, next, limit);
+            if (next_score < best_score) {
+                best_score = next_score;
+                best_plan = std::move(next);
+            }
+        }
+        if (best_score < score) {
+            score = best_score;
+            plan = std::move(best_plan);
+        }
+    }
+    return plan;
+}
+
+vector<char> anneal_order_and_p_macro_plan(const Solver &solver, vector<int> initial_order, int limit, double time_limit_sec) {
+    if (initial_order.size() < 2) return solver.build_ops(initial_order);
+
+    vector<PMacroPlacement> current_plan = seed_p_macro_plan(solver, initial_order, limit, 3, 45);
+    vector<int> current_order = std::move(initial_order);
+    int current_score = eval_p_macro_plan(solver, current_order, current_plan, limit);
+
+    vector<int> best_order = current_order;
+    vector<PMacroPlacement> best_plan = current_plan;
+    int best_score = current_score;
+
+    static double log_table[65536];
+    static bool initialized = false;
+    if (!initialized) {
+        for (int i = 0; i < 65536; ++i) log_table[i] = log((i + 0.5) / 65536.0);
+        rnd::shuffle(log_table);
+        initialized = true;
+    }
+
+    auto random_def_loose = [&](int leg_count) {
+        PMacroPlacement p;
+        p.leg = rnd::get(leg_count);
+        p.offset = rnd::get(80);
+        p.len = 6 + rnd::get(155);
+        return p;
+    };
+
+    const double start_time = get_time();
+    const double T0 = 75.0;
+    const double T1 = 0.12;
+    double heat = T0;
+    int iter = 0;
+
+    while (true) {
+        if ((iter & 3) == 0) {
+            double progress = (get_time() - start_time) / time_limit_sec;
+            if (progress >= 1.0) break;
+            heat = T0 * pow(T1 / T0, progress);
+        }
+        ++iter;
+
+        vector<int> next_order = current_order;
+        vector<PMacroPlacement> next_plan = current_plan;
+        int leg_count = (int)next_order.size() * 2;
+        int type = rnd::get(10);
+
+        if (type == 0) {
+            int i = rnd::get((int)next_order.size());
+            int j = rnd::get((int)next_order.size() - 1);
+            if (j >= i) ++j;
+            swap(next_order[i], next_order[j]);
+        } else if (type == 1) {
+            int l = rnd::get((int)next_order.size());
+            int r = rnd::get((int)next_order.size());
+            if (l > r) swap(l, r);
+            if (l != r) reverse(next_order.begin() + l, next_order.begin() + r + 1);
+        } else if (type == 2) {
+            int i = rnd::get((int)next_order.size());
+            int j = rnd::get((int)next_order.size());
+            if (i != j) {
+                int x = next_order[i];
+                next_order.erase(next_order.begin() + i);
+                if (j > i) --j;
+                next_order.insert(next_order.begin() + j, x);
+            }
+        } else if (type == 3 || next_plan.empty()) {
+            if ((int)next_plan.size() < 10) next_plan.push_back(random_def_loose(leg_count));
+        } else if (type == 4) {
+            next_plan.erase(next_plan.begin() + rnd::get((int)next_plan.size()));
+        } else if (type == 5) {
+            int idx = rnd::get((int)next_plan.size());
+            next_plan[idx] = random_def_loose(leg_count);
+        } else if (type == 6) {
+            int idx = rnd::get((int)next_plan.size());
+            next_plan[idx].leg += rnd::range(-5, 6);
+        } else if (type == 7) {
+            int idx = rnd::get((int)next_plan.size());
+            next_plan[idx].offset += rnd::range(-20, 21);
+        } else if (type == 8) {
+            int idx = rnd::get((int)next_plan.size());
+            next_plan[idx].len += rnd::range(-36, 37);
+        } else {
+            next_plan = seed_p_macro_plan(solver, next_order, limit, 2, 24);
+        }
+
+        while ((int)next_plan.size() > 10) {
+            next_plan.erase(next_plan.begin() + rnd::get((int)next_plan.size()));
+        }
+
+        int next_score = eval_p_macro_plan(solver, next_order, next_plan, limit);
+        int delta = next_score - current_score;
+        double accept_margin = -heat * log_table[iter & 65535];
+        if (delta <= accept_margin) {
+            current_order = std::move(next_order);
+            current_plan = std::move(next_plan);
+            current_score = next_score;
+            if (current_score < best_score) {
+                best_score = current_score;
+                best_order = current_order;
+                best_plan = current_plan;
+            }
+        }
+    }
+
+    return build_program_with_p_macro_plan(solver, best_order, best_plan);
+}
+
+struct FullState {
+    int cell = 0;
+    int dir = 1;
+    int held = -1;
+    vector<int> ball_pos;
+};
+
+FullState initial_full_state(const Solver &solver) {
+    FullState st;
+    int m = solver.ball_count();
+    st.ball_pos.resize(m);
+    for (int k = 0; k < m; ++k) st.ball_pos[k] = solver.ball_cell(k);
+    return st;
+}
+
+int ball_at_cell(const FullState &st, int cell) {
+    for (int k = 0; k < (int)st.ball_pos.size(); ++k) {
+        if (st.ball_pos[k] == cell) return k;
+    }
+    return -1;
+}
+
+void apply_full_basic_op(const Solver &solver, FullState &st, char op) {
+    if (op == 'S') {
+        int on_cell = ball_at_cell(st, st.cell);
+        if (st.held == -1 && on_cell != -1) {
+            st.held = on_cell;
+            st.ball_pos[on_cell] = -1;
+        } else if (st.held != -1 && on_cell == -1) {
+            st.ball_pos[st.held] = st.cell;
+            st.held = -1;
+        } else if (st.held != -1 && on_cell != -1) {
+            st.ball_pos[st.held] = st.cell;
+            st.ball_pos[on_cell] = -1;
+            st.held = on_cell;
+        }
+    } else {
+        solver.apply_basic_op(op, st.cell, st.dir);
+    }
+}
+
+void apply_full_buttons(const Solver &solver, FullState &st, const vector<char> &buttons, const vector<char> &macro) {
+    for (char op : buttons) {
+        if (op == 'P') {
+            for (char basic : macro) apply_full_basic_op(solver, st, basic);
+        } else if (is_basic_op(op)) {
+            apply_full_basic_op(solver, st, op);
+        }
+    }
+}
+
+int normalize_order_index(const Solver &solver, const vector<int> &order, const FullState &st, int idx) {
+    while (idx < (int)order.size()) {
+        int k = order[idx];
+        if (st.held != k && st.ball_pos[k] == solver.basket_cell(k)) {
+            ++idx;
+        } else {
+            break;
+        }
+    }
+    return idx;
+}
+
+bool is_all_done(const Solver &solver, const FullState &st) {
+    if (st.held != -1) return false;
+    for (int k = 0; k < (int)st.ball_pos.size(); ++k) {
+        if (st.ball_pos[k] != solver.basket_cell(k)) return false;
+    }
+    return true;
+}
+
+int rough_remaining_cost(const Solver &solver, const vector<int> &order, const FullState &st, int idx) {
+    idx = normalize_order_index(solver, order, st, idx);
+    if (idx >= (int)order.size()) return st.held == -1 ? 0 : 1000000;
+
+    int k = order[idx];
+    int target = -1;
+    int cost = 0;
+    if (st.held == k) {
+        target = solver.basket_cell(k);
+        cost += 1;
+    } else {
+        if (st.ball_pos[k] == -1) return 1000000;
+        target = st.ball_pos[k];
+        cost += 1;
+    }
+
+    int end_cell, end_dir;
+    vector<char> path = solver.basic_move_ops(st.cell, st.dir, target, end_cell, end_dir);
+    cost += (int)path.size();
+
+    int rest_bonus = 0;
+    for (int p = idx + 1; p < (int)order.size(); ++p) {
+        int x = order[p];
+        if (st.ball_pos[x] == solver.basket_cell(x)) continue;
+        rest_bonus += 2;
+    }
+    return cost + rest_bonus;
+}
+
+bool contains_s_op(const vector<char> &ops, int l, int len) {
+    for (int i = l; i < l + len; ++i) {
+        if (ops[i] == 'S') return true;
+    }
+    return false;
+}
+
+vector<MacroAction> collect_single_s_macro_candidates(const vector<char> &base, int keep = 1400) {
+    vector<MacroAction> candidates;
+    set<pair<int, int>> seen;
+
+    auto add = [&](int start, int len) {
+        if (start < 0 || len < 4 || start + len > (int)base.size()) return;
+        if (!contains_s_op(base, start, len)) return;
+        pair<int, int> key{start, len};
+        if (seen.insert(key).second) candidates.push_back(MacroAction{start, len});
+    };
+
+    vector<MacroAction> repeated = collect_macro_action_candidates(base, 180, keep);
+    for (MacroAction x : repeated) add(x.start, x.len);
+
+    vector<int> s_pos;
+    for (int i = 0; i < (int)base.size(); ++i) {
+        if (base[i] == 'S') s_pos.push_back(i);
+    }
+
+    const vector<int> lens = {5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 56, 72, 96, 128, 160};
+    for (int p : s_pos) {
+        for (int back : {0, 1, 2, 4, 6, 8, 12, 16, 24, 32}) {
+            for (int len : lens) {
+                add(p - back, len);
+            }
+        }
+    }
+
+    while ((int)candidates.size() > keep) {
+        candidates.pop_back();
+    }
+    return candidates;
+}
+
+vector<char> build_program_with_single_s_macro(const Solver &solver, const vector<int> &order, const vector<char> &base, MacroAction action, int limit,
+                                               bool *done_out = nullptr, int *expanded_out = nullptr) {
+    vector<char> program;
+    auto finish = [&](const FullState &st) {
+        if (done_out) *done_out = is_all_done(solver, st);
+        if (expanded_out) *expanded_out = expanded_basic_count(program);
+        return program;
+    };
+
+    if (action.start < 0 || action.len <= 0 || action.start + action.len > (int)base.size()) {
+        if (done_out) *done_out = false;
+        if (expanded_out) *expanded_out = 0;
+        return program;
+    }
+
+    vector<char> macro(base.begin() + action.start, base.begin() + action.start + action.len);
+    FullState st = initial_full_state(solver);
+
+    vector<char> prefix(base.begin(), base.begin() + action.start);
+    program.insert(program.end(), prefix.begin(), prefix.end());
+    apply_full_buttons(solver, st, prefix, macro);
+
+    program.push_back('M');
+    program.insert(program.end(), macro.begin(), macro.end());
+    program.push_back('M');
+    apply_full_buttons(solver, st, macro, macro);
+
+    int idx = 0;
+    int guard = 0;
+    while (!is_all_done(solver, st) && (int)program.size() <= limit + 500 && guard < 10000) {
+        ++guard;
+        idx = normalize_order_index(solver, order, st, idx);
+        if (idx >= (int)order.size()) break;
+
+        int k = order[idx];
+        int target;
+        if (st.held == k) {
+            target = solver.basket_cell(k);
+        } else {
+            if (st.ball_pos[k] == -1) {
+                ++idx;
+                continue;
+            }
+            target = st.ball_pos[k];
+        }
+
+        if (st.cell == target) {
+            program.push_back('S');
+            apply_full_basic_op(solver, st, 'S');
+            continue;
+        }
+
+        int cur_est = rough_remaining_cost(solver, order, st, idx);
+        FullState p_state = st;
+        apply_full_buttons(solver, p_state, vector<char>{'P'}, macro);
+        int p_est = rough_remaining_cost(solver, order, p_state, idx);
+
+        if (p_est + 1 < cur_est) {
+            program.push_back('P');
+            st = std::move(p_state);
+            continue;
+        }
+
+        int end_cell, end_dir;
+        vector<char> path = solver.basic_move_ops(st.cell, st.dir, target, end_cell, end_dir);
+        if (path.empty()) break;
+        program.push_back(path[0]);
+        apply_full_basic_op(solver, st, path[0]);
+    }
+
+    return finish(st);
+}
+
+int score_single_s_macro_program(const vector<char> &program, int limit, bool done, int expanded) {
+    if (!done) return 1000000000;
+    int score = (int)program.size();
+    if (score > limit) return 900000000 + score - limit;
+    if (expanded > limit) return 800000000 + expanded - limit;
+    return score;
+}
+
+bool delivered_prefix_ok(const Solver &solver, const vector<int> &order, const FullState &st, int count) {
+    if (st.held != -1) return false;
+    for (int i = 0; i < count; ++i) {
+        int k = order[i];
+        if (st.ball_pos[k] != solver.basket_cell(k)) return false;
+    }
+    return true;
+}
+
+vector<char> build_program_with_delivery_s_macro(const Solver &solver, const vector<int> &order, int define_idx,
+                                                 bool *done_out = nullptr, int *expanded_out = nullptr) {
+    vector<char> program;
+    vector<char> macro;
+    bool registered = false;
+    bool broken = false;
+    FullState st = initial_full_state(solver);
+
+    auto finish = [&]() {
+        if (done_out) *done_out = !broken && is_all_done(solver, st);
+        if (expanded_out) *expanded_out = expanded_basic_count(program);
+        return program;
+    };
+
+    auto append_basic_ops = [&](const vector<char> &ops) {
+        program.insert(program.end(), ops.begin(), ops.end());
+        apply_full_buttons(solver, st, ops, macro);
+    };
+
+    auto normal_delivery = [&](int k) {
+        program.push_back('S');
+        apply_full_basic_op(solver, st, 'S');
+        int end_cell, end_dir;
+        vector<char> path = solver.basic_move_ops(st.cell, st.dir, solver.basket_cell(k), end_cell, end_dir);
+        append_basic_ops(path);
+        program.push_back('S');
+        apply_full_basic_op(solver, st, 'S');
+    };
+
+    for (int idx = 0; idx < (int)order.size(); ++idx) {
+        int k = order[idx];
+        if (st.ball_pos[k] == solver.basket_cell(k) && st.held != k) continue;
+        if (st.held != -1 || st.ball_pos[k] == -1) {
+            broken = true;
+            break;
+        }
+
+        int end_cell, end_dir;
+        vector<char> to_ball = solver.basic_move_ops(st.cell, st.dir, st.ball_pos[k], end_cell, end_dir);
+        append_basic_ops(to_ball);
+
+        if (idx == define_idx) {
+            vector<char> delivery;
+            delivery.push_back('S');
+            FullState tmp = st;
+            apply_full_basic_op(solver, tmp, 'S');
+
+            int ecell, edir;
+            vector<char> path = solver.basic_move_ops(tmp.cell, tmp.dir, solver.basket_cell(k), ecell, edir);
+            delivery.insert(delivery.end(), path.begin(), path.end());
+            delivery.push_back('S');
+
+            program.push_back('M');
+            program.insert(program.end(), delivery.begin(), delivery.end());
+            program.push_back('M');
+            apply_full_buttons(solver, st, delivery, macro);
+            macro = std::move(delivery);
+            registered = true;
+        } else if (registered) {
+            FullState p_state = st;
+            apply_full_buttons(solver, p_state, vector<char>{'P'}, macro);
+            if (p_state.ball_pos[k] == solver.basket_cell(k) && delivered_prefix_ok(solver, order, p_state, idx + 1)) {
+                program.push_back('P');
+                st = std::move(p_state);
+            } else {
+                normal_delivery(k);
+            }
+        } else {
+            normal_delivery(k);
+        }
+
+        if (!delivered_prefix_ok(solver, order, st, idx + 1)) {
+            broken = true;
+            break;
+        }
+    }
+
+    return finish();
+}
+
+vector<char> best_delivery_s_macro_program(const Solver &solver, const vector<int> &order, int limit) {
+    vector<char> best;
+    int best_score = 1000000000;
+
+    for (int i = 0; i < (int)order.size(); ++i) {
+        bool done = false;
+        int expanded = 0;
+        vector<char> program = build_program_with_delivery_s_macro(solver, order, i, &done, &expanded);
+        int score = score_single_s_macro_program(program, limit, done, expanded);
+        if (score < best_score) {
+            best_score = score;
+            best = std::move(program);
+        }
+    }
+
+    if (best_score >= 1000000000) return {};
+    return best;
+}
+
+vector<char> anneal_single_s_macro(const Solver &solver, const vector<int> &order, int limit, double time_limit_sec) {
+    vector<char> base = solver.build_ops(order);
+    vector<char> fallback = compress_with_single_macro(base, limit);
+    vector<char> delivery_macro = best_delivery_s_macro_program(solver, order, limit);
+    if (!delivery_macro.empty() && delivery_macro.size() < fallback.size()) fallback = std::move(delivery_macro);
+    vector<MacroAction> candidates = collect_single_s_macro_candidates(base);
+    if (candidates.empty()) return fallback;
+
+    auto eval = [&](MacroAction action) {
+        bool done = false;
+        int expanded = 0;
+        vector<char> program = build_program_with_single_s_macro(solver, order, base, action, limit, &done, &expanded);
+        return score_single_s_macro_program(program, limit, done, expanded);
+    };
+
+    MacroAction current = candidates[rnd::get((int)candidates.size())];
+    int current_score = eval(current);
+    MacroAction best = current;
+    int best_score = (int)fallback.size();
+    bool has_best_macro = false;
+
+    int warmup = min(240, (int)candidates.size());
+    for (int i = 0; i < warmup; ++i) {
+        MacroAction cand = candidates[rnd::get((int)candidates.size())];
+        int score = eval(cand);
+        if (score < best_score) {
+            best = cand;
+            best_score = score;
+            has_best_macro = true;
+            current = cand;
+            current_score = score;
+        }
+    }
+
+    if (has_best_macro && current_score >= 1000000000) {
+        current = best;
+        current_score = best_score;
+    }
+
+    static double log_table[65536];
+    static bool initialized = false;
+    if (!initialized) {
+        for (int i = 0; i < 65536; ++i) log_table[i] = log((i + 0.5) / 65536.0);
+        rnd::shuffle(log_table);
+        initialized = true;
+    }
+
+    const double start_time = get_time();
+    const double T0 = 50.0;
+    const double T1 = 0.06;
+    double heat = T0;
+    int iter = 0;
+
+    while (true) {
+        if ((iter & 3) == 0) {
+            double progress = (get_time() - start_time) / time_limit_sec;
+            if (progress >= 1.0) break;
+            heat = T0 * pow(T1 / T0, progress);
+        }
+        ++iter;
+
+        MacroAction next = current;
+        int type = rnd::get(5);
+        if (type == 0) {
+            next = candidates[rnd::get((int)candidates.size())];
+        } else if (type == 1) {
+            next.start += rnd::range(-24, 25);
+        } else if (type == 2) {
+            next.len += rnd::range(-36, 37);
+        } else if (type == 3) {
+            next.start += rnd::range(-8, 9);
+            next.len += rnd::range(-12, 13);
+        } else {
+            int s = rnd::get(max(1, (int)base.size() - 3));
+            int max_len = min(180, (int)base.size() - s);
+            int len = 4 + rnd::get(max(1, max_len - 3));
+            next = MacroAction{s, len};
+        }
+
+        next.start = max(0, min(next.start, max(0, (int)base.size() - 4)));
+        next.len = max(4, min(next.len, (int)base.size() - next.start));
+        if (!contains_s_op(base, next.start, next.len)) continue;
+
+        int next_score = eval(next);
+        int delta = next_score - current_score;
+        double accept_margin = -heat * log_table[iter & 65535];
+        if (delta <= accept_margin) {
+            current = next;
+            current_score = next_score;
+            if (current_score < best_score) {
+                best = current;
+                best_score = current_score;
+                has_best_macro = true;
+            }
+        }
+    }
+
+    if (!has_best_macro) return fallback;
+    bool done = false;
+    int expanded = 0;
+    vector<char> answer = build_program_with_single_s_macro(solver, order, base, best, limit, &done, &expanded);
+    if (!done || (int)answer.size() > limit || expanded > limit || (int)answer.size() >= (int)fallback.size()) return fallback;
+    return answer;
+}
+
+bool valid_program_for_limit(const vector<char> &program, int limit) {
+    if (program.empty()) return false;
+    if ((int)program.size() > limit) return false;
+    if (expanded_basic_count(program) > limit) return false;
+    return true;
+}
+
+vector<char> anneal_multi_macro_open_s(const Solver &solver, const vector<int> &order, int limit, double time_limit_sec) {
+    vector<char> raw = solver.build_ops(order);
+    vector<char> best = best_macro_compress(raw, limit, false);
+    if (!valid_program_for_limit(best, limit)) best = raw;
+
+    auto consider = [&](vector<char> candidate) {
+        if (!valid_program_for_limit(candidate, limit)) return;
+        if (candidate.size() < best.size()) best = std::move(candidate);
+    };
+
+    double direct_time = time_limit_sec * 0.18;
+    double reroute_time = time_limit_sec * 0.38;
+    double coanneal_time = max(0.0, time_limit_sec - direct_time - reroute_time);
+
+    consider(anneal_macro_program_direct(raw, limit, direct_time));
+    consider(anneal_multi_p_macro_reroute(solver, order, limit, reroute_time, 2, 24, 10));
+    consider(anneal_order_and_p_macro_plan(solver, order, limit, coanneal_time));
+
+    return best;
+}
+
 int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
@@ -1390,8 +2265,7 @@ int main() {
     vector<int> greedy_order = solver.build_greedy_order();
     vector<int> annealed_order = anneal_order_with_macro(solver, greedy_order, 0.20);
 
-    vector<char> annealed_raw = solver.build_ops(annealed_order);
-    vector<char> answer = anneal_p_macro_reroute(solver, annealed_order, in.T, 0.25);
+    vector<char> answer = anneal_multi_macro_open_s(solver, annealed_order, in.T, 1.20);
     for (char op : answer) {
         cout << op << '\n';
     }
