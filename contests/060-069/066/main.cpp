@@ -23,13 +23,6 @@ inline uint32_t next() {
     return ret;
 }
 
-inline double nextf() {
-    uint64_t v = 0x3ff0000000000000ULL | ((uint64_t)next() << 20);
-    double d;
-    memcpy(&d, &v, sizeof(double));
-    return d - 1.0;
-}
-
 inline int get(int n) {
     return (int)((uint64_t)next() * (uint32_t)n >> 32);
 }
@@ -143,10 +136,6 @@ class Solver {
         return answer;
     }
 
-    vector<char> solve() const {
-        return build_ops(build_greedy_order());
-    }
-
     int time_limit() const {
         return in.T;
     }
@@ -256,11 +245,6 @@ class Solver {
         end_cell = goal / 4;
         end_dir = goal % 4;
         return ops;
-    }
-
-    vector<char> macro_move_ops(int from, int from_dir, int to, const vector<char> &macro, int &end_cell, int &end_dir) const {
-        vector<int> macro_transition = build_macro_transition(macro);
-        return macro_move_ops_with_transition(from, from_dir, to, macro_transition, end_cell, end_dir);
     }
 
   private:
@@ -766,387 +750,108 @@ vector<char> best_macro_compress(const vector<char> &base, int limit, bool fast)
     return multiple.size() < single.size() ? multiple : single;
 }
 
-int macro_aware_score(const Solver &solver, const vector<int> &order, bool fast) {
+int raw_order_score(const Solver &solver, const vector<int> &order) {
     constexpr int INF = 1000000000;
     vector<char> raw = solver.build_ops(order);
     if ((int)raw.size() > solver.time_limit()) {
         return INF / 2 + (int)raw.size() - solver.time_limit();
     }
-    vector<char> encoded = best_macro_compress(raw, solver.time_limit(), fast);
-    return (int)encoded.size();
+    return (int)raw.size();
 }
 
-vector<int> anneal_order_with_macro(const Solver &solver, const vector<int> &initial_order, double time_limit_sec) {
-    const int m = (int)initial_order.size();
-    if (m < 2 || time_limit_sec <= 0.0) return initial_order;
+int basic_move_len(const Solver &solver, int from, int dir, int to) {
+    int end_cell = 0;
+    int end_dir = 0;
+    return (int)solver.basic_move_ops(from, dir, to, end_cell, end_dir).size();
+}
 
-    vector<int> current_order = initial_order;
-    vector<int> best_order = initial_order;
-    int current_score = macro_aware_score(solver, current_order, true);
-    int best_score = current_score;
+vector<vector<int>> build_goal_reverse_orders(const Solver &solver) {
+    const int m = solver.ball_count();
+    vector<int> delivery(m, 0);
+    vector<int> start_cost(m, 0);
+    vector<vector<int>> link(m, vector<int>(m, 0));
 
-    static double log_table[65536];
-    static bool initialized = false;
-    if (!initialized) {
-        for (int i = 0; i < 65536; ++i) {
-            log_table[i] = log((i + 0.5) / 65536.0);
+    for (int k = 0; k < m; ++k) {
+        int best_delivery = numeric_limits<int>::max();
+        for (int dir = 0; dir < 4; ++dir) {
+            best_delivery = min(best_delivery, basic_move_len(solver, solver.ball_cell(k), dir, solver.basket_cell(k)) + 2);
         }
-        rnd::shuffle(log_table);
-        initialized = true;
+        delivery[k] = best_delivery;
+        vector<int> single{k};
+        start_cost[k] = (int)solver.build_ops(single).size();
     }
 
-    const double start = get_time();
-    const double T0 = 18.0;
-    const double T1 = 0.05;
-    double heat = T0;
-    int iter = 0;
-
-    while (true) {
-        if ((iter & 3) == 0) {
-            double progress = (get_time() - start) / time_limit_sec;
-            if (progress >= 1.0) break;
-            heat = T0 * pow(T1 / T0, progress);
-        }
-        ++iter;
-
-        vector<int> next_order = current_order;
-        int type = rnd::get(3);
-
-        if (type == 0) {
-            int i = rnd::get(m);
-            int j = rnd::get(m - 1);
-            if (j >= i) ++j;
-            swap(next_order[i], next_order[j]);
-        } else if (type == 1) {
-            int l = rnd::get(m);
-            int r = rnd::get(m);
-            if (l > r) swap(l, r);
-            if (l == r) continue;
-            reverse(next_order.begin() + l, next_order.begin() + r + 1);
-        } else {
-            int i = rnd::get(m);
-            int j = rnd::get(m);
-            if (i == j) continue;
-            int x = next_order[i];
-            next_order.erase(next_order.begin() + i);
-            if (j > i) --j;
-            next_order.insert(next_order.begin() + j, x);
-        }
-
-        int next_score = macro_aware_score(solver, next_order, true);
-        int delta = next_score - current_score;
-        double accept_margin = -heat * log_table[iter & 65535];
-
-        if (delta <= accept_margin) {
-            current_order = std::move(next_order);
-            current_score = next_score;
-            if (current_score < best_score) {
-                best_score = current_score;
-                best_order = current_order;
+    for (int from = 0; from < m; ++from) {
+        for (int to = 0; to < m; ++to) {
+            if (from == to) continue;
+            int best = numeric_limits<int>::max();
+            for (int dir = 0; dir < 4; ++dir) {
+                best = min(best, basic_move_len(solver, solver.basket_cell(from), dir, solver.ball_cell(to)));
             }
+            link[from][to] = best;
         }
     }
 
-    return best_order;
-}
-
-struct MacroAction {
-    int start = 0;
-    int len = 0;
-};
-
-vector<MacroAction> collect_macro_action_candidates(const vector<char> &base, int max_len_cap = 140, int keep = 4000) {
-    const int n = (int)base.size();
-    string s(base.begin(), base.end());
-    const int max_len = min(n / 2, max_len_cap);
-    if (max_len < 2) return {};
-
-    struct HashKey {
-        unsigned long long a = 0;
-        unsigned long long b = 0;
-
-        bool operator<(const HashKey &other) const {
-            if (a != other.a) return a < other.a;
-            return b < other.b;
-        }
-
-        bool operator==(const HashKey &other) const {
-            return a == other.a && b == other.b;
-        }
+    auto edge_score = [&](int prev, int head, int tail, int mode) {
+        int jitter = (prev * 119 + head * 31 + tail * 17 + mode * 13) % 17;
+        if (mode == 0) return 100 * link[prev][head] + 45 * delivery[prev] + jitter;
+        if (mode == 1) return 135 * link[prev][head] + 20 * delivery[prev] + jitter;
+        if (mode == 2) return 75 * link[prev][head] + 85 * delivery[prev] + jitter;
+        if (mode == 3) return 110 * link[prev][head] + 10 * start_cost[prev] + jitter;
+        if (mode == 4) return 95 * link[prev][head] + 35 * delivery[prev] + 12 * start_cost[prev] + jitter;
+        if (mode == 5) return 100 * link[prev][head] + jitter;
+        if (mode == 6) return 100 * link[prev][head] + 8 * delivery[prev] + jitter;
+        return 100 * link[prev][head] + 8 * start_cost[prev] + jitter;
     };
 
-    struct ScoredAction {
-        int score = 0;
-        MacroAction action;
-    };
+    vector<vector<int>> orders;
+    orders.push_back(solver.build_greedy_order());
 
-    constexpr unsigned long long BASE1 = 1000003ULL;
-    constexpr unsigned long long BASE2 = 1000033ULL;
+    for (int tail = 0; tail < m; ++tail) {
+        for (int mode = 0; mode < 8; ++mode) {
+            vector<char> used(m, 0);
+            vector<int> order;
+            order.reserve(m);
+            order.push_back(tail);
+            used[tail] = 1;
 
-    vector<unsigned long long> pow1(max_len + 1, 1), pow2(max_len + 1, 1);
-    for (int i = 1; i <= max_len; ++i) {
-        pow1[i] = pow1[i - 1] * BASE1;
-        pow2[i] = pow2[i - 1] * BASE2;
-    }
-
-    vector<unsigned long long> pref1(n + 1, 0), pref2(n + 1, 0);
-    for (int i = 0; i < n; ++i) {
-        unsigned long long x = (unsigned long long)(unsigned char)s[i] + 1;
-        pref1[i + 1] = pref1[i] * BASE1 + x;
-        pref2[i + 1] = pref2[i] * BASE2 + x;
-    }
-
-    auto get_hash = [&](int l, int len) -> HashKey {
-        return HashKey{
-            pref1[l + len] - pref1[l] * pow1[len],
-            pref2[l + len] - pref2[l] * pow2[len],
-        };
-    };
-
-    vector<ScoredAction> scored;
-    vector<pair<HashKey, int>> substrings;
-
-    for (int len = 2; len <= max_len; ++len) {
-        substrings.clear();
-        substrings.reserve(n - len + 1);
-        for (int i = 0; i + len <= n; ++i) {
-            substrings.push_back({get_hash(i, len), i});
-        }
-
-        sort(substrings.begin(), substrings.end(), [](const auto &lhs, const auto &rhs) {
-            if (!(lhs.first == rhs.first)) return lhs.first < rhs.first;
-            return lhs.second < rhs.second;
-        });
-
-        for (int l = 0; l < (int)substrings.size();) {
-            int r = l + 1;
-            while (r < (int)substrings.size() && substrings[l].first == substrings[r].first) ++r;
-
-            int m = r - l;
-            if (m >= 2) {
-                vector<int> positions;
-                positions.reserve(m);
-                for (int idx = l; idx < r; ++idx) positions.push_back(substrings[idx].second);
-
-                for (int idx = 0; idx + 1 < m; ++idx) {
-                    int last = positions[idx];
-                    int future_count = 0;
-                    for (int j = idx + 1; j < m; ++j) {
-                        if (positions[j] < last + len) continue;
-                        ++future_count;
-                        last = positions[j];
-                    }
-
-                    int saving = future_count * (len - 1) - 2;
-                    if (saving > 0) {
-                        scored.push_back(ScoredAction{saving, MacroAction{positions[idx], len}});
+            while ((int)order.size() < m) {
+                int head = order.front();
+                int best = -1;
+                int best_score = numeric_limits<int>::max();
+                for (int k = 0; k < m; ++k) {
+                    if (used[k]) continue;
+                    int score = edge_score(k, head, tail, mode);
+                    if (score < best_score) {
+                        best_score = score;
+                        best = k;
                     }
                 }
+                if (best == -1) break;
+                order.insert(order.begin(), best);
+                used[best] = 1;
             }
-
-            l = r;
+            orders.push_back(std::move(order));
         }
     }
 
-    sort(scored.begin(), scored.end(), [](const ScoredAction &lhs, const ScoredAction &rhs) {
-        if (lhs.score != rhs.score) return lhs.score > rhs.score;
-        if (lhs.action.len != rhs.action.len) return lhs.action.len > rhs.action.len;
-        return lhs.action.start < rhs.action.start;
-    });
-
-    vector<MacroAction> candidates;
-    candidates.reserve(min(keep, (int)scored.size()));
-    set<pair<int, int>> seen;
-    for (const ScoredAction &x : scored) {
-        if ((int)candidates.size() >= keep) break;
-        pair<int, int> key{x.action.start, x.action.len};
-        if (seen.insert(key).second) candidates.push_back(x.action);
-    }
-    return candidates;
+    sort(orders.begin(), orders.end());
+    orders.erase(unique(orders.begin(), orders.end()), orders.end());
+    return orders;
 }
 
-vector<MacroAction> normalize_macro_actions(vector<MacroAction> actions, int n) {
-    sort(actions.begin(), actions.end(), [](const MacroAction &lhs, const MacroAction &rhs) {
-        if (lhs.start != rhs.start) return lhs.start < rhs.start;
-        return lhs.len > rhs.len;
-    });
+vector<int> build_light_goal_reverse_order(const Solver &solver) {
+    vector<vector<int>> orders = build_goal_reverse_orders(solver);
+    if (orders.empty()) return solver.build_greedy_order();
 
-    vector<MacroAction> normalized;
-    int last_end = 0;
-    for (MacroAction action : actions) {
-        action.start = max(0, min(action.start, n));
-        action.len = max(1, min(action.len, n - action.start));
-        if (action.len <= 1) continue;
-        if (action.start < last_end) continue;
-        normalized.push_back(action);
-        last_end = action.start + action.len;
-    }
-    return normalized;
-}
-
-vector<char> encode_macro_program_from_actions(const vector<char> &base, const vector<MacroAction> &actions) {
-    const int n = (int)base.size();
-    string s(base.begin(), base.end());
-    vector<MacroAction> normalized = normalize_macro_actions(actions, n);
-    vector<char> encoded;
-    encoded.reserve(n);
-
-    string last_macro;
-    bool has_macro = false;
-
-    auto append_segment_using_last_macro = [&](const string &segment) {
-        int p = 0;
-        while (p < (int)segment.size()) {
-            if (has_macro && !last_macro.empty() && p + (int)last_macro.size() <= (int)segment.size() &&
-                segment.compare(p, last_macro.size(), last_macro) == 0) {
-                encoded.push_back('P');
-                p += (int)last_macro.size();
-            } else {
-                encoded.push_back(segment[p]);
-                ++p;
-            }
-        }
-    };
-
-    int action_idx = 0;
-    int i = 0;
-    while (i < n) {
-        if (action_idx < (int)normalized.size() && normalized[action_idx].start == i) {
-            int len = normalized[action_idx].len;
-            string segment = s.substr(i, len);
-            encoded.push_back('M');
-            append_segment_using_last_macro(segment);
-            encoded.push_back('M');
-            last_macro = segment;
-            has_macro = true;
-            i += len;
-            ++action_idx;
-        } else if (has_macro && !last_macro.empty() && i + (int)last_macro.size() <= n &&
-                   s.compare(i, last_macro.size(), last_macro) == 0) {
-            encoded.push_back('P');
-            i += (int)last_macro.size();
-        } else {
-            encoded.push_back(base[i]);
-            ++i;
-        }
+    vector<pair<int, int>> scored;
+    scored.reserve(orders.size());
+    for (int i = 0; i < (int)orders.size(); ++i) {
+        scored.push_back({raw_order_score(solver, orders[i]), i});
     }
 
-    return encoded;
-}
-
-int score_macro_program_actions(const vector<char> &base, const vector<MacroAction> &actions, int limit) {
-    vector<char> encoded = encode_macro_program_from_actions(base, actions);
-    if (!same_expansion(encoded, base)) return 1000000000;
-    if ((int)encoded.size() > limit) return 500000000 + (int)encoded.size() - limit;
-    return (int)encoded.size();
-}
-
-vector<char> anneal_macro_program_direct(const vector<char> &base, int limit, double time_limit_sec) {
-    const int n = (int)base.size();
-    if (n < 6 || time_limit_sec <= 0.0) return base;
-
-    vector<MacroAction> candidates = collect_macro_action_candidates(base);
-    if (candidates.empty()) return base;
-
-    auto random_action = [&]() -> MacroAction {
-        if (!candidates.empty() && rnd::get(100) < 90) {
-            return candidates[rnd::get((int)candidates.size())];
-        }
-        int start = rnd::get(n - 1);
-        int max_len = min(140, n - start);
-        int len = 2 + rnd::get(max(1, max_len - 1));
-        return MacroAction{start, len};
-    };
-
-    vector<MacroAction> current_actions;
-    int current_score = score_macro_program_actions(base, current_actions, limit);
-
-    for (int i = 0; i < min(600, (int)candidates.size()); ++i) {
-        vector<MacroAction> next_actions = current_actions;
-        next_actions.push_back(candidates[i]);
-        int next_score = score_macro_program_actions(base, next_actions, limit);
-        if (next_score < current_score) {
-            current_actions = std::move(next_actions);
-            current_score = next_score;
-        }
-    }
-
-    vector<MacroAction> best_actions = current_actions;
-    int best_score = current_score;
-
-    static double log_table[65536];
-    static bool initialized = false;
-    if (!initialized) {
-        for (int i = 0; i < 65536; ++i) {
-            log_table[i] = log((i + 0.5) / 65536.0);
-        }
-        rnd::shuffle(log_table);
-        initialized = true;
-    }
-
-    const double start_time = get_time();
-    const double T0 = 28.0;
-    const double T1 = 0.04;
-    double heat = T0;
-    int iter = 0;
-
-    while (true) {
-        if ((iter & 7) == 0) {
-            double progress = (get_time() - start_time) / time_limit_sec;
-            if (progress >= 1.0) break;
-            heat = T0 * pow(T1 / T0, progress);
-        }
-        ++iter;
-
-        vector<MacroAction> next_actions = current_actions;
-        int type = rnd::get(6);
-
-        if (type == 0 || next_actions.empty()) {
-            next_actions.push_back(random_action());
-        } else if (type == 1) {
-            int idx = rnd::get((int)next_actions.size());
-            next_actions.erase(next_actions.begin() + idx);
-        } else if (type == 2) {
-            int idx = rnd::get((int)next_actions.size());
-            next_actions[idx] = random_action();
-        } else if (type == 3) {
-            int idx = rnd::get((int)next_actions.size());
-            int delta = rnd::range(-20, 21);
-            next_actions[idx].start = max(0, min(n - 2, next_actions[idx].start + delta));
-            next_actions[idx].len = max(2, min(next_actions[idx].len, n - next_actions[idx].start));
-        } else if (type == 4) {
-            int idx = rnd::get((int)next_actions.size());
-            int delta = rnd::range(-24, 25);
-            next_actions[idx].len = max(2, min(180, next_actions[idx].len + delta));
-            next_actions[idx].len = min(next_actions[idx].len, n - next_actions[idx].start);
-        } else {
-            int remove_count = min((int)next_actions.size(), 1 + rnd::get(3));
-            for (int k = 0; k < remove_count && !next_actions.empty(); ++k) {
-                int idx = rnd::get((int)next_actions.size());
-                next_actions.erase(next_actions.begin() + idx);
-            }
-        }
-
-        while ((int)next_actions.size() > 80) {
-            int idx = rnd::get((int)next_actions.size());
-            next_actions.erase(next_actions.begin() + idx);
-        }
-
-        int next_score = score_macro_program_actions(base, next_actions, limit);
-        int delta = next_score - current_score;
-        double accept_margin = -heat * log_table[iter & 65535];
-        if (delta <= accept_margin) {
-            current_actions = std::move(next_actions);
-            current_score = next_score;
-            if (current_score < best_score) {
-                best_score = current_score;
-                best_actions = current_actions;
-            }
-        }
-    }
-
-    vector<char> encoded = encode_macro_program_from_actions(base, best_actions);
-    return encoded;
+    sort(scored.begin(), scored.end());
+    return orders[scored[0].second];
 }
 
 int expanded_basic_count(const vector<char> &encoded) {
@@ -1222,69 +927,6 @@ vector<PMacroPlacement> collect_p_macro_placements(const vector<vector<char>> &l
     }
 
     return candidates;
-}
-
-vector<char> build_program_with_p_macro(const Solver &solver, const vector<int> &order, PMacroPlacement placement) {
-    vector<char> program;
-    vector<char> macro;
-    vector<int> macro_transition;
-    bool registered = false;
-    int cell = 0;
-    int dir = 1;
-    int leg = 0;
-
-    auto append_ops = [&](const vector<char> &ops) {
-        program.insert(program.end(), ops.begin(), ops.end());
-        solver.apply_basic_ops(ops, cell, dir);
-    };
-
-    auto move_to = [&](int target) {
-        if (!registered) {
-            int end_cell, end_dir;
-            vector<char> basic = solver.basic_move_ops(cell, dir, target, end_cell, end_dir);
-
-            if (leg == placement.leg && placement.offset + placement.len <= (int)basic.size()) {
-                vector<char> prefix(basic.begin(), basic.begin() + placement.offset);
-                append_ops(prefix);
-
-                macro.assign(basic.begin() + placement.offset, basic.begin() + placement.offset + placement.len);
-                program.push_back('M');
-                program.insert(program.end(), macro.begin(), macro.end());
-                program.push_back('M');
-                solver.apply_basic_ops(macro, cell, dir);
-                macro_transition = solver.build_macro_transition(macro);
-                registered = true;
-
-                int next_cell, next_dir;
-                vector<char> rest = solver.macro_move_ops_with_transition(cell, dir, target, macro_transition, next_cell, next_dir);
-                program.insert(program.end(), rest.begin(), rest.end());
-                for (char op : rest) {
-                    if (op == 'P') solver.apply_basic_ops(macro, cell, dir);
-                    else solver.apply_basic_op(op, cell, dir);
-                }
-            } else {
-                append_ops(basic);
-            }
-        } else {
-            int next_cell, next_dir;
-            vector<char> ops = solver.macro_move_ops_with_transition(cell, dir, target, macro_transition, next_cell, next_dir);
-            program.insert(program.end(), ops.begin(), ops.end());
-            for (char op : ops) {
-                if (op == 'P') solver.apply_basic_ops(macro, cell, dir);
-                else solver.apply_basic_op(op, cell, dir);
-            }
-        }
-        ++leg;
-    };
-
-    for (int k : order) {
-        move_to(solver.ball_cell(k));
-        program.push_back('S');
-        move_to(solver.basket_cell(k));
-        program.push_back('S');
-    }
-
-    return program;
 }
 
 void apply_buttons_with_macro(const Solver &solver, const vector<char> &buttons, const vector<char> &macro, int &cell, int &dir) {
@@ -1413,93 +1055,10 @@ int score_p_macro_program(const vector<char> &program, int limit) {
     return score;
 }
 
-vector<char> anneal_p_macro_reroute(const Solver &solver, const vector<int> &order, int limit, double time_limit_sec) {
-    vector<vector<char>> legs = build_basic_movement_legs(solver, order);
-    vector<PMacroPlacement> candidates = collect_p_macro_placements(legs);
-    if (candidates.empty()) return solver.build_ops(order);
-
-    auto eval = [&](PMacroPlacement placement) {
-        vector<char> program = build_program_with_p_macro(solver, order, placement);
-        return score_p_macro_program(program, limit);
-    };
-
-    PMacroPlacement current = candidates[rnd::get((int)candidates.size())];
-    int current_score = eval(current);
-    PMacroPlacement best = current;
-    int best_score = current_score;
-
-    int warmup = min(150, (int)candidates.size());
-    for (int i = 0; i < warmup; ++i) {
-        PMacroPlacement cand = candidates[rnd::get((int)candidates.size())];
-        int score = eval(cand);
-        if (score < best_score) {
-            best = cand;
-            best_score = score;
-            current = cand;
-            current_score = score;
-        }
-    }
-
-    static double log_table[65536];
-    static bool initialized = false;
-    if (!initialized) {
-        for (int i = 0; i < 65536; ++i) log_table[i] = log((i + 0.5) / 65536.0);
-        rnd::shuffle(log_table);
-        initialized = true;
-    }
+vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int> &order, int limit, double time_limit_sec, int seed_rounds = 5, int seed_trials = 80, int max_defs = 10) {
+    if (time_limit_sec <= 0.0) return solver.build_ops(order);
 
     const double start_time = get_time();
-    const double T0 = 35.0;
-    const double T1 = 0.05;
-    double heat = T0;
-    int iter = 0;
-
-    while (true) {
-        if ((iter & 3) == 0) {
-            double progress = (get_time() - start_time) / time_limit_sec;
-            if (progress >= 1.0) break;
-            heat = T0 * pow(T1 / T0, progress);
-        }
-        ++iter;
-
-        PMacroPlacement next = current;
-        int type = rnd::get(5);
-        if (type == 0) {
-            next = candidates[rnd::get((int)candidates.size())];
-        } else if (type == 1) {
-            next.offset += rnd::range(-8, 9);
-        } else if (type == 2) {
-            next.len += rnd::range(-12, 13);
-        } else if (type == 3) {
-            next.leg += rnd::range(-3, 4);
-        } else {
-            next.leg = rnd::get((int)legs.size());
-            next.offset = legs[next.leg].empty() ? 0 : rnd::get((int)legs[next.leg].size());
-            next.len = 6 + rnd::get(115);
-        }
-
-        next.leg = max(0, min(next.leg, (int)legs.size() - 1));
-        next.offset = max(0, min(next.offset, max(0, (int)legs[next.leg].size() - 1)));
-        next.len = max(6, min(next.len, (int)legs[next.leg].size() - next.offset));
-        if (next.len < 6) continue;
-
-        int next_score = eval(next);
-        int delta = next_score - current_score;
-        double accept_margin = -heat * log_table[iter & 65535];
-        if (delta <= accept_margin) {
-            current = next;
-            current_score = next_score;
-            if (current_score < best_score) {
-                best = current;
-                best_score = current_score;
-            }
-        }
-    }
-
-    return build_program_with_p_macro(solver, order, best);
-}
-
-vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int> &order, int limit, double time_limit_sec, int seed_rounds = 5, int seed_trials = 80, int max_defs = 10) {
     vector<vector<char>> legs = build_basic_movement_legs(solver, order);
     vector<PMacroPlacement> candidates = collect_p_macro_placements(legs);
     if (candidates.empty()) return solver.build_ops(order);
@@ -1537,9 +1096,11 @@ vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int
     int current_score = eval(current_plan);
 
     for (int round = 0; round < seed_rounds; ++round) {
+        if (get_time() - start_time >= time_limit_sec) break;
         vector<PMacroPlacement> best_add_plan = current_plan;
         int best_add_score = current_score;
         for (int trial = 0; trial < seed_trials; ++trial) {
+            if (get_time() - start_time >= time_limit_sec) break;
             vector<PMacroPlacement> next_plan = current_plan;
             next_plan.push_back(random_def());
             int score = eval(next_plan);
@@ -1565,16 +1126,15 @@ vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int
         initialized = true;
     }
 
-    const double start_time = get_time();
     const double T0 = 60.0;
     const double T1 = 0.08;
     double heat = T0;
     int iter = 0;
 
     while (true) {
+        double progress = (get_time() - start_time) / time_limit_sec;
+        if (progress >= 1.0) break;
         if ((iter & 3) == 0) {
-            double progress = (get_time() - start_time) / time_limit_sec;
-            if (progress >= 1.0) break;
             heat = T0 * pow(T1 / T0, progress);
         }
         ++iter;
@@ -1643,591 +1203,6 @@ vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int
     return build_program_with_p_macro_plan(solver, order, best_plan);
 }
 
-int eval_p_macro_plan(const Solver &solver, const vector<int> &order, const vector<PMacroPlacement> &plan, int limit) {
-    vector<char> program = build_program_with_p_macro_plan(solver, order, plan);
-    return score_p_macro_program(program, limit);
-}
-
-vector<PMacroPlacement> seed_p_macro_plan(const Solver &solver, const vector<int> &order, int limit, int rounds, int trials) {
-    vector<vector<char>> legs = build_basic_movement_legs(solver, order);
-    vector<PMacroPlacement> candidates = collect_p_macro_placements(legs);
-    vector<PMacroPlacement> plan;
-    if (candidates.empty()) return plan;
-
-    auto random_def = [&]() {
-        if (rnd::get(100) < 85) return candidates[rnd::get((int)candidates.size())];
-        PMacroPlacement p;
-        p.leg = rnd::get((int)legs.size());
-        int leg_size = (int)legs[p.leg].size();
-        if (leg_size < 6) return candidates[rnd::get((int)candidates.size())];
-        p.offset = rnd::get(leg_size - 5);
-        p.len = 6 + rnd::get(min(160, leg_size - p.offset) - 5);
-        return p;
-    };
-
-    int score = eval_p_macro_plan(solver, order, plan, limit);
-    for (int round = 0; round < rounds; ++round) {
-        vector<PMacroPlacement> best_plan = plan;
-        int best_score = score;
-        for (int trial = 0; trial < trials; ++trial) {
-            vector<PMacroPlacement> next = plan;
-            next.push_back(random_def());
-            int next_score = eval_p_macro_plan(solver, order, next, limit);
-            if (next_score < best_score) {
-                best_score = next_score;
-                best_plan = std::move(next);
-            }
-        }
-        if (best_score < score) {
-            score = best_score;
-            plan = std::move(best_plan);
-        }
-    }
-    return plan;
-}
-
-vector<char> anneal_order_and_p_macro_plan(const Solver &solver, vector<int> initial_order, int limit, double time_limit_sec) {
-    if (initial_order.size() < 2) return solver.build_ops(initial_order);
-
-    vector<PMacroPlacement> current_plan = seed_p_macro_plan(solver, initial_order, limit, 3, 45);
-    vector<int> current_order = std::move(initial_order);
-    int current_score = eval_p_macro_plan(solver, current_order, current_plan, limit);
-
-    vector<int> best_order = current_order;
-    vector<PMacroPlacement> best_plan = current_plan;
-    int best_score = current_score;
-
-    static double log_table[65536];
-    static bool initialized = false;
-    if (!initialized) {
-        for (int i = 0; i < 65536; ++i) log_table[i] = log((i + 0.5) / 65536.0);
-        rnd::shuffle(log_table);
-        initialized = true;
-    }
-
-    auto random_def_loose = [&](int leg_count) {
-        PMacroPlacement p;
-        p.leg = rnd::get(leg_count);
-        p.offset = rnd::get(80);
-        p.len = 6 + rnd::get(155);
-        return p;
-    };
-
-    const double start_time = get_time();
-    const double T0 = 75.0;
-    const double T1 = 0.12;
-    double heat = T0;
-    int iter = 0;
-
-    while (true) {
-        if ((iter & 3) == 0) {
-            double progress = (get_time() - start_time) / time_limit_sec;
-            if (progress >= 1.0) break;
-            heat = T0 * pow(T1 / T0, progress);
-        }
-        ++iter;
-
-        vector<int> next_order = current_order;
-        vector<PMacroPlacement> next_plan = current_plan;
-        int leg_count = (int)next_order.size() * 2;
-        int type = rnd::get(10);
-
-        if (type == 0) {
-            int i = rnd::get((int)next_order.size());
-            int j = rnd::get((int)next_order.size() - 1);
-            if (j >= i) ++j;
-            swap(next_order[i], next_order[j]);
-        } else if (type == 1) {
-            int l = rnd::get((int)next_order.size());
-            int r = rnd::get((int)next_order.size());
-            if (l > r) swap(l, r);
-            if (l != r) reverse(next_order.begin() + l, next_order.begin() + r + 1);
-        } else if (type == 2) {
-            int i = rnd::get((int)next_order.size());
-            int j = rnd::get((int)next_order.size());
-            if (i != j) {
-                int x = next_order[i];
-                next_order.erase(next_order.begin() + i);
-                if (j > i) --j;
-                next_order.insert(next_order.begin() + j, x);
-            }
-        } else if (type == 3 || next_plan.empty()) {
-            if ((int)next_plan.size() < 10) next_plan.push_back(random_def_loose(leg_count));
-        } else if (type == 4) {
-            next_plan.erase(next_plan.begin() + rnd::get((int)next_plan.size()));
-        } else if (type == 5) {
-            int idx = rnd::get((int)next_plan.size());
-            next_plan[idx] = random_def_loose(leg_count);
-        } else if (type == 6) {
-            int idx = rnd::get((int)next_plan.size());
-            next_plan[idx].leg += rnd::range(-5, 6);
-        } else if (type == 7) {
-            int idx = rnd::get((int)next_plan.size());
-            next_plan[idx].offset += rnd::range(-20, 21);
-        } else if (type == 8) {
-            int idx = rnd::get((int)next_plan.size());
-            next_plan[idx].len += rnd::range(-36, 37);
-        } else {
-            next_plan = seed_p_macro_plan(solver, next_order, limit, 2, 24);
-        }
-
-        while ((int)next_plan.size() > 10) {
-            next_plan.erase(next_plan.begin() + rnd::get((int)next_plan.size()));
-        }
-
-        int next_score = eval_p_macro_plan(solver, next_order, next_plan, limit);
-        int delta = next_score - current_score;
-        double accept_margin = -heat * log_table[iter & 65535];
-        if (delta <= accept_margin) {
-            current_order = std::move(next_order);
-            current_plan = std::move(next_plan);
-            current_score = next_score;
-            if (current_score < best_score) {
-                best_score = current_score;
-                best_order = current_order;
-                best_plan = current_plan;
-            }
-        }
-    }
-
-    return build_program_with_p_macro_plan(solver, best_order, best_plan);
-}
-
-struct FullState {
-    int cell = 0;
-    int dir = 1;
-    int held = -1;
-    vector<int> ball_pos;
-};
-
-FullState initial_full_state(const Solver &solver) {
-    FullState st;
-    int m = solver.ball_count();
-    st.ball_pos.resize(m);
-    for (int k = 0; k < m; ++k) st.ball_pos[k] = solver.ball_cell(k);
-    return st;
-}
-
-int ball_at_cell(const FullState &st, int cell) {
-    for (int k = 0; k < (int)st.ball_pos.size(); ++k) {
-        if (st.ball_pos[k] == cell) return k;
-    }
-    return -1;
-}
-
-void apply_full_basic_op(const Solver &solver, FullState &st, char op) {
-    if (op == 'S') {
-        int on_cell = ball_at_cell(st, st.cell);
-        if (st.held == -1 && on_cell != -1) {
-            st.held = on_cell;
-            st.ball_pos[on_cell] = -1;
-        } else if (st.held != -1 && on_cell == -1) {
-            st.ball_pos[st.held] = st.cell;
-            st.held = -1;
-        } else if (st.held != -1 && on_cell != -1) {
-            st.ball_pos[st.held] = st.cell;
-            st.ball_pos[on_cell] = -1;
-            st.held = on_cell;
-        }
-    } else {
-        solver.apply_basic_op(op, st.cell, st.dir);
-    }
-}
-
-void apply_full_buttons(const Solver &solver, FullState &st, const vector<char> &buttons, const vector<char> &macro) {
-    for (char op : buttons) {
-        if (op == 'P') {
-            for (char basic : macro) apply_full_basic_op(solver, st, basic);
-        } else if (is_basic_op(op)) {
-            apply_full_basic_op(solver, st, op);
-        }
-    }
-}
-
-int normalize_order_index(const Solver &solver, const vector<int> &order, const FullState &st, int idx) {
-    while (idx < (int)order.size()) {
-        int k = order[idx];
-        if (st.held != k && st.ball_pos[k] == solver.basket_cell(k)) {
-            ++idx;
-        } else {
-            break;
-        }
-    }
-    return idx;
-}
-
-bool is_all_done(const Solver &solver, const FullState &st) {
-    if (st.held != -1) return false;
-    for (int k = 0; k < (int)st.ball_pos.size(); ++k) {
-        if (st.ball_pos[k] != solver.basket_cell(k)) return false;
-    }
-    return true;
-}
-
-int rough_remaining_cost(const Solver &solver, const vector<int> &order, const FullState &st, int idx) {
-    idx = normalize_order_index(solver, order, st, idx);
-    if (idx >= (int)order.size()) return st.held == -1 ? 0 : 1000000;
-
-    int k = order[idx];
-    int target = -1;
-    int cost = 0;
-    if (st.held == k) {
-        target = solver.basket_cell(k);
-        cost += 1;
-    } else {
-        if (st.ball_pos[k] == -1) return 1000000;
-        target = st.ball_pos[k];
-        cost += 1;
-    }
-
-    int end_cell, end_dir;
-    vector<char> path = solver.basic_move_ops(st.cell, st.dir, target, end_cell, end_dir);
-    cost += (int)path.size();
-
-    int rest_bonus = 0;
-    for (int p = idx + 1; p < (int)order.size(); ++p) {
-        int x = order[p];
-        if (st.ball_pos[x] == solver.basket_cell(x)) continue;
-        rest_bonus += 2;
-    }
-    return cost + rest_bonus;
-}
-
-bool contains_s_op(const vector<char> &ops, int l, int len) {
-    for (int i = l; i < l + len; ++i) {
-        if (ops[i] == 'S') return true;
-    }
-    return false;
-}
-
-vector<MacroAction> collect_single_s_macro_candidates(const vector<char> &base, int keep = 1400) {
-    vector<MacroAction> candidates;
-    set<pair<int, int>> seen;
-
-    auto add = [&](int start, int len) {
-        if (start < 0 || len < 4 || start + len > (int)base.size()) return;
-        if (!contains_s_op(base, start, len)) return;
-        pair<int, int> key{start, len};
-        if (seen.insert(key).second) candidates.push_back(MacroAction{start, len});
-    };
-
-    vector<MacroAction> repeated = collect_macro_action_candidates(base, 180, keep);
-    for (MacroAction x : repeated) add(x.start, x.len);
-
-    vector<int> s_pos;
-    for (int i = 0; i < (int)base.size(); ++i) {
-        if (base[i] == 'S') s_pos.push_back(i);
-    }
-
-    const vector<int> lens = {5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 56, 72, 96, 128, 160};
-    for (int p : s_pos) {
-        for (int back : {0, 1, 2, 4, 6, 8, 12, 16, 24, 32}) {
-            for (int len : lens) {
-                add(p - back, len);
-            }
-        }
-    }
-
-    while ((int)candidates.size() > keep) {
-        candidates.pop_back();
-    }
-    return candidates;
-}
-
-vector<char> build_program_with_single_s_macro(const Solver &solver, const vector<int> &order, const vector<char> &base, MacroAction action, int limit,
-                                               bool *done_out = nullptr, int *expanded_out = nullptr) {
-    vector<char> program;
-    auto finish = [&](const FullState &st) {
-        if (done_out) *done_out = is_all_done(solver, st);
-        if (expanded_out) *expanded_out = expanded_basic_count(program);
-        return program;
-    };
-
-    if (action.start < 0 || action.len <= 0 || action.start + action.len > (int)base.size()) {
-        if (done_out) *done_out = false;
-        if (expanded_out) *expanded_out = 0;
-        return program;
-    }
-
-    vector<char> macro(base.begin() + action.start, base.begin() + action.start + action.len);
-    FullState st = initial_full_state(solver);
-
-    vector<char> prefix(base.begin(), base.begin() + action.start);
-    program.insert(program.end(), prefix.begin(), prefix.end());
-    apply_full_buttons(solver, st, prefix, macro);
-
-    program.push_back('M');
-    program.insert(program.end(), macro.begin(), macro.end());
-    program.push_back('M');
-    apply_full_buttons(solver, st, macro, macro);
-
-    int idx = 0;
-    int guard = 0;
-    while (!is_all_done(solver, st) && (int)program.size() <= limit + 500 && guard < 10000) {
-        ++guard;
-        idx = normalize_order_index(solver, order, st, idx);
-        if (idx >= (int)order.size()) break;
-
-        int k = order[idx];
-        int target;
-        if (st.held == k) {
-            target = solver.basket_cell(k);
-        } else {
-            if (st.ball_pos[k] == -1) {
-                ++idx;
-                continue;
-            }
-            target = st.ball_pos[k];
-        }
-
-        if (st.cell == target) {
-            program.push_back('S');
-            apply_full_basic_op(solver, st, 'S');
-            continue;
-        }
-
-        int cur_est = rough_remaining_cost(solver, order, st, idx);
-        FullState p_state = st;
-        apply_full_buttons(solver, p_state, vector<char>{'P'}, macro);
-        int p_est = rough_remaining_cost(solver, order, p_state, idx);
-
-        if (p_est + 1 < cur_est) {
-            program.push_back('P');
-            st = std::move(p_state);
-            continue;
-        }
-
-        int end_cell, end_dir;
-        vector<char> path = solver.basic_move_ops(st.cell, st.dir, target, end_cell, end_dir);
-        if (path.empty()) break;
-        program.push_back(path[0]);
-        apply_full_basic_op(solver, st, path[0]);
-    }
-
-    return finish(st);
-}
-
-int score_single_s_macro_program(const vector<char> &program, int limit, bool done, int expanded) {
-    if (!done) return 1000000000;
-    int score = (int)program.size();
-    if (score > limit) return 900000000 + score - limit;
-    if (expanded > limit) return 800000000 + expanded - limit;
-    return score;
-}
-
-bool delivered_prefix_ok(const Solver &solver, const vector<int> &order, const FullState &st, int count) {
-    if (st.held != -1) return false;
-    for (int i = 0; i < count; ++i) {
-        int k = order[i];
-        if (st.ball_pos[k] != solver.basket_cell(k)) return false;
-    }
-    return true;
-}
-
-vector<char> build_program_with_delivery_s_macro(const Solver &solver, const vector<int> &order, int define_idx,
-                                                 bool *done_out = nullptr, int *expanded_out = nullptr) {
-    vector<char> program;
-    vector<char> macro;
-    bool registered = false;
-    bool broken = false;
-    FullState st = initial_full_state(solver);
-
-    auto finish = [&]() {
-        if (done_out) *done_out = !broken && is_all_done(solver, st);
-        if (expanded_out) *expanded_out = expanded_basic_count(program);
-        return program;
-    };
-
-    auto append_basic_ops = [&](const vector<char> &ops) {
-        program.insert(program.end(), ops.begin(), ops.end());
-        apply_full_buttons(solver, st, ops, macro);
-    };
-
-    auto normal_delivery = [&](int k) {
-        program.push_back('S');
-        apply_full_basic_op(solver, st, 'S');
-        int end_cell, end_dir;
-        vector<char> path = solver.basic_move_ops(st.cell, st.dir, solver.basket_cell(k), end_cell, end_dir);
-        append_basic_ops(path);
-        program.push_back('S');
-        apply_full_basic_op(solver, st, 'S');
-    };
-
-    for (int idx = 0; idx < (int)order.size(); ++idx) {
-        int k = order[idx];
-        if (st.ball_pos[k] == solver.basket_cell(k) && st.held != k) continue;
-        if (st.held != -1 || st.ball_pos[k] == -1) {
-            broken = true;
-            break;
-        }
-
-        int end_cell, end_dir;
-        vector<char> to_ball = solver.basic_move_ops(st.cell, st.dir, st.ball_pos[k], end_cell, end_dir);
-        append_basic_ops(to_ball);
-
-        if (idx == define_idx) {
-            vector<char> delivery;
-            delivery.push_back('S');
-            FullState tmp = st;
-            apply_full_basic_op(solver, tmp, 'S');
-
-            int ecell, edir;
-            vector<char> path = solver.basic_move_ops(tmp.cell, tmp.dir, solver.basket_cell(k), ecell, edir);
-            delivery.insert(delivery.end(), path.begin(), path.end());
-            delivery.push_back('S');
-
-            program.push_back('M');
-            program.insert(program.end(), delivery.begin(), delivery.end());
-            program.push_back('M');
-            apply_full_buttons(solver, st, delivery, macro);
-            macro = std::move(delivery);
-            registered = true;
-        } else if (registered) {
-            FullState p_state = st;
-            apply_full_buttons(solver, p_state, vector<char>{'P'}, macro);
-            if (p_state.ball_pos[k] == solver.basket_cell(k) && delivered_prefix_ok(solver, order, p_state, idx + 1)) {
-                program.push_back('P');
-                st = std::move(p_state);
-            } else {
-                normal_delivery(k);
-            }
-        } else {
-            normal_delivery(k);
-        }
-
-        if (!delivered_prefix_ok(solver, order, st, idx + 1)) {
-            broken = true;
-            break;
-        }
-    }
-
-    return finish();
-}
-
-vector<char> best_delivery_s_macro_program(const Solver &solver, const vector<int> &order, int limit) {
-    vector<char> best;
-    int best_score = 1000000000;
-
-    for (int i = 0; i < (int)order.size(); ++i) {
-        bool done = false;
-        int expanded = 0;
-        vector<char> program = build_program_with_delivery_s_macro(solver, order, i, &done, &expanded);
-        int score = score_single_s_macro_program(program, limit, done, expanded);
-        if (score < best_score) {
-            best_score = score;
-            best = std::move(program);
-        }
-    }
-
-    if (best_score >= 1000000000) return {};
-    return best;
-}
-
-vector<char> anneal_single_s_macro(const Solver &solver, const vector<int> &order, int limit, double time_limit_sec) {
-    vector<char> base = solver.build_ops(order);
-    vector<char> fallback = compress_with_single_macro(base, limit);
-    vector<char> delivery_macro = best_delivery_s_macro_program(solver, order, limit);
-    if (!delivery_macro.empty() && delivery_macro.size() < fallback.size()) fallback = std::move(delivery_macro);
-    vector<MacroAction> candidates = collect_single_s_macro_candidates(base);
-    if (candidates.empty()) return fallback;
-
-    auto eval = [&](MacroAction action) {
-        bool done = false;
-        int expanded = 0;
-        vector<char> program = build_program_with_single_s_macro(solver, order, base, action, limit, &done, &expanded);
-        return score_single_s_macro_program(program, limit, done, expanded);
-    };
-
-    MacroAction current = candidates[rnd::get((int)candidates.size())];
-    int current_score = eval(current);
-    MacroAction best = current;
-    int best_score = (int)fallback.size();
-    bool has_best_macro = false;
-
-    int warmup = min(240, (int)candidates.size());
-    for (int i = 0; i < warmup; ++i) {
-        MacroAction cand = candidates[rnd::get((int)candidates.size())];
-        int score = eval(cand);
-        if (score < best_score) {
-            best = cand;
-            best_score = score;
-            has_best_macro = true;
-            current = cand;
-            current_score = score;
-        }
-    }
-
-    if (has_best_macro && current_score >= 1000000000) {
-        current = best;
-        current_score = best_score;
-    }
-
-    static double log_table[65536];
-    static bool initialized = false;
-    if (!initialized) {
-        for (int i = 0; i < 65536; ++i) log_table[i] = log((i + 0.5) / 65536.0);
-        rnd::shuffle(log_table);
-        initialized = true;
-    }
-
-    const double start_time = get_time();
-    const double T0 = 50.0;
-    const double T1 = 0.06;
-    double heat = T0;
-    int iter = 0;
-
-    while (true) {
-        if ((iter & 3) == 0) {
-            double progress = (get_time() - start_time) / time_limit_sec;
-            if (progress >= 1.0) break;
-            heat = T0 * pow(T1 / T0, progress);
-        }
-        ++iter;
-
-        MacroAction next = current;
-        int type = rnd::get(5);
-        if (type == 0) {
-            next = candidates[rnd::get((int)candidates.size())];
-        } else if (type == 1) {
-            next.start += rnd::range(-24, 25);
-        } else if (type == 2) {
-            next.len += rnd::range(-36, 37);
-        } else if (type == 3) {
-            next.start += rnd::range(-8, 9);
-            next.len += rnd::range(-12, 13);
-        } else {
-            int s = rnd::get(max(1, (int)base.size() - 3));
-            int max_len = min(180, (int)base.size() - s);
-            int len = 4 + rnd::get(max(1, max_len - 3));
-            next = MacroAction{s, len};
-        }
-
-        next.start = max(0, min(next.start, max(0, (int)base.size() - 4)));
-        next.len = max(4, min(next.len, (int)base.size() - next.start));
-        if (!contains_s_op(base, next.start, next.len)) continue;
-
-        int next_score = eval(next);
-        int delta = next_score - current_score;
-        double accept_margin = -heat * log_table[iter & 65535];
-        if (delta <= accept_margin) {
-            current = next;
-            current_score = next_score;
-            if (current_score < best_score) {
-                best = current;
-                best_score = current_score;
-                has_best_macro = true;
-            }
-        }
-    }
-
-    if (!has_best_macro) return fallback;
-    bool done = false;
-    int expanded = 0;
-    vector<char> answer = build_program_with_single_s_macro(solver, order, base, best, limit, &done, &expanded);
-    if (!done || (int)answer.size() > limit || expanded > limit || (int)answer.size() >= (int)fallback.size()) return fallback;
-    return answer;
-}
-
 bool valid_program_for_limit(const vector<char> &program, int limit) {
     if (program.empty()) return false;
     if ((int)program.size() > limit) return false;
@@ -2235,37 +1210,29 @@ bool valid_program_for_limit(const vector<char> &program, int limit) {
     return true;
 }
 
-vector<char> anneal_multi_macro_open_s(const Solver &solver, const vector<int> &order, int limit, double time_limit_sec) {
+vector<char> solve_with_p_macro_reroute(const Solver &solver, const vector<int> &order, int limit, double time_limit_sec) {
     vector<char> raw = solver.build_ops(order);
-    vector<char> best = best_macro_compress(raw, limit, false);
-    if (!valid_program_for_limit(best, limit)) best = raw;
+    vector<char> answer = anneal_multi_p_macro_reroute(solver, order, limit, time_limit_sec, 2, 24, 10);
+    if (valid_program_for_limit(answer, limit)) return answer;
 
-    auto consider = [&](vector<char> candidate) {
-        if (!valid_program_for_limit(candidate, limit)) return;
-        if (candidate.size() < best.size()) best = std::move(candidate);
-    };
-
-    double direct_time = time_limit_sec * 0.18;
-    double reroute_time = time_limit_sec * 0.38;
-    double coanneal_time = max(0.0, time_limit_sec - direct_time - reroute_time);
-
-    consider(anneal_macro_program_direct(raw, limit, direct_time));
-    consider(anneal_multi_p_macro_reroute(solver, order, limit, reroute_time, 2, 24, 10));
-    consider(anneal_order_and_p_macro_plan(solver, order, limit, coanneal_time));
-
-    return best;
+    vector<char> fallback = best_macro_compress(raw, limit, false);
+    if (valid_program_for_limit(fallback, limit)) return fallback;
+    return raw;
 }
 
 int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
+    const double start_time = get_time();
+    constexpr double TOTAL_TIME_LIMIT = 1.70;
+
     Input in = read_input();
     Solver solver(in);
-    vector<int> greedy_order = solver.build_greedy_order();
-    vector<int> annealed_order = anneal_order_with_macro(solver, greedy_order, 0.20);
+    vector<int> order = build_light_goal_reverse_order(solver);
 
-    vector<char> answer = anneal_multi_macro_open_s(solver, annealed_order, in.T, 1.20);
+    double anneal_time = max(0.05, TOTAL_TIME_LIMIT - (get_time() - start_time));
+    vector<char> answer = solve_with_p_macro_reroute(solver, order, in.T, anneal_time);
     for (char op : answer) {
         cout << op << '\n';
     }
