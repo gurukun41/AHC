@@ -893,6 +893,15 @@ struct PMacroPlacement {
     int len = 0;
 };
 
+struct MacroContainStats {
+    int definitions = 0;
+    int contained_definitions = 0;
+    int contained_p_count = 0;
+    int encoded_saving = 0;
+    int consecutive_contained = 0;
+    int max_contained_chain = 0;
+};
+
 vector<vector<char>> build_basic_movement_legs(const Solver &solver, const vector<int> &order) {
     vector<vector<char>> legs;
     int cell = 0;
@@ -951,6 +960,38 @@ vector<char> expand_buttons_with_macro(const vector<char> &buttons, const vector
     return expanded;
 }
 
+vector<char> encode_with_previous_macro(const vector<char> &target_basic, const vector<char> &macro) {
+    const int n = (int)target_basic.size();
+    const int m = (int)macro.size();
+    if (m <= 1 || n < m) return target_basic;
+
+    vector<int> dp(n + 1, 0), use_p(n, 0);
+    dp[n] = 0;
+    for (int i = n - 1; i >= 0; --i) {
+        dp[i] = 1 + dp[i + 1];
+        if (i + m <= n && equal(macro.begin(), macro.end(), target_basic.begin() + i)) {
+            int cand = 1 + dp[i + m];
+            if (cand < dp[i]) {
+                dp[i] = cand;
+                use_p[i] = 1;
+            }
+        }
+    }
+
+    vector<char> encoded;
+    encoded.reserve(dp[0]);
+    for (int i = 0; i < n;) {
+        if (use_p[i]) {
+            encoded.push_back('P');
+            i += m;
+        } else {
+            encoded.push_back(target_basic[i]);
+            ++i;
+        }
+    }
+    return encoded;
+}
+
 vector<PMacroPlacement> normalize_p_macro_plan(vector<PMacroPlacement> plan, int leg_count) {
     sort(plan.begin(), plan.end(), [](const PMacroPlacement &lhs, const PMacroPlacement &rhs) {
         if (lhs.leg != rhs.leg) return lhs.leg < rhs.leg;
@@ -971,7 +1012,7 @@ vector<PMacroPlacement> normalize_p_macro_plan(vector<PMacroPlacement> plan, int
     return res;
 }
 
-vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<int> &order, vector<PMacroPlacement> plan) {
+vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<int> &order, vector<PMacroPlacement> plan, MacroContainStats *stats = nullptr) {
     const int leg_count = (int)order.size() * 2;
     plan = normalize_p_macro_plan(std::move(plan), leg_count);
 
@@ -983,10 +1024,21 @@ vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<
     int dir = 1;
     int leg = 0;
     int plan_idx = 0;
+    int contained_chain = 0;
 
     auto append_and_apply = [&](const vector<char> &buttons, const vector<char> &active_macro) {
         program.insert(program.end(), buttons.begin(), buttons.end());
-        apply_buttons_with_macro(solver, buttons, active_macro, cell, dir);
+        for (char op : buttons) {
+            if (op == 'P') {
+                if (!active_macro.empty()) {
+                    int next_state = macro_transition[cell * 4 + dir];
+                    cell = next_state / 4;
+                    dir = next_state % 4;
+                }
+            } else {
+                solver.apply_basic_op(op, cell, dir);
+            }
+        }
     };
 
     auto current_route = [&](int target) {
@@ -1020,13 +1072,39 @@ vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<
         vector<char> prefix(route.begin(), route.begin() + def.offset);
         append_and_apply(prefix, macro);
 
-        vector<char> definition_buttons(route.begin() + def.offset, route.begin() + def.offset + def.len);
-        vector<char> new_macro = expand_buttons_with_macro(definition_buttons, macro);
+        vector<char> raw_definition(route.begin() + def.offset, route.begin() + def.offset + def.len);
+        vector<char> new_macro = expand_buttons_with_macro(raw_definition, macro);
+        vector<char> definition_buttons = encode_with_previous_macro(new_macro, macro);
+
+        if (stats) {
+            ++stats->definitions;
+            int p_count = (int)count(definition_buttons.begin(), definition_buttons.end(), 'P');
+            if (p_count > 0) {
+                ++stats->contained_definitions;
+                stats->contained_p_count += p_count;
+                stats->encoded_saving += max(0, (int)new_macro.size() - (int)definition_buttons.size());
+                ++contained_chain;
+                stats->consecutive_contained += max(0, contained_chain - 1);
+                stats->max_contained_chain = max(stats->max_contained_chain, contained_chain);
+            } else {
+                contained_chain = 0;
+            }
+        }
 
         program.push_back('M');
         program.insert(program.end(), definition_buttons.begin(), definition_buttons.end());
         program.push_back('M');
-        apply_buttons_with_macro(solver, definition_buttons, macro, cell, dir);
+        for (char op : definition_buttons) {
+            if (op == 'P') {
+                if (!macro.empty()) {
+                    int next_state = macro_transition[cell * 4 + dir];
+                    cell = next_state / 4;
+                    dir = next_state % 4;
+                }
+            } else {
+                solver.apply_basic_op(op, cell, dir);
+            }
+        }
 
         macro = std::move(new_macro);
         macro_transition = solver.build_macro_transition(macro);
@@ -1053,6 +1131,106 @@ int score_p_macro_program(const vector<char> &program, int limit) {
     if (score > limit) score += 1000000 + score - limit;
     if (expanded > limit) score += 1000 * (expanded - limit);
     return score;
+}
+
+int score_p_macro_plan_fast(const Solver &solver, const vector<int> &order, vector<PMacroPlacement> plan, int limit) {
+    const int leg_count = (int)order.size() * 2;
+    plan = normalize_p_macro_plan(std::move(plan), leg_count);
+
+    vector<char> macro;
+    vector<int> macro_transition;
+    bool has_macro = false;
+    int cell = 0;
+    int dir = 1;
+    int leg = 0;
+    int plan_idx = 0;
+    int out_len = 0;
+    int expanded_len = 0;
+
+    auto append_and_apply = [&](const vector<char> &buttons, const vector<char> &active_macro) {
+        out_len += (int)buttons.size();
+        for (char op : buttons) {
+            if (op == 'P') {
+                expanded_len += (int)active_macro.size();
+                if (!active_macro.empty()) {
+                    int next_state = macro_transition[cell * 4 + dir];
+                    cell = next_state / 4;
+                    dir = next_state % 4;
+                }
+            } else {
+                ++expanded_len;
+                solver.apply_basic_op(op, cell, dir);
+            }
+        }
+    };
+
+    auto current_route = [&](int target) {
+        int end_cell, end_dir;
+        if (has_macro) {
+            return solver.macro_move_ops_with_transition(cell, dir, target, macro_transition, end_cell, end_dir);
+        }
+        return solver.basic_move_ops(cell, dir, target, end_cell, end_dir);
+    };
+
+    auto move_to = [&](int target) {
+        vector<char> route = current_route(target);
+
+        bool define_here = false;
+        PMacroPlacement def;
+        while (plan_idx < (int)plan.size() && plan[plan_idx].leg < leg) ++plan_idx;
+        if (plan_idx < (int)plan.size() && plan[plan_idx].leg == leg) {
+            def = plan[plan_idx];
+            if (def.offset + def.len <= (int)route.size()) define_here = true;
+            ++plan_idx;
+        }
+
+        if (!define_here) {
+            append_and_apply(route, macro);
+            ++leg;
+            return;
+        }
+
+        vector<char> prefix(route.begin(), route.begin() + def.offset);
+        append_and_apply(prefix, macro);
+
+        vector<char> raw_definition(route.begin() + def.offset, route.begin() + def.offset + def.len);
+        vector<char> new_macro = expand_buttons_with_macro(raw_definition, macro);
+        vector<char> definition_buttons = encode_with_previous_macro(new_macro, macro);
+
+        out_len += 2;
+        append_and_apply(definition_buttons, macro);
+
+        macro = std::move(new_macro);
+        macro_transition = solver.build_macro_transition(macro);
+        has_macro = true;
+
+        vector<char> rest = current_route(target);
+        append_and_apply(rest, macro);
+        ++leg;
+    };
+
+    for (int k : order) {
+        move_to(solver.ball_cell(k));
+        ++out_len;
+        ++expanded_len;
+        move_to(solver.basket_cell(k));
+        ++out_len;
+        ++expanded_len;
+    }
+
+    int score = out_len;
+    if (out_len > limit) score += 1000000 + out_len - limit;
+    if (expanded_len > limit) score += 1000 * (expanded_len - limit);
+    return score;
+}
+
+int macro_containment_bonus(const MacroContainStats &stats) {
+    int bonus = 0;
+    bonus += 3 * stats.contained_definitions;
+    bonus += stats.contained_p_count;
+    bonus += 5 * stats.consecutive_contained;
+    bonus += 8 * stats.max_contained_chain;
+    return min(31, bonus);
 }
 
 vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int> &order, int limit, double time_limit_sec, int seed_rounds = 5, int seed_trials = 80, int max_defs = 10) {
@@ -1088,8 +1266,7 @@ vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int
     };
 
     auto eval = [&](const vector<PMacroPlacement> &plan) {
-        vector<char> program = build_program_with_p_macro_plan(solver, order, plan);
-        return score_p_macro_program(program, limit);
+        return score_p_macro_plan_fast(solver, order, plan, limit);
     };
 
     vector<PMacroPlacement> current_plan;
@@ -1200,7 +1377,17 @@ vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int
         }
     }
 
-    return build_program_with_p_macro_plan(solver, order, best_plan);
+    MacroContainStats stats;
+    vector<char> answer = build_program_with_p_macro_plan(solver, order, best_plan, &stats);
+    cerr << "p_macro_contain defs=" << stats.definitions
+         << " contained_defs=" << stats.contained_definitions
+         << " p_count=" << stats.contained_p_count
+         << " saving=" << stats.encoded_saving
+         << " chain=" << stats.max_contained_chain
+         << " bonus=" << macro_containment_bonus(stats)
+         << " iter=" << iter
+         << '\n';
+    return answer;
 }
 
 bool valid_program_for_limit(const vector<char> &program, int limit) {
