@@ -86,6 +86,7 @@ class Solver {
             ball_id[k] = id(in.ball[k]);
             basket_id[k] = id(in.basket[k]);
         }
+        build_neighbor_table();
         build_shortest_paths();
     }
 
@@ -158,7 +159,8 @@ class Solver {
         } else if (op == 'L') {
             dir = (dir + 3) % 4;
         } else if (op == 'F') {
-            if (can_move(cell, dir)) cell = neighbor(cell, dir);
+            int nxt = next_cell[cell][dir];
+            if (nxt != -1) cell = nxt;
         }
     }
 
@@ -194,32 +196,41 @@ class Solver {
             return cell * 4 + dir;
         };
 
-        vector<int> dist(states, -1), prev_state(states, -1);
-        vector<char> prev_op(states, 0);
-        queue<int> q;
+        ensure_macro_bfs_buffers(states);
+        fill(macro_bfs_dist.begin(), macro_bfs_dist.end(), -1);
 
         int start = sid(from, from_dir);
-        dist[start] = 0;
-        q.push(start);
+        macro_bfs_dist[start] = 0;
+        int q_head = 0;
+        int q_tail = 0;
+        macro_bfs_queue[q_tail++] = start;
+        int goal = -1;
 
         auto push_next = [&](int cur_state, int next_cell, int next_dir, char op) {
             int ns = sid(next_cell, next_dir);
-            if (ns == cur_state || dist[ns] != -1) return;
-            dist[ns] = dist[cur_state] + 1;
-            prev_state[ns] = cur_state;
-            prev_op[ns] = op;
-            q.push(ns);
+            if (ns == cur_state || macro_bfs_dist[ns] != -1) return;
+            macro_bfs_dist[ns] = macro_bfs_dist[cur_state] + 1;
+            macro_bfs_prev[ns] = cur_state;
+            macro_bfs_op[ns] = op;
+            macro_bfs_queue[q_tail++] = ns;
         };
 
-        while (!q.empty()) {
-            int cur_state = q.front();
-            q.pop();
+        while (q_head < q_tail) {
+            int cur_state = macro_bfs_queue[q_head++];
             int cell = cur_state / 4;
             int dir = cur_state % 4;
+            if (cell == to) {
+                if (goal == -1 || macro_bfs_dist[cur_state] < macro_bfs_dist[goal] ||
+                    (macro_bfs_dist[cur_state] == macro_bfs_dist[goal] && dir < goal % 4)) {
+                    goal = cur_state;
+                }
+                continue;
+            }
+            if (goal != -1 && macro_bfs_dist[cur_state] >= macro_bfs_dist[goal]) continue;
 
             push_next(cur_state, cell, (dir + 1) % 4, 'R');
             push_next(cur_state, cell, (dir + 3) % 4, 'L');
-            if (can_move(cell, dir)) push_next(cur_state, neighbor(cell, dir), dir, 'F');
+            if (next_cell[cell][dir] != -1) push_next(cur_state, next_cell[cell][dir], dir, 'F');
 
             if (!macro_transition.empty()) {
                 int next_state = macro_transition[cur_state];
@@ -227,19 +238,14 @@ class Solver {
             }
         }
 
-        int goal = -1;
-        for (int dir = 0; dir < 4; ++dir) {
-            int s = sid(to, dir);
-            if (dist[s] != -1 && (goal == -1 || dist[s] < dist[goal])) goal = s;
-        }
-
         vector<char> ops;
         if (goal == -1) {
             return basic_move_ops(from, from_dir, to, end_cell, end_dir);
         }
 
-        for (int cur = goal; cur != start; cur = prev_state[cur]) {
-            ops.push_back(prev_op[cur]);
+        ops.reserve(macro_bfs_dist[goal]);
+        for (int cur = goal; cur != start; cur = macro_bfs_prev[cur]) {
+            ops.push_back(macro_bfs_op[cur]);
         }
         reverse(ops.begin(), ops.end());
         end_cell = goal / 4;
@@ -267,7 +273,12 @@ class Solver {
     int total = 0;
     vector<int> ball_id;
     vector<int> basket_id;
+    vector<array<int, 4>> next_cell;
     vector<vector<int>> first_dir;
+    mutable vector<int> macro_bfs_dist;
+    mutable vector<int> macro_bfs_prev;
+    mutable vector<int> macro_bfs_queue;
+    mutable vector<char> macro_bfs_op;
 
     int id(Pos p) const {
         return p.r * in.N + p.c;
@@ -278,20 +289,39 @@ class Solver {
     }
 
     bool can_move(int cell, int dir) const {
-        Pos p = pos(cell);
-        int nr = p.r + DR[dir];
-        int nc = p.c + DC[dir];
-        if (nr < 0 || nr >= in.N || nc < 0 || nc >= in.N) return false;
-
-        if (dir == UP) return in.h[p.r - 1][p.c] == '0';
-        if (dir == DOWN) return in.h[p.r][p.c] == '0';
-        if (dir == LEFT) return in.v[p.r][p.c - 1] == '0';
-        return in.v[p.r][p.c] == '0';
+        return next_cell[cell][dir] != -1;
     }
 
     int neighbor(int cell, int dir) const {
-        Pos p = pos(cell);
-        return id(Pos{p.r + DR[dir], p.c + DC[dir]});
+        return next_cell[cell][dir];
+    }
+
+    void ensure_macro_bfs_buffers(int states) const {
+        if ((int)macro_bfs_dist.size() == states) return;
+        macro_bfs_dist.resize(states);
+        macro_bfs_prev.resize(states);
+        macro_bfs_queue.resize(states);
+        macro_bfs_op.resize(states);
+    }
+
+    void build_neighbor_table() {
+        next_cell.assign(total, array<int, 4>{});
+        for (int cell = 0; cell < total; ++cell) {
+            Pos p = pos(cell);
+            for (int dir = 0; dir < 4; ++dir) {
+                int nr = p.r + DR[dir];
+                int nc = p.c + DC[dir];
+                next_cell[cell][dir] = -1;
+                if (nr < 0 || nr >= in.N || nc < 0 || nc >= in.N) continue;
+
+                bool open = false;
+                if (dir == UP) open = in.h[p.r - 1][p.c] == '0';
+                if (dir == DOWN) open = in.h[p.r][p.c] == '0';
+                if (dir == LEFT) open = in.v[p.r][p.c - 1] == '0';
+                if (dir == RIGHT) open = in.v[p.r][p.c] == '0';
+                if (open) next_cell[cell][dir] = id(Pos{nr, nc});
+            }
+        }
     }
 
     void build_shortest_paths() {
@@ -320,18 +350,6 @@ class Solver {
         }
     }
 
-    vector<int> path_dirs(int from, int to) const {
-        vector<int> path;
-        int cur = from;
-        while (cur != to) {
-            int dir = first_dir[cur][to];
-            if (dir == -1) break;
-            path.push_back(dir);
-            cur = neighbor(cur, dir);
-        }
-        return path;
-    }
-
     static void append_turns(int next_dir, int &cur_dir, vector<char> &ops) {
         int diff = (next_dir - cur_dir + 4) % 4;
         if (diff == 1) {
@@ -346,10 +364,13 @@ class Solver {
     }
 
     void append_path(int from, int to, int &dir, vector<char> &ops) const {
-        vector<int> path = path_dirs(from, to);
-        for (int next_dir : path) {
+        int cur = from;
+        while (cur != to) {
+            int next_dir = first_dir[cur][to];
+            if (next_dir == -1) break;
             append_turns(next_dir, dir, ops);
             ops.push_back('F');
+            cur = neighbor(cur, next_dir);
         }
     }
 
@@ -1133,7 +1154,7 @@ int score_p_macro_program(const vector<char> &program, int limit) {
     return score;
 }
 
-int score_p_macro_plan_fast(const Solver &solver, const vector<int> &order, vector<PMacroPlacement> plan, int limit) {
+int score_p_macro_plan_fast(const Solver &solver, const vector<int> &order, vector<PMacroPlacement> plan, int limit, int cutoff = numeric_limits<int>::max() / 4) {
     const int leg_count = (int)order.size() * 2;
     plan = normalize_p_macro_plan(std::move(plan), leg_count);
 
@@ -1146,6 +1167,17 @@ int score_p_macro_plan_fast(const Solver &solver, const vector<int> &order, vect
     int plan_idx = 0;
     int out_len = 0;
     int expanded_len = 0;
+
+    auto current_score_value = [&]() {
+        int score = out_len;
+        if (out_len > limit) score += 1000000 + out_len - limit;
+        if (expanded_len > limit) score += 1000 * (expanded_len - limit);
+        return score;
+    };
+
+    auto exceeded_cutoff = [&]() {
+        return current_score_value() > cutoff;
+    };
 
     auto append_and_apply = [&](const vector<char> &buttons, const vector<char> &active_macro) {
         out_len += (int)buttons.size();
@@ -1211,17 +1243,18 @@ int score_p_macro_plan_fast(const Solver &solver, const vector<int> &order, vect
 
     for (int k : order) {
         move_to(solver.ball_cell(k));
+        if (exceeded_cutoff()) return cutoff + 1;
         ++out_len;
         ++expanded_len;
+        if (exceeded_cutoff()) return cutoff + 1;
         move_to(solver.basket_cell(k));
+        if (exceeded_cutoff()) return cutoff + 1;
         ++out_len;
         ++expanded_len;
+        if (exceeded_cutoff()) return cutoff + 1;
     }
 
-    int score = out_len;
-    if (out_len > limit) score += 1000000 + out_len - limit;
-    if (expanded_len > limit) score += 1000 * (expanded_len - limit);
-    return score;
+    return current_score_value();
 }
 
 int macro_containment_bonus(const MacroContainStats &stats) {
@@ -1265,8 +1298,8 @@ vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int
         return p;
     };
 
-    auto eval = [&](const vector<PMacroPlacement> &plan) {
-        return score_p_macro_plan_fast(solver, order, plan, limit);
+    auto eval = [&](const vector<PMacroPlacement> &plan, int cutoff = numeric_limits<int>::max() / 4) {
+        return score_p_macro_plan_fast(solver, order, plan, limit, cutoff);
     };
 
     vector<PMacroPlacement> current_plan;
@@ -1280,7 +1313,7 @@ vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int
             if (get_time() - start_time >= time_limit_sec) break;
             vector<PMacroPlacement> next_plan = current_plan;
             next_plan.push_back(random_def());
-            int score = eval(next_plan);
+            int score = eval(next_plan, best_add_score - 1);
             if (score < best_add_score) {
                 best_add_score = score;
                 best_add_plan = std::move(next_plan);
@@ -1364,9 +1397,10 @@ vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int
             next_plan.erase(next_plan.begin() + rnd::get((int)next_plan.size()));
         }
 
-        int next_score = eval(next_plan);
-        int delta = next_score - current_score;
         double accept_margin = -heat * log_table[iter & 65535];
+        int accept_cutoff = current_score + (int)floor(accept_margin);
+        int next_score = eval(next_plan, accept_cutoff);
+        int delta = next_score - current_score;
         if (delta <= accept_margin) {
             current_plan = std::move(next_plan);
             current_score = next_score;
