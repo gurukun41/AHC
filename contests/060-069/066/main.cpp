@@ -1313,9 +1313,19 @@ vector<int> build_basic_leg_lengths(const Solver &solver, const vector<int> &ord
     return leg_len;
 }
 
-MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, MacroSite s,
-                            const vector<int> *pos_ptr = nullptr,
-                            const vector<int> *leg_len_ptr = nullptr) {
+struct OrderContext {
+    vector<int> pos;
+    vector<int> basic_leg_len;
+};
+
+OrderContext build_order_context(const Solver &solver, const vector<int> &order) {
+    OrderContext ctx;
+    ctx.pos = build_pos_in_order(order, solver.ball_count());
+    ctx.basic_leg_len = build_basic_leg_lengths(solver, order);
+    return ctx;
+}
+
+MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, const OrderContext &ctx, MacroSite s) {
     const int m = solver.ball_count();
     if (m <= 0 || order.empty()) {
         s.ball = 0;
@@ -1328,35 +1338,21 @@ MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, Macr
     s.ball = max(0, min(s.ball, m - 1));
     s.phase = s.phase & 1;
 
-    vector<int> pos_storage;
-    const vector<int> *pos = pos_ptr;
-    if (!pos) {
-        pos_storage = build_pos_in_order(order, m);
-        pos = &pos_storage;
-    }
-
-    int p = (*pos)[s.ball];
+    int p = ctx.pos[s.ball];
     if (p < 0) {
         s.offset = 0;
         s.len = 0;
         return s;
     }
 
-    vector<int> leg_len_storage;
-    const vector<int> *leg_len = leg_len_ptr;
-    if (!leg_len) {
-        leg_len_storage = build_basic_leg_lengths(solver, order);
-        leg_len = &leg_len_storage;
-    }
-
     int leg = p * 2 + s.phase;
-    if (leg < 0 || leg >= (int)leg_len->size() || (*leg_len)[leg] < 6) {
+    if (leg < 0 || leg >= (int)ctx.basic_leg_len.size() || ctx.basic_leg_len[leg] < 6) {
         s.offset = 0;
         s.len = 0;
         return s;
     }
 
-    const int L = (*leg_len)[leg];
+    const int L = ctx.basic_leg_len[leg];
     s.offset = max(0, min(s.offset, L - 6));
     int max_len = min(160, L - s.offset);
     if (max_len < 6) {
@@ -1367,12 +1363,14 @@ MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, Macr
     return s;
 }
 
-void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &order, vector<MacroSite> &sites, int max_defs) {
-    const int m = solver.ball_count();
-    vector<int> pos = build_pos_in_order(order, m);
-    vector<int> leg_len = build_basic_leg_lengths(solver, order);
+MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, MacroSite s) {
+    OrderContext ctx = build_order_context(solver, order);
+    return repair_macro_site(solver, order, ctx, s);
+}
 
-    for (MacroSite &s : sites) s = repair_macro_site(solver, order, s, &pos, &leg_len);
+void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &order, const OrderContext &ctx,
+                                   vector<MacroSite> &sites, int max_defs) {
+    for (MacroSite &s : sites) s = repair_macro_site(solver, order, ctx, s);
     sites.erase(remove_if(sites.begin(), sites.end(), [](const MacroSite &s) {
                     return s.len < 6;
                 }),
@@ -1394,34 +1392,71 @@ void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &orde
     }
 }
 
-vector<PMacroPlacement> convert_sites_to_plan(const Solver &solver, const vector<int> &order, vector<MacroSite> sites) {
-    const int m = solver.ball_count();
-    vector<int> pos = build_pos_in_order(order, m);
-    vector<int> leg_len = build_basic_leg_lengths(solver, order);
+void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &order, vector<MacroSite> &sites, int max_defs) {
+    OrderContext ctx = build_order_context(solver, order);
+    normalize_macro_sites_inplace(solver, order, ctx, sites, max_defs);
+}
 
+vector<PMacroPlacement> convert_sites_to_plan(const Solver &solver, const vector<int> &order,
+                                              const OrderContext &ctx, const vector<MacroSite> &sites) {
     vector<PMacroPlacement> plan;
     plan.reserve(sites.size());
 
     for (MacroSite s : sites) {
-        s = repair_macro_site(solver, order, s, &pos, &leg_len);
+        s = repair_macro_site(solver, order, ctx, s);
         if (s.len < 6) continue;
-        int p = pos[s.ball];
+        int p = ctx.pos[s.ball];
         if (p < 0) continue;
         plan.push_back(PMacroPlacement{p * 2 + s.phase, s.offset, s.len});
     }
     return plan;
 }
 
-MacroSite random_macro_site(const Solver &solver, const vector<int> &order) {
+vector<PMacroPlacement> convert_sites_to_plan(const Solver &solver, const vector<int> &order, const vector<MacroSite> &sites) {
+    OrderContext ctx = build_order_context(solver, order);
+    return convert_sites_to_plan(solver, order, ctx, sites);
+}
+
+// normalize_macro_sites_inplace() 済みの sites を PMacroPlacement に変換する軽量版。
+// repair_macro_site() をここで再実行しないことで、評価時の重複計算を避ける。
+vector<PMacroPlacement> convert_sites_to_plan_no_repair(const vector<int> &order,
+                                                        const OrderContext &ctx,
+                                                        const vector<MacroSite> &sites) {
+    (void)order;
+    vector<PMacroPlacement> plan;
+    plan.reserve(sites.size());
+
+    for (const MacroSite &s : sites) {
+        if (s.len < 6) continue;
+        if (s.phase < 0 || s.phase > 1) continue;
+        if (s.ball < 0 || s.ball >= (int)ctx.pos.size()) continue;
+
+        int p = ctx.pos[s.ball];
+        if (p < 0) continue;
+        plan.push_back(PMacroPlacement{p * 2 + s.phase, s.offset, s.len});
+    }
+
+    // order が変わると ball 順と leg 順は一致しないので、既存処理に渡す前に leg 順へ整える。
+    sort(plan.begin(), plan.end(), [](const PMacroPlacement &lhs, const PMacroPlacement &rhs) {
+        if (lhs.leg != rhs.leg) return lhs.leg < rhs.leg;
+        if (lhs.offset != rhs.offset) return lhs.offset < rhs.offset;
+        return lhs.len > rhs.len;
+    });
+
+    return plan;
+}
+
+
+MacroSite random_macro_site(const Solver &solver, const vector<int> &order, const OrderContext &ctx) {
+    (void)solver;
     static const vector<int> lens = {6, 8, 10, 12, 16, 20, 24, 32, 40, 56, 72, 96, 120};
     const int m = (int)order.size();
-    vector<int> leg_len = build_basic_leg_lengths(solver, order);
 
     for (int trial = 0; trial < 30; ++trial) {
         int leg = rnd::get(max(1, 2 * m));
-        if (leg >= (int)leg_len.size() || leg_len[leg] < 6) continue;
+        if (leg >= (int)ctx.basic_leg_len.size() || ctx.basic_leg_len[leg] < 6) continue;
 
-        int L = leg_len[leg];
+        int L = ctx.basic_leg_len[leg];
         MacroSite s;
         s.ball = order[leg / 2];
         s.phase = leg & 1;
@@ -1444,6 +1479,24 @@ MacroSite random_macro_site(const Solver &solver, const vector<int> &order) {
     s.offset = 0;
     s.len = 0;
     return s;
+}
+
+MacroSite random_macro_site(const Solver &solver, const vector<int> &order) {
+    OrderContext ctx = build_order_context(solver, order);
+    return random_macro_site(solver, order, ctx);
+}
+
+int sample_weighted_type(const array<int, 8> &weights) {
+    int total = 0;
+    for (int w : weights) total += w;
+    if (total <= 0) return rnd::get(8);
+
+    int x = rnd::get(total);
+    for (int i = 0; i < 8; ++i) {
+        if (x < weights[i]) return i;
+        x -= weights[i];
+    }
+    return 7;
 }
 
 void mutate_order_inplace(vector<int> &order, int type) {
@@ -1799,9 +1852,16 @@ struct PlanEvalCache {
     long long info_misses = 0;
     long long ops_hits = 0;
     long long ops_misses = 0;
+    int trim_counter = 0;
+
+    void reserve_memory() {
+        info_cache.reserve(300000);
+        ops_cache.reserve(80000);
+    }
 
     void trim_if_needed() {
-        // キャッシュ肥大化で逆に遅くなるのを防ぐ。大きめに取って、通常は消さない。
+        if (((++trim_counter) & 16383) != 0) return;
+
         if (info_cache.size() > 300000) {
             info_cache.clear();
         }
@@ -1996,24 +2056,27 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
     if (initial_order.empty()) return solver.build_ops(initial_order);
 
     PlanEvalCache eval_cache;
+    //eval_cache.reserve_memory();
 
-    auto eval = [&](const vector<int> &ord, const vector<MacroSite> &sites,
+    auto eval = [&](const vector<int> &ord, const OrderContext &ctx, const vector<MacroSite> &sites,
                     int cutoff = numeric_limits<int>::max() / 4) {
-        vector<PMacroPlacement> plan = convert_sites_to_plan(solver, ord, sites);
+        vector<PMacroPlacement> plan = convert_sites_to_plan_no_repair(ord, ctx, sites);
         return score_p_macro_plan_fast(solver, ord, plan, limit, cutoff, &eval_cache);
     };
 
-    auto build_answer = [&](const vector<int> &ord, const vector<MacroSite> &sites, MacroContainStats *stats) {
-        vector<PMacroPlacement> plan = convert_sites_to_plan(solver, ord, sites);
+    auto build_answer = [&](const vector<int> &ord, const OrderContext &ctx,
+                            const vector<MacroSite> &sites, MacroContainStats *stats) {
+        vector<PMacroPlacement> plan = convert_sites_to_plan_no_repair(ord, ctx, sites);
         return build_program_with_p_macro_plan(solver, ord, plan, stats);
     };
 
     vector<int> current_order = initial_order;
+    OrderContext current_ctx = build_order_context(solver, current_order);
     vector<MacroSite> current_sites;
-    int current_score = eval(current_order, current_sites);
+    int current_score = eval(current_order, current_ctx, current_sites);
 
     // まずは現在の order に対して、良いマクロ定義を少しだけ貪欲に足す。
-    // ここは order 変更前の初期足場を作るだけなので、試行回数は控えめにしている。
+    // current_ctx を使い回して、pos / leg 長の再計算を避ける。
     for (int round = 0; round < seed_rounds; ++round) {
         if (get_time() - start_time >= time_limit_sec) break;
 
@@ -2024,12 +2087,12 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
             if (get_time() - start_time >= time_limit_sec) break;
 
             vector<MacroSite> next_sites = current_sites;
-            MacroSite s = random_macro_site(solver, current_order);
+            MacroSite s = random_macro_site(solver, current_order, current_ctx);
             if (s.len < 6) continue;
             next_sites.push_back(s);
-            normalize_macro_sites_inplace(solver, current_order, next_sites, max_defs);
+            normalize_macro_sites_inplace(solver, current_order, current_ctx, next_sites, max_defs);
 
-            int score = eval(current_order, next_sites, best_add_score - 1);
+            int score = eval(current_order, current_ctx, next_sites, best_add_score - 1);
             if (score < best_add_score) {
                 best_add_score = score;
                 best_add_sites = std::move(next_sites);
@@ -2043,6 +2106,7 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
     }
 
     vector<int> best_order = current_order;
+    OrderContext best_ctx = current_ctx;
     vector<MacroSite> best_sites = current_sites;
     int best_score = current_score;
 
@@ -2061,6 +2125,11 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
     int order_mutations = 0;
     int macro_mutations = 0;
     int accepted_order_mutations = 0;
+    int accepted_macro_mutations = 0;
+    array<int, 8> order_type_attempt{};
+    array<int, 8> order_type_accept{};
+    array<int, 8> macro_type_attempt{};
+    array<int, 8> macro_type_accept{};
 
     while (true) {
         double progress = (get_time() - start_time) / time_limit_sec;
@@ -2068,17 +2137,47 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
         if ((iter & 3) == 0) heat = T0 * pow(T1 / T0, progress);
         ++iter;
 
-        vector<int> next_order = current_order;
         vector<MacroSite> next_sites = current_sites;
+        vector<int> next_order_storage;
+        OrderContext next_ctx_storage;
+        const vector<int> *next_order = &current_order;
+        const OrderContext *next_ctx = &current_ctx;
         bool touched_order = false;
 
-        int type = rnd::get(16);
+        static constexpr array<int, 8> ORDER_TYPE_WEIGHT = {
+            10,  // 0: swap
+            12,  // 1: insert
+            8,   // 2: reverse
+            18,  // 3: block insert
+            26,  // 4: block swap
+            6,   // 5: swap + site削除の可能性あり
+            14,  // 6: insert + macro追加の可能性あり
+            6,   // 7: reverse + site間引き
+        };
+        static constexpr array<int, 8> MACRO_TYPE_WEIGHT = {
+            16,  // 0: macro追加
+            6,   // 1: macro削除
+            10,  // 2: macro置換
+            9,   // 3: ball/phase変更
+            18,  // 4: offset変更
+            18,  // 5: len変更
+            5,   // 6: 複数macro置換
+            18,  // 7: shuffle + 削除/追加
+        };
 
-        if (type <= 7) {
+        int type = -1;
+        int order_type = -1;
+        int macro_type = -1;
+        const bool choose_macro = rnd::get(2) == 0;
+
+        if (choose_macro) {
+            macro_type = sample_weighted_type(MACRO_TYPE_WEIGHT);
+            type = macro_type;
             ++macro_mutations;
+            ++macro_type_attempt[macro_type];
             if (type == 0 || next_sites.empty()) {
                 if ((int)next_sites.size() < max_defs) {
-                    MacroSite s = random_macro_site(solver, next_order);
+                    MacroSite s = random_macro_site(solver, *next_order, *next_ctx);
                     if (s.len >= 6) next_sites.push_back(s);
                 }
             } else if (type == 1) {
@@ -2086,11 +2185,11 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
                 next_sites.erase(next_sites.begin() + idx);
             } else if (type == 2) {
                 int idx = rnd::get((int)next_sites.size());
-                MacroSite s = random_macro_site(solver, next_order);
+                MacroSite s = random_macro_site(solver, *next_order, *next_ctx);
                 if (s.len >= 6) next_sites[idx] = s;
             } else if (type == 3) {
                 int idx = rnd::get((int)next_sites.size());
-                next_sites[idx].ball = next_order[rnd::get((int)next_order.size())];
+                next_sites[idx].ball = (*next_order)[rnd::get((int)next_order->size())];
                 next_sites[idx].phase ^= rnd::get(2);
             } else if (type == 4) {
                 int idx = rnd::get((int)next_sites.size());
@@ -2102,7 +2201,7 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
                 int cnt = min(3, max(1, (int)next_sites.size()));
                 for (int i = 0; i < cnt; ++i) {
                     int idx = rnd::get((int)next_sites.size());
-                    MacroSite s = random_macro_site(solver, next_order);
+                    MacroSite s = random_macro_site(solver, *next_order, *next_ctx);
                     if (s.len >= 6) next_sites[idx] = s;
                 }
             } else {
@@ -2111,67 +2210,84 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
                     next_sites.erase(next_sites.begin() + rnd::get((int)next_sites.size()));
                 }
                 while ((int)next_sites.size() < max_defs && rnd::get(100) < 55) {
-                    MacroSite s = random_macro_site(solver, next_order);
+                    MacroSite s = random_macro_site(solver, *next_order, *next_ctx);
                     if (s.len >= 6) next_sites.push_back(s);
                 }
             }
         } else {
+            order_type = sample_weighted_type(ORDER_TYPE_WEIGHT);
+            type = 8 + order_type;
             ++order_mutations;
+            ++order_type_attempt[order_type];
             touched_order = true;
+            next_order_storage = current_order;
 
-            if (type == 8) {
-                mutate_order_inplace(next_order, 0);  // swap
-            } else if (type == 9) {
-                mutate_order_inplace(next_order, 1);  // insert
-            } else if (type == 10) {
-                mutate_order_inplace(next_order, 2);  // reverse
-            } else if (type == 11) {
-                mutate_order_inplace(next_order, 3);  // block insert
-            } else if (type == 12) {
-                mutate_order_inplace(next_order, 4);  // block swap
-            } else if (type == 13) {
-                mutate_order_inplace(next_order, 0);
+            if (order_type == 0) {
+                mutate_order_inplace(next_order_storage, 0);  // swap
+            } else if (order_type == 1) {
+                mutate_order_inplace(next_order_storage, 1);  // insert
+            } else if (order_type == 2) {
+                mutate_order_inplace(next_order_storage, 2);  // reverse
+            } else if (order_type == 3) {
+                mutate_order_inplace(next_order_storage, 3);  // block insert
+            } else if (order_type == 4) {
+                mutate_order_inplace(next_order_storage, 4);  // block swap
+            } else if (order_type == 5) {
+                mutate_order_inplace(next_order_storage, 0);
                 if (!next_sites.empty() && rnd::get(100) < 35) {
                     next_sites.erase(next_sites.begin() + rnd::get((int)next_sites.size()));
                 }
-            } else if (type == 14) {
-                mutate_order_inplace(next_order, 1);
-                if ((int)next_sites.size() < max_defs) {
-                    MacroSite s = random_macro_site(solver, next_order);
-                    if (s.len >= 6) next_sites.push_back(s);
-                }
+            } else if (order_type == 6) {
+                mutate_order_inplace(next_order_storage, 1);
             } else {
-                mutate_order_inplace(next_order, 2);
+                mutate_order_inplace(next_order_storage, 2);
                 // 大きめの order 変更時は、古い offset が合わないことが多いので少し間引く。
                 while (!next_sites.empty() && rnd::get(100) < 30) {
                     next_sites.erase(next_sites.begin() + rnd::get((int)next_sites.size()));
                 }
             }
+
+            next_ctx_storage = build_order_context(solver, next_order_storage);
+            next_order = &next_order_storage;
+            next_ctx = &next_ctx_storage;
+
+            if (order_type == 6 && (int)next_sites.size() < max_defs) {
+                MacroSite s = random_macro_site(solver, *next_order, *next_ctx);
+                if (s.len >= 6) next_sites.push_back(s);
+            }
         }
 
-        normalize_macro_sites_inplace(solver, next_order, next_sites, max_defs);
+        normalize_macro_sites_inplace(solver, *next_order, *next_ctx, next_sites, max_defs);
 
         double accept_margin = -heat * log_table[iter & 65535];
         int accept_cutoff = current_score + (int)floor(accept_margin);
-        int next_score = eval(next_order, next_sites, accept_cutoff);
+        int next_score = eval(*next_order, *next_ctx, next_sites, accept_cutoff);
         int delta = next_score - current_score;
 
         if (delta <= accept_margin) {
-            current_order = std::move(next_order);
+            if (touched_order) {
+                current_order = std::move(next_order_storage);
+                current_ctx = std::move(next_ctx_storage);
+                ++accepted_order_mutations;
+                if (order_type >= 0) ++order_type_accept[order_type];
+            } else {
+                ++accepted_macro_mutations;
+                if (macro_type >= 0) ++macro_type_accept[macro_type];
+            }
             current_sites = std::move(next_sites);
             current_score = next_score;
-            if (touched_order) ++accepted_order_mutations;
 
             if (current_score < best_score) {
                 best_score = current_score;
                 best_order = current_order;
+                best_ctx = current_ctx;
                 best_sites = current_sites;
             }
         }
     }
 
     MacroContainStats stats;
-    vector<char> answer = build_answer(best_order, best_sites, &stats);
+    vector<char> answer = build_answer(best_order, best_ctx, best_sites, &stats);
     cerr << "joint_order_macro"
          << " initial_raw=" << raw_order_score(solver, initial_order)
          << " best_score=" << best_score
@@ -2184,10 +2300,32 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
          << " bonus=" << macro_containment_bonus(stats)
          << " iter=" << iter
          << " order_mut=" << accepted_order_mutations << "/" << order_mutations
-         << " macro_mut=" << macro_mutations
+         << " macro_mut=" << accepted_macro_mutations << "/" << macro_mutations
          << " route_info_cache=" << eval_cache.info_hits << "/" << (eval_cache.info_hits + eval_cache.info_misses)
          << " route_ops_cache=" << eval_cache.ops_hits << "/" << (eval_cache.ops_hits + eval_cache.ops_misses)
          << '\n';
+
+    cerr << "order_type_attempt=";
+    for (int i = 0; i < 8; ++i) {
+        if (i) cerr << ',';
+        cerr << order_type_attempt[i];
+    }
+    cerr << " order_type_accept=";
+    for (int i = 0; i < 8; ++i) {
+        if (i) cerr << ',';
+        cerr << order_type_accept[i];
+    }
+    cerr << " macro_type_attempt=";
+    for (int i = 0; i < 8; ++i) {
+        if (i) cerr << ',';
+        cerr << macro_type_attempt[i];
+    }
+    cerr << " macro_type_accept=";
+    for (int i = 0; i < 8; ++i) {
+        if (i) cerr << ',';
+        cerr << macro_type_accept[i];
+    }
+    cerr << '\n';
 
     return answer;
 }
