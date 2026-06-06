@@ -1139,6 +1139,65 @@ vector<int> build_light_goal_reverse_order(const Solver &solver) {
     vector<vector<int>> orders = build_goal_reverse_orders(solver);
     if (orders.empty()) return solver.build_greedy_order();
 
+    auto refine_by_local_moves = [&](vector<int> order, int current_score) {
+        const int m = (int)order.size();
+        auto move_one = [&](int from, int to) {
+            if (from == to) return;
+            int value = order[from];
+            if (from < to) {
+                for (int k = from; k < to; ++k) order[k] = order[k + 1];
+            } else {
+                for (int k = from; k > to; --k) order[k] = order[k - 1];
+            }
+            order[to] = value;
+        };
+
+        for (int pass = 0; pass < 2; ++pass) {
+            int best_type = 0;
+            int best_i = -1;
+            int best_j = -1;
+            int best_score = current_score;
+
+            for (int i = 0; i < m; ++i) {
+                for (int j = i + 1; j < m; ++j) {
+                    swap(order[i], order[j]);
+                    int score = raw_order_score(solver, order);
+                    if (score < best_score) {
+                        best_type = 1;
+                        best_score = score;
+                        best_i = i;
+                        best_j = j;
+                    }
+                    swap(order[i], order[j]);
+                }
+            }
+
+            for (int i = 0; i < m; ++i) {
+                for (int j = 0; j < m; ++j) {
+                    if (i == j) continue;
+                    move_one(i, j);
+                    int score = raw_order_score(solver, order);
+                    if (score < best_score) {
+                        best_type = 2;
+                        best_score = score;
+                        best_i = i;
+                        best_j = j;
+                    }
+                    move_one(j, i);
+                }
+            }
+
+            if (best_type == 0) break;
+            if (best_type == 1) {
+                swap(order[best_i], order[best_j]);
+            } else {
+                move_one(best_i, best_j);
+            }
+            current_score = best_score;
+        }
+        return pair<vector<int>, int>(order, current_score);
+    };
+
     vector<pair<int, int>> scored;
     scored.reserve(orders.size());
     for (int i = 0; i < (int)orders.size(); ++i) {
@@ -1146,6 +1205,33 @@ vector<int> build_light_goal_reverse_order(const Solver &solver) {
     }
 
     sort(scored.begin(), scored.end());
+    const int original_best = scored.front().first;
+
+    const int refine_keep = min((int)scored.size(), 8);
+    int refined_best = original_best;
+    for (int rank = 0; rank < refine_keep; ++rank) {
+        auto [refined, score] = refine_by_local_moves(orders[scored[rank].second], scored[rank].first);
+        if (score < refined_best) refined_best = score;
+        orders.push_back(std::move(refined));
+    }
+
+    sort(orders.begin(), orders.end());
+    orders.erase(unique(orders.begin(), orders.end()), orders.end());
+
+    scored.clear();
+    scored.reserve(orders.size());
+    for (int i = 0; i < (int)orders.size(); ++i) {
+        scored.push_back({raw_order_score(solver, orders[i]), i});
+    }
+    sort(scored.begin(), scored.end());
+
+    cerr << "order_select candidates=" << orders.size()
+         << " refine_keep=" << refine_keep
+         << " original_raw=" << original_best
+         << " refined_raw=" << refined_best
+         << " chosen_raw=" << scored.front().first
+         << '\n';
+
     return orders[scored[0].second];
 }
 
@@ -1187,6 +1273,252 @@ struct PMacroPlacement {
     int offset = 0;
     int len = 0;
 };
+
+
+struct MacroSite {
+    int ball = 0;
+    int phase = 0;  // 0: 現在地から ball へ移動する leg, 1: ball から basket へ移動する leg
+    int offset = 0;
+    int len = 0;
+};
+
+struct JointSearchState {
+    vector<int> order;
+    vector<MacroSite> sites;
+};
+
+vector<int> build_pos_in_order(const vector<int> &order, int m) {
+    vector<int> pos(m, -1);
+    for (int i = 0; i < (int)order.size(); ++i) pos[order[i]] = i;
+    return pos;
+}
+
+vector<int> build_basic_leg_lengths(const Solver &solver, const vector<int> &order) {
+    vector<int> leg_len;
+    leg_len.reserve((int)order.size() * 2);
+
+    int cell = 0;
+    int dir = 1;
+    for (int k : order) {
+        Solver::RouteInfo to_ball = solver.basic_move_info(cell, dir, solver.ball_cell(k));
+        leg_len.push_back(to_ball.len);
+        cell = to_ball.end_cell;
+        dir = to_ball.end_dir;
+
+        Solver::RouteInfo to_basket = solver.basic_move_info(cell, dir, solver.basket_cell(k));
+        leg_len.push_back(to_basket.len);
+        cell = to_basket.end_cell;
+        dir = to_basket.end_dir;
+    }
+    return leg_len;
+}
+
+MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, MacroSite s,
+                            const vector<int> *pos_ptr = nullptr,
+                            const vector<int> *leg_len_ptr = nullptr) {
+    const int m = solver.ball_count();
+    if (m <= 0 || order.empty()) {
+        s.ball = 0;
+        s.phase = 0;
+        s.offset = 0;
+        s.len = 0;
+        return s;
+    }
+
+    s.ball = max(0, min(s.ball, m - 1));
+    s.phase = s.phase & 1;
+
+    vector<int> pos_storage;
+    const vector<int> *pos = pos_ptr;
+    if (!pos) {
+        pos_storage = build_pos_in_order(order, m);
+        pos = &pos_storage;
+    }
+
+    int p = (*pos)[s.ball];
+    if (p < 0) {
+        s.offset = 0;
+        s.len = 0;
+        return s;
+    }
+
+    vector<int> leg_len_storage;
+    const vector<int> *leg_len = leg_len_ptr;
+    if (!leg_len) {
+        leg_len_storage = build_basic_leg_lengths(solver, order);
+        leg_len = &leg_len_storage;
+    }
+
+    int leg = p * 2 + s.phase;
+    if (leg < 0 || leg >= (int)leg_len->size() || (*leg_len)[leg] < 6) {
+        s.offset = 0;
+        s.len = 0;
+        return s;
+    }
+
+    const int L = (*leg_len)[leg];
+    s.offset = max(0, min(s.offset, L - 6));
+    int max_len = min(160, L - s.offset);
+    if (max_len < 6) {
+        s.len = 0;
+        return s;
+    }
+    s.len = max(6, min(s.len, max_len));
+    return s;
+}
+
+void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &order, vector<MacroSite> &sites, int max_defs) {
+    const int m = solver.ball_count();
+    vector<int> pos = build_pos_in_order(order, m);
+    vector<int> leg_len = build_basic_leg_lengths(solver, order);
+
+    for (MacroSite &s : sites) s = repair_macro_site(solver, order, s, &pos, &leg_len);
+    sites.erase(remove_if(sites.begin(), sites.end(), [](const MacroSite &s) {
+                    return s.len < 6;
+                }),
+                sites.end());
+
+    sort(sites.begin(), sites.end(), [](const MacroSite &a, const MacroSite &b) {
+        if (a.ball != b.ball) return a.ball < b.ball;
+        if (a.phase != b.phase) return a.phase < b.phase;
+        if (a.offset != b.offset) return a.offset < b.offset;
+        return a.len > b.len;
+    });
+    sites.erase(unique(sites.begin(), sites.end(), [](const MacroSite &a, const MacroSite &b) {
+                    return a.ball == b.ball && a.phase == b.phase;
+                }),
+                sites.end());
+
+    while ((int)sites.size() > max_defs) {
+        sites.erase(sites.begin() + rnd::get((int)sites.size()));
+    }
+}
+
+vector<PMacroPlacement> convert_sites_to_plan(const Solver &solver, const vector<int> &order, vector<MacroSite> sites) {
+    const int m = solver.ball_count();
+    vector<int> pos = build_pos_in_order(order, m);
+    vector<int> leg_len = build_basic_leg_lengths(solver, order);
+
+    vector<PMacroPlacement> plan;
+    plan.reserve(sites.size());
+
+    for (MacroSite s : sites) {
+        s = repair_macro_site(solver, order, s, &pos, &leg_len);
+        if (s.len < 6) continue;
+        int p = pos[s.ball];
+        if (p < 0) continue;
+        plan.push_back(PMacroPlacement{p * 2 + s.phase, s.offset, s.len});
+    }
+    return plan;
+}
+
+MacroSite random_macro_site(const Solver &solver, const vector<int> &order) {
+    static const vector<int> lens = {6, 8, 10, 12, 16, 20, 24, 32, 40, 56, 72, 96, 120};
+    const int m = (int)order.size();
+    vector<int> leg_len = build_basic_leg_lengths(solver, order);
+
+    for (int trial = 0; trial < 30; ++trial) {
+        int leg = rnd::get(max(1, 2 * m));
+        if (leg >= (int)leg_len.size() || leg_len[leg] < 6) continue;
+
+        int L = leg_len[leg];
+        MacroSite s;
+        s.ball = order[leg / 2];
+        s.phase = leg & 1;
+
+        if (rnd::get(100) < 80) {
+            int len = lens[rnd::get((int)lens.size())];
+            if (len > L) continue;
+            s.len = len;
+            s.offset = rnd::get(L - len + 1);
+        } else {
+            s.offset = rnd::get(L - 5);
+            s.len = 6 + rnd::get(min(160, L - s.offset) - 5);
+        }
+        return s;
+    }
+
+    MacroSite s;
+    if (m > 0) s.ball = order[0];
+    s.phase = 0;
+    s.offset = 0;
+    s.len = 0;
+    return s;
+}
+
+void mutate_order_inplace(vector<int> &order, int type) {
+    const int m = (int)order.size();
+    if (m <= 1) return;
+
+    if (type == 0) {
+        int i = rnd::get(m);
+        int j = rnd::get(m);
+        if (i != j) swap(order[i], order[j]);
+    } else if (type == 1) {
+        int i = rnd::get(m);
+        int j = rnd::get(m);
+        if (i == j) return;
+        int value = order[i];
+        if (i < j) {
+            for (int p = i; p < j; ++p) order[p] = order[p + 1];
+        } else {
+            for (int p = i; p > j; --p) order[p] = order[p - 1];
+        }
+        order[j] = value;
+    } else if (type == 2) {
+        int l = rnd::get(m);
+        int r = rnd::get(m);
+        if (l > r) swap(l, r);
+        if (l < r) reverse(order.begin() + l, order.begin() + r + 1);
+    } else if (type == 3) {
+        int len = 1 + rnd::get(min(8, m));
+        int from = rnd::get(m - len + 1);
+        int to = rnd::get(m - len + 1);
+        if (from == to) return;
+
+        vector<int> block(order.begin() + from, order.begin() + from + len);
+        order.erase(order.begin() + from, order.begin() + from + len);
+        if (to > from) to -= len;
+        to = max(0, min(to, (int)order.size()));
+        order.insert(order.begin() + to, block.begin(), block.end());
+    } else {
+        int len1 = 1 + rnd::get(min(6, m));
+        int a = rnd::get(m - len1 + 1);
+        int len2 = 1 + rnd::get(min(6, m));
+        int b = rnd::get(m - len2 + 1);
+        if (a > b) {
+            swap(a, b);
+            swap(len1, len2);
+        }
+        if (a + len1 > b) return;
+        vector<int> A(order.begin() + a, order.begin() + a + len1);
+        vector<int> B(order.begin() + b, order.begin() + b + len2);
+        order.erase(order.begin() + b, order.begin() + b + len2);
+        order.erase(order.begin() + a, order.begin() + a + len1);
+        order.insert(order.begin() + a, B.begin(), B.end());
+        int nb = b - len1 + len2;
+        order.insert(order.begin() + nb, A.begin(), A.end());
+    }
+}
+
+vector<int> build_initial_order_fast(const Solver &solver) {
+    vector<vector<int>> orders = build_goal_reverse_orders(solver);
+    if (orders.empty()) return solver.build_greedy_order();
+
+    int best_idx = 0;
+    int best_score = raw_order_score(solver, orders[0]);
+    for (int i = 1; i < (int)orders.size(); ++i) {
+        int score = raw_order_score(solver, orders[i]);
+        if (score < best_score) {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+
+    cerr << "initial_order candidates=" << orders.size()
+         << " chosen_raw=" << best_score << '\n';
+    return orders[best_idx];
+}
 
 struct MacroContainStats {
     int definitions = 0;
@@ -1654,67 +1986,64 @@ int macro_containment_bonus(const MacroContainStats &stats) {
     return min(31, bonus);
 }
 
-vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int> &order, int limit, double time_limit_sec, int seed_rounds = 5, int seed_trials = 80, int max_defs = 10) {
-    if (time_limit_sec <= 0.0) return solver.build_ops(order);
+
+vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector<int> &initial_order, int limit,
+                                              double time_limit_sec, int seed_rounds = 3,
+                                              int seed_trials = 32, int max_defs = 10) {
+    if (time_limit_sec <= 0.0) return solver.build_ops(initial_order);
 
     const double start_time = get_time();
-    vector<vector<char>> legs = build_basic_movement_legs(solver, order);
-    vector<PMacroPlacement> candidates = collect_p_macro_placements(legs);
-    if (candidates.empty()) return solver.build_ops(order);
-
-    auto repair = [&](PMacroPlacement p) {
-        p.leg = max(0, min(p.leg, (int)legs.size() - 1));
-        int leg_size = (int)legs[p.leg].size();
-        if (leg_size < 6) {
-            p.offset = 0;
-            p.len = 0;
-            return p;
-        }
-        p.offset = max(0, min(p.offset, leg_size - 6));
-        p.len = max(6, min(p.len, leg_size - p.offset));
-        return p;
-    };
-
-    auto random_def = [&]() {
-        if (rnd::get(100) < 85) return candidates[rnd::get((int)candidates.size())];
-        PMacroPlacement p;
-        p.leg = rnd::get((int)legs.size());
-        int leg_size = (int)legs[p.leg].size();
-        if (leg_size < 6) return candidates[rnd::get((int)candidates.size())];
-        p.offset = rnd::get(leg_size - 5);
-        p.len = 6 + rnd::get(min(160, leg_size - p.offset) - 5);
-        return p;
-    };
+    if (initial_order.empty()) return solver.build_ops(initial_order);
 
     PlanEvalCache eval_cache;
-    auto eval = [&](const vector<PMacroPlacement> &plan, int cutoff = numeric_limits<int>::max() / 4) {
-        return score_p_macro_plan_fast(solver, order, plan, limit, cutoff, &eval_cache);
+
+    auto eval = [&](const vector<int> &ord, const vector<MacroSite> &sites,
+                    int cutoff = numeric_limits<int>::max() / 4) {
+        vector<PMacroPlacement> plan = convert_sites_to_plan(solver, ord, sites);
+        return score_p_macro_plan_fast(solver, ord, plan, limit, cutoff, &eval_cache);
     };
 
-    vector<PMacroPlacement> current_plan;
-    int current_score = eval(current_plan);
+    auto build_answer = [&](const vector<int> &ord, const vector<MacroSite> &sites, MacroContainStats *stats) {
+        vector<PMacroPlacement> plan = convert_sites_to_plan(solver, ord, sites);
+        return build_program_with_p_macro_plan(solver, ord, plan, stats);
+    };
 
+    vector<int> current_order = initial_order;
+    vector<MacroSite> current_sites;
+    int current_score = eval(current_order, current_sites);
+
+    // まずは現在の order に対して、良いマクロ定義を少しだけ貪欲に足す。
+    // ここは order 変更前の初期足場を作るだけなので、試行回数は控えめにしている。
     for (int round = 0; round < seed_rounds; ++round) {
         if (get_time() - start_time >= time_limit_sec) break;
-        vector<PMacroPlacement> best_add_plan = current_plan;
+
+        vector<MacroSite> best_add_sites = current_sites;
         int best_add_score = current_score;
+
         for (int trial = 0; trial < seed_trials; ++trial) {
             if (get_time() - start_time >= time_limit_sec) break;
-            vector<PMacroPlacement> next_plan = current_plan;
-            next_plan.push_back(random_def());
-            int score = eval(next_plan, best_add_score - 1);
+
+            vector<MacroSite> next_sites = current_sites;
+            MacroSite s = random_macro_site(solver, current_order);
+            if (s.len < 6) continue;
+            next_sites.push_back(s);
+            normalize_macro_sites_inplace(solver, current_order, next_sites, max_defs);
+
+            int score = eval(current_order, next_sites, best_add_score - 1);
             if (score < best_add_score) {
                 best_add_score = score;
-                best_add_plan = std::move(next_plan);
+                best_add_sites = std::move(next_sites);
             }
         }
+
         if (best_add_score < current_score) {
-            current_plan = std::move(best_add_plan);
+            current_sites = std::move(best_add_sites);
             current_score = best_add_score;
         }
     }
 
-    vector<PMacroPlacement> best_plan = current_plan;
+    vector<int> best_order = current_order;
+    vector<MacroSite> best_sites = current_sites;
     int best_score = current_score;
 
     static double log_table[65536];
@@ -1725,93 +2054,141 @@ vector<char> anneal_multi_p_macro_reroute(const Solver &solver, const vector<int
         initialized = true;
     }
 
-    const double T0 = 60.0;
-    const double T1 = 0.08;
+    const double T0 = 120.0;
+    const double T1 = 0.05;
     double heat = T0;
     int iter = 0;
+    int order_mutations = 0;
+    int macro_mutations = 0;
+    int accepted_order_mutations = 0;
 
     while (true) {
         double progress = (get_time() - start_time) / time_limit_sec;
         if (progress >= 1.0) break;
-        if ((iter & 3) == 0) {
-            heat = T0 * pow(T1 / T0, progress);
-        }
+        if ((iter & 3) == 0) heat = T0 * pow(T1 / T0, progress);
         ++iter;
 
-        vector<PMacroPlacement> next_plan = current_plan;
-        int type = rnd::get(8);
+        vector<int> next_order = current_order;
+        vector<MacroSite> next_sites = current_sites;
+        bool touched_order = false;
 
-        if (type == 0 || next_plan.empty()) {
-            if ((int)next_plan.size() < max_defs) next_plan.push_back(random_def());
-        } else if (type == 1) {
-            int idx = rnd::get((int)next_plan.size());
-            next_plan.erase(next_plan.begin() + idx);
-        } else if (type == 2) {
-            int idx = rnd::get((int)next_plan.size());
-            next_plan[idx] = random_def();
-        } else if (type == 3) {
-            int idx = rnd::get((int)next_plan.size());
-            next_plan[idx].leg += rnd::range(-5, 6);
-            next_plan[idx] = repair(next_plan[idx]);
-        } else if (type == 4) {
-            int idx = rnd::get((int)next_plan.size());
-            next_plan[idx].offset += rnd::range(-14, 15);
-            next_plan[idx] = repair(next_plan[idx]);
-        } else if (type == 5) {
-            int idx = rnd::get((int)next_plan.size());
-            next_plan[idx].len += rnd::range(-28, 29);
-            next_plan[idx] = repair(next_plan[idx]);
-        } else if (type == 6) {
-            int cnt = min(3, max(1, (int)next_plan.size()));
-            for (int i = 0; i < cnt; ++i) {
-                int idx = rnd::get((int)next_plan.size());
-                next_plan[idx] = random_def();
+        int type = rnd::get(16);
+
+        if (type <= 7) {
+            ++macro_mutations;
+            if (type == 0 || next_sites.empty()) {
+                if ((int)next_sites.size() < max_defs) {
+                    MacroSite s = random_macro_site(solver, next_order);
+                    if (s.len >= 6) next_sites.push_back(s);
+                }
+            } else if (type == 1) {
+                int idx = rnd::get((int)next_sites.size());
+                next_sites.erase(next_sites.begin() + idx);
+            } else if (type == 2) {
+                int idx = rnd::get((int)next_sites.size());
+                MacroSite s = random_macro_site(solver, next_order);
+                if (s.len >= 6) next_sites[idx] = s;
+            } else if (type == 3) {
+                int idx = rnd::get((int)next_sites.size());
+                next_sites[idx].ball = next_order[rnd::get((int)next_order.size())];
+                next_sites[idx].phase ^= rnd::get(2);
+            } else if (type == 4) {
+                int idx = rnd::get((int)next_sites.size());
+                next_sites[idx].offset += rnd::range(-16, 17);
+            } else if (type == 5) {
+                int idx = rnd::get((int)next_sites.size());
+                next_sites[idx].len += rnd::range(-32, 33);
+            } else if (type == 6) {
+                int cnt = min(3, max(1, (int)next_sites.size()));
+                for (int i = 0; i < cnt; ++i) {
+                    int idx = rnd::get((int)next_sites.size());
+                    MacroSite s = random_macro_site(solver, next_order);
+                    if (s.len >= 6) next_sites[idx] = s;
+                }
+            } else {
+                rnd::shuffle(next_sites);
+                while ((int)next_sites.size() > 1 && rnd::get(100) < 35) {
+                    next_sites.erase(next_sites.begin() + rnd::get((int)next_sites.size()));
+                }
+                while ((int)next_sites.size() < max_defs && rnd::get(100) < 55) {
+                    MacroSite s = random_macro_site(solver, next_order);
+                    if (s.len >= 6) next_sites.push_back(s);
+                }
             }
         } else {
-            rnd::shuffle(next_plan);
-            while ((int)next_plan.size() > 1 && rnd::get(100) < 35) {
-                next_plan.erase(next_plan.begin() + rnd::get((int)next_plan.size()));
-            }
-            while ((int)next_plan.size() < 8 && rnd::get(100) < 55) {
-                next_plan.push_back(random_def());
+            ++order_mutations;
+            touched_order = true;
+
+            if (type == 8) {
+                mutate_order_inplace(next_order, 0);  // swap
+            } else if (type == 9) {
+                mutate_order_inplace(next_order, 1);  // insert
+            } else if (type == 10) {
+                mutate_order_inplace(next_order, 2);  // reverse
+            } else if (type == 11) {
+                mutate_order_inplace(next_order, 3);  // block insert
+            } else if (type == 12) {
+                mutate_order_inplace(next_order, 4);  // block swap
+            } else if (type == 13) {
+                mutate_order_inplace(next_order, 0);
+                if (!next_sites.empty() && rnd::get(100) < 35) {
+                    next_sites.erase(next_sites.begin() + rnd::get((int)next_sites.size()));
+                }
+            } else if (type == 14) {
+                mutate_order_inplace(next_order, 1);
+                if ((int)next_sites.size() < max_defs) {
+                    MacroSite s = random_macro_site(solver, next_order);
+                    if (s.len >= 6) next_sites.push_back(s);
+                }
+            } else {
+                mutate_order_inplace(next_order, 2);
+                // 大きめの order 変更時は、古い offset が合わないことが多いので少し間引く。
+                while (!next_sites.empty() && rnd::get(100) < 30) {
+                    next_sites.erase(next_sites.begin() + rnd::get((int)next_sites.size()));
+                }
             }
         }
 
-        for (PMacroPlacement &p : next_plan) p = repair(p);
-        next_plan.erase(remove_if(next_plan.begin(), next_plan.end(), [](const PMacroPlacement &p) {
-                            return p.len < 6;
-                        }),
-                        next_plan.end());
-        while ((int)next_plan.size() > max_defs) {
-            next_plan.erase(next_plan.begin() + rnd::get((int)next_plan.size()));
-        }
+        normalize_macro_sites_inplace(solver, next_order, next_sites, max_defs);
 
         double accept_margin = -heat * log_table[iter & 65535];
         int accept_cutoff = current_score + (int)floor(accept_margin);
-        int next_score = eval(next_plan, accept_cutoff);
+        int next_score = eval(next_order, next_sites, accept_cutoff);
         int delta = next_score - current_score;
+
         if (delta <= accept_margin) {
-            current_plan = std::move(next_plan);
+            current_order = std::move(next_order);
+            current_sites = std::move(next_sites);
             current_score = next_score;
+            if (touched_order) ++accepted_order_mutations;
+
             if (current_score < best_score) {
                 best_score = current_score;
-                best_plan = current_plan;
+                best_order = current_order;
+                best_sites = current_sites;
             }
         }
     }
 
     MacroContainStats stats;
-    vector<char> answer = build_program_with_p_macro_plan(solver, order, best_plan, &stats);
-    cerr << "p_macro_contain defs=" << stats.definitions
+    vector<char> answer = build_answer(best_order, best_sites, &stats);
+    cerr << "joint_order_macro"
+         << " initial_raw=" << raw_order_score(solver, initial_order)
+         << " best_score=" << best_score
+         << " best_raw=" << raw_order_score(solver, best_order)
+         << " defs=" << stats.definitions
          << " contained_defs=" << stats.contained_definitions
          << " p_count=" << stats.contained_p_count
          << " saving=" << stats.encoded_saving
          << " chain=" << stats.max_contained_chain
          << " bonus=" << macro_containment_bonus(stats)
          << " iter=" << iter
+         << " order_mut=" << accepted_order_mutations << "/" << order_mutations
+         << " macro_mut=" << macro_mutations
          << " route_info_cache=" << eval_cache.info_hits << "/" << (eval_cache.info_hits + eval_cache.info_misses)
          << " route_ops_cache=" << eval_cache.ops_hits << "/" << (eval_cache.ops_hits + eval_cache.ops_misses)
          << '\n';
+
     return answer;
 }
 
@@ -1824,7 +2201,7 @@ bool valid_program_for_limit(const vector<char> &program, int limit) {
 
 vector<char> solve_with_p_macro_reroute(const Solver &solver, const vector<int> &order, int limit, double time_limit_sec) {
     vector<char> raw = solver.build_ops(order);
-    vector<char> answer = anneal_multi_p_macro_reroute(solver, order, limit, time_limit_sec, 2, 24, 10);
+    vector<char> answer = anneal_order_and_p_macro_reroute(solver, order, limit, time_limit_sec, 3, 32, 10);
     if (valid_program_for_limit(answer, limit)) return answer;
 
     vector<char> fallback = best_macro_compress(raw, limit, false);
@@ -1841,7 +2218,7 @@ int main() {
 
     Input in = read_input();
     Solver solver(in);
-    vector<int> order = build_light_goal_reverse_order(solver);
+    vector<int> order = build_initial_order_fast(solver);
 
     double anneal_time = max(0.05, TOTAL_TIME_LIMIT - (get_time() - start_time));
     vector<char> answer = solve_with_p_macro_reroute(solver, order, in.T, anneal_time);
