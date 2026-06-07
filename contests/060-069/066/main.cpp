@@ -212,6 +212,18 @@ class Solver {
         return info;
     }
 
+    vector<int> build_macro_transition(const vector<char> &macro) const {
+        vector<int> transition(total * 4);
+        for (int cell = 0; cell < total; ++cell) {
+            for (int dir = 0; dir < 4; ++dir) {
+                int next_cell = cell;
+                int next_dir = dir;
+                apply_basic_ops(macro, next_cell, next_dir);
+                transition[cell * 4 + dir] = next_cell * 4 + next_dir;
+            }
+        }
+        return transition;
+    }
 
     vector<int> build_macro_transition_from_buttons(const vector<char> &buttons, const vector<int> &old_transition) const {
         const int states = total * 4;
@@ -253,8 +265,8 @@ class Solver {
         macro_bfs_queue[q_tail++] = start;
         int goal = -1;
 
-        auto push_next = [&](int cur_state, int next_cell_arg, int next_dir, char op) {
-            int ns = sid(next_cell_arg, next_dir);
+        auto push_next = [&](int cur_state, int next_cell, int next_dir, char op) {
+            int ns = sid(next_cell, next_dir);
             if (ns == cur_state || macro_bfs_seen[ns] == macro_bfs_stamp) return;
             macro_bfs_seen[ns] = macro_bfs_stamp;
             macro_bfs_dist[ns] = macro_bfs_dist[cur_state] + 1;
@@ -361,8 +373,137 @@ class Solver {
     }
 
 
+    template <class Emit>
+    RouteInfo greedy_macro_route_with_transition(int from, int from_dir, int to, const vector<int> &macro_transition, Emit emit) const {
+        RouteInfo info;
+        int cell = from;
+        int dir = from_dir;
+        const bool has_macro = !macro_transition.empty();
+
+        auto state_id = [](int c, int d) {
+            return c * 4 + d;
+        };
+
+        auto basic_len = [&](int c, int d) {
+            int end_dir = d;
+            return basic_move_len_fast(c, d, to, end_dir);
+        };
+
+        auto apply_basic_emit = [&](char op) {
+            emit(op);
+            ++info.len;
+            apply_basic_op(op, cell, dir);
+        };
+
+        auto apply_p_emit = [&]() {
+            emit('P');
+            ++info.len;
+            ++info.p_count;
+            int ns = macro_transition[state_id(cell, dir)];
+            cell = ns / 4;
+            dir = ns & 3;
+        };
+
+        auto basic_first_op = [&]() -> char {
+            if (cell == to) return 0;
+            int next_dir = first_dir_at(cell, to);
+            if (next_dir == NO_DIR) return 0;
+            int diff = (next_dir - dir + 4) & 3;
+            if (diff == 0) return 'F';
+            if (diff == 1) return 'R';
+            if (diff == 2) return 'R';
+            return 'L';
+        };
+
+        int start_basic = basic_len(cell, dir);
+        int safety = max(20, start_basic * 4 + 200);
+
+        while (cell != to && safety-- > 0) {
+            int base = basic_len(cell, dir);
+            if (base <= 0) break;
+
+            char first = basic_first_op();
+            if (first == 0) break;
+
+            struct Choice {
+                int est = INT_MAX;
+                char a = 0;
+                char b = 0;
+                int p_count = 0;
+            } best;
+            best.est = base;
+            best.a = first;
 
 
+            auto consider_p = [&](int c, int d, int prefix_cost, char a, char b) {
+                if (!has_macro) return;
+                int st = state_id(c, d);
+                int ns = macro_transition[st];
+                if (ns == st) return;
+                int nc = ns / 4;
+                int nd = ns & 3;
+                int est = prefix_cost + 1 + basic_len(nc, nd);
+                if (est < best.est) {
+                    best.est = est;
+                    best.a = a;
+                    best.b = b;
+                    best.p_count = 1;
+                }
+            };
+
+            consider_p(cell, dir, 0, 'P', 0);
+            consider_p(cell, (dir + 1) & 3, 1, 'R', 'P');
+            consider_p(cell, (dir + 3) & 3, 1, 'L', 'P');
+            if (next_cell[cell][dir] != -1) {
+                consider_p(next_cell[cell][dir], dir, 1, 'F', 'P');
+            }
+
+            if (best.p_count == 0) {
+                apply_basic_emit(best.a);
+            } else {
+                if (best.a == 'P') {
+                    apply_p_emit();
+                } else {
+                    apply_basic_emit(best.a);
+                    apply_p_emit();
+                }
+            }
+        }
+
+        if (cell != to) {
+            int end_cell = cell;
+            int end_dir = dir;
+            vector<char> rest = basic_move_ops(cell, dir, to, end_cell, end_dir);
+            for (char op : rest) {
+                emit(op);
+            }
+            info.len += (int)rest.size();
+            cell = end_cell;
+            dir = end_dir;
+        }
+
+        info.end_cell = cell;
+        info.end_dir = dir;
+        return info;
+    }
+
+    RouteInfo greedy_macro_move_info_with_transition(int from, int from_dir, int to, const vector<int> &macro_transition) const {
+        auto noop = [](char) {};
+        return greedy_macro_route_with_transition(from, from_dir, to, macro_transition, noop);
+    }
+
+    vector<char> greedy_macro_move_ops_with_transition(int from, int from_dir, int to, const vector<int> &macro_transition, int &end_cell, int &end_dir) const {
+        vector<char> ops;
+        int reserve_len = basic_move_len_fast(from, from_dir, to, end_dir);
+        ops.reserve(max(0, reserve_len));
+        auto emit = [&](char op) {
+            ops.push_back(op);
+        };
+        RouteInfo info = greedy_macro_route_with_transition(from, from_dir, to, macro_transition, emit);
+        end_cell = info.end_cell;
+        end_dir = info.end_dir;
+        return ops;
+    }
 
   private:
     static constexpr int UP = 0;
@@ -994,6 +1135,105 @@ vector<vector<int>> build_goal_reverse_orders(const Solver &solver) {
     return orders;
 }
 
+vector<int> build_light_goal_reverse_order(const Solver &solver) {
+    vector<vector<int>> orders = build_goal_reverse_orders(solver);
+    if (orders.empty()) return solver.build_greedy_order();
+
+    auto refine_by_local_moves = [&](vector<int> order, int current_score) {
+        const int m = (int)order.size();
+        auto move_one = [&](int from, int to) {
+            if (from == to) return;
+            int value = order[from];
+            if (from < to) {
+                for (int k = from; k < to; ++k) order[k] = order[k + 1];
+            } else {
+                for (int k = from; k > to; --k) order[k] = order[k - 1];
+            }
+            order[to] = value;
+        };
+
+        for (int pass = 0; pass < 2; ++pass) {
+            int best_type = 0;
+            int best_i = -1;
+            int best_j = -1;
+            int best_score = current_score;
+
+            for (int i = 0; i < m; ++i) {
+                for (int j = i + 1; j < m; ++j) {
+                    swap(order[i], order[j]);
+                    int score = raw_order_score(solver, order);
+                    if (score < best_score) {
+                        best_type = 1;
+                        best_score = score;
+                        best_i = i;
+                        best_j = j;
+                    }
+                    swap(order[i], order[j]);
+                }
+            }
+
+            for (int i = 0; i < m; ++i) {
+                for (int j = 0; j < m; ++j) {
+                    if (i == j) continue;
+                    move_one(i, j);
+                    int score = raw_order_score(solver, order);
+                    if (score < best_score) {
+                        best_type = 2;
+                        best_score = score;
+                        best_i = i;
+                        best_j = j;
+                    }
+                    move_one(j, i);
+                }
+            }
+
+            if (best_type == 0) break;
+            if (best_type == 1) {
+                swap(order[best_i], order[best_j]);
+            } else {
+                move_one(best_i, best_j);
+            }
+            current_score = best_score;
+        }
+        return pair<vector<int>, int>(order, current_score);
+    };
+
+    vector<pair<int, int>> scored;
+    scored.reserve(orders.size());
+    for (int i = 0; i < (int)orders.size(); ++i) {
+        scored.push_back({raw_order_score(solver, orders[i]), i});
+    }
+
+    sort(scored.begin(), scored.end());
+    const int original_best = scored.front().first;
+
+    const int refine_keep = min((int)scored.size(), 8);
+    int refined_best = original_best;
+    for (int rank = 0; rank < refine_keep; ++rank) {
+        auto [refined, score] = refine_by_local_moves(orders[scored[rank].second], scored[rank].first);
+        if (score < refined_best) refined_best = score;
+        orders.push_back(std::move(refined));
+    }
+
+    sort(orders.begin(), orders.end());
+    orders.erase(unique(orders.begin(), orders.end()), orders.end());
+
+    scored.clear();
+    scored.reserve(orders.size());
+    for (int i = 0; i < (int)orders.size(); ++i) {
+        scored.push_back({raw_order_score(solver, orders[i]), i});
+    }
+    sort(scored.begin(), scored.end());
+
+    cerr << "order_select candidates=" << orders.size()
+         << " refine_keep=" << refine_keep
+         << " original_raw=" << original_best
+         << " refined_raw=" << refined_best
+         << " chosen_raw=" << scored.front().first
+         << '\n';
+
+    return orders[scored[0].second];
+}
 
 int expanded_basic_count(const vector<char> &encoded) {
     int count = 0;
@@ -1032,6 +1272,8 @@ struct PMacroPlacement {
     int leg = 0;
     int offset = 0;
     int len = 0;
+    bool explicit_body = true;
+    vector<char> body;
 };
 
 
@@ -1040,8 +1282,14 @@ struct MacroSite {
     int phase = 0;  // 0: 現在地から ball へ移動する leg, 1: ball から basket へ移動する leg
     int offset = 0;
     int len = 0;
+    bool explicit_body = true;   // body-state 版では基本的に常に true。false は旧 slice 候補の一時状態のみ
+    vector<char> body;           // 探索対象の expanded basic body
 };
 
+struct JointSearchState {
+    vector<int> order;
+    vector<MacroSite> sites;
+};
 
 vector<int> build_pos_in_order(const vector<int> &order, int m) {
     vector<int> pos(m, -1);
@@ -1088,6 +1336,8 @@ MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, cons
         s.phase = 0;
         s.offset = 0;
         s.len = 0;
+        s.explicit_body = false;
+        s.body.clear();
         return s;
     }
 
@@ -1098,17 +1348,46 @@ MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, cons
     if (p < 0) {
         s.offset = 0;
         s.len = 0;
+        s.explicit_body = false;
+        s.body.clear();
         return s;
     }
 
     int leg = p * 2 + s.phase;
-    if (leg < 0 || leg >= (int)ctx.basic_leg_len.size() || ctx.basic_leg_len[leg] < 6) {
+    if (leg < 0 || leg >= (int)ctx.basic_leg_len.size()) {
+        s.offset = 0;
+        s.len = 0;
+        s.explicit_body = false;
+        s.body.clear();
+        return s;
+    }
+
+    const int L = ctx.basic_leg_len[leg];
+
+    if (s.explicit_body) {
+        // explicit body は「どこで定義するか」だけ leg 上に置き、長さは body 側で管理する。
+        s.offset = max(0, min(s.offset, L));
+        s.body.erase(remove_if(s.body.begin(), s.body.end(), [](char ch) {
+                         return ch != 'F' && ch != 'R' && ch != 'L';
+                     }),
+                     s.body.end());
+        if ((int)s.body.size() < 6) {
+            s.len = 0;
+            s.explicit_body = false;
+            s.body.clear();
+            return s;
+        }
+        if ((int)s.body.size() > 160) s.body.resize(160);
+        s.len = (int)s.body.size();
+        return s;
+    }
+
+    if (L < 6) {
         s.offset = 0;
         s.len = 0;
         return s;
     }
 
-    const int L = ctx.basic_leg_len[leg];
     s.offset = max(0, min(s.offset, L - 6));
     int max_len = min(160, L - s.offset);
     if (max_len < 6) {
@@ -1116,9 +1395,14 @@ MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, cons
         return s;
     }
     s.len = max(6, min(s.len, max_len));
+    s.body.clear();
     return s;
 }
 
+MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, MacroSite s) {
+    OrderContext ctx = build_order_context(solver, order);
+    return repair_macro_site(solver, order, ctx, s);
+}
 
 void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &order, const OrderContext &ctx,
                                    vector<MacroSite> &sites, int max_defs) {
@@ -1144,6 +1428,36 @@ void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &orde
     }
 }
 
+void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &order, vector<MacroSite> &sites, int max_defs) {
+    OrderContext ctx = build_order_context(solver, order);
+    normalize_macro_sites_inplace(solver, order, ctx, sites, max_defs);
+}
+
+vector<PMacroPlacement> convert_sites_to_plan(const Solver &solver, const vector<int> &order,
+                                              const OrderContext &ctx, const vector<MacroSite> &sites) {
+    vector<PMacroPlacement> plan;
+    plan.reserve(sites.size());
+
+    for (MacroSite s : sites) {
+        s = repair_macro_site(solver, order, ctx, s);
+        if (s.len < 6) continue;
+        int p = ctx.pos[s.ball];
+        if (p < 0) continue;
+        PMacroPlacement pm;
+        pm.leg = p * 2 + s.phase;
+        pm.offset = s.offset;
+        pm.len = s.len;
+        pm.explicit_body = s.explicit_body;
+        if (s.explicit_body) pm.body = s.body;
+        plan.push_back(std::move(pm));
+    }
+    return plan;
+}
+
+vector<PMacroPlacement> convert_sites_to_plan(const Solver &solver, const vector<int> &order, const vector<MacroSite> &sites) {
+    OrderContext ctx = build_order_context(solver, order);
+    return convert_sites_to_plan(solver, order, ctx, sites);
+}
 
 // normalize_macro_sites_inplace() 済みの sites を PMacroPlacement に変換する軽量版。
 // repair_macro_site() をここで再実行しないことで、評価時の重複計算を避ける。
@@ -1161,7 +1475,13 @@ vector<PMacroPlacement> convert_sites_to_plan_no_repair(const vector<int> &order
 
         int p = ctx.pos[s.ball];
         if (p < 0) continue;
-        plan.push_back(PMacroPlacement{p * 2 + s.phase, s.offset, s.len});
+        PMacroPlacement pm;
+        pm.leg = p * 2 + s.phase;
+        pm.offset = s.offset;
+        pm.len = s.len;
+        pm.explicit_body = s.explicit_body;
+        if (s.explicit_body) pm.body = s.body;
+        plan.push_back(std::move(pm));
     }
 
     // order が変わると ball 順と leg 順は一致しないので、既存処理に渡す前に leg 順へ整える。
@@ -1175,8 +1495,183 @@ vector<PMacroPlacement> convert_sites_to_plan_no_repair(const vector<int> &order
 }
 
 
+vector<char> build_basic_leg_ops_for_site(const Solver &solver, const vector<int> &order, const OrderContext &ctx, const MacroSite &site) {
+    vector<char> empty;
+    if (site.ball < 0 || site.ball >= (int)ctx.pos.size()) return empty;
+    int pos = ctx.pos[site.ball];
+    if (pos < 0 || pos >= (int)order.size()) return empty;
+
+    int cell = 0;
+    int dir = 1;
+    for (int i = 0; i < pos; ++i) {
+        int end_cell = cell;
+        int end_dir = dir;
+        vector<char> to_ball = solver.basic_move_ops(cell, dir, solver.ball_cell(order[i]), end_cell, end_dir);
+        cell = end_cell;
+        dir = end_dir;
+        vector<char> to_basket = solver.basic_move_ops(cell, dir, solver.basket_cell(order[i]), end_cell, end_dir);
+        cell = end_cell;
+        dir = end_dir;
+    }
+
+    int end_cell = cell;
+    int end_dir = dir;
+    vector<char> to_ball = solver.basic_move_ops(cell, dir, solver.ball_cell(site.ball), end_cell, end_dir);
+    if (site.phase == 0) return to_ball;
+
+    cell = end_cell;
+    dir = end_dir;
+    return solver.basic_move_ops(cell, dir, solver.basket_cell(site.ball), end_cell, end_dir);
+}
+
+bool materialize_macro_site_body(const Solver &solver, const vector<int> &order, const OrderContext &ctx, MacroSite &site) {
+    site.explicit_body = false;
+    site.body.clear();
+    site = repair_macro_site(solver, order, ctx, site);
+    if (site.len < 6) return false;
+
+    vector<char> leg_ops = build_basic_leg_ops_for_site(solver, order, ctx, site);
+    if (site.offset < 0 || site.offset + site.len > (int)leg_ops.size()) return false;
+
+    site.body.assign(leg_ops.begin() + site.offset, leg_ops.begin() + site.offset + site.len);
+    if ((int)site.body.size() < 6) return false;
+    site.explicit_body = true;
+    site.len = (int)site.body.size();
+    return true;
+}
+
+
+bool refresh_explicit_body_from_route(const Solver &solver, const vector<int> &order, const OrderContext &ctx, MacroSite &site) {
+    // 既存の場所情報は維持しつつ、現在の basic route slice から body を作り直す。
+    // explicit body が壊れたときの再接地、または slice 型から explicit 型への昇格に使う。
+    int desired_len = site.explicit_body && !site.body.empty() ? (int)site.body.size() : site.len;
+    site.explicit_body = false;
+    site.body.clear();
+    site.len = max(6, min(160, desired_len));
+    return materialize_macro_site_body(solver, order, ctx, site);
+}
+
+bool splice_explicit_body_with_route(const Solver &solver, const vector<int> &order, const OrderContext &ctx, MacroSite &site) {
+    if (!site.explicit_body || site.body.empty()) return refresh_explicit_body_from_route(solver, order, ctx, site);
+
+    MacroSite slice = site;
+    slice.explicit_body = false;
+    slice.body.clear();
+    slice.len = max(6, min(160, (int)site.body.size() + rnd::range(-12, 13)));
+    slice.offset += rnd::range(-12, 13);
+    if (!materialize_macro_site_body(solver, order, ctx, slice)) return false;
+
+    if (rnd::get(100) < 40) {
+        site.body = std::move(slice.body);
+    } else {
+        int a = rnd::get((int)site.body.size());
+        int b = rnd::get((int)site.body.size());
+        if (a > b) swap(a, b);
+        if (a == b) b = min((int)site.body.size(), a + 1);
+
+        int take = min((int)slice.body.size(), max(1, b - a));
+        int from = rnd::get((int)slice.body.size() - take + 1);
+        site.body.erase(site.body.begin() + a, site.body.begin() + b);
+        site.body.insert(site.body.begin() + a, slice.body.begin() + from, slice.body.begin() + from + take);
+        if ((int)site.body.size() > 160) site.body.resize(160);
+    }
+
+    if ((int)site.body.size() < 6) return false;
+    site.explicit_body = true;
+    site.len = (int)site.body.size();
+    return true;
+}
+
+void mutate_explicit_body_inplace(MacroSite &site) {
+    if (!site.explicit_body || site.body.empty()) return;
+
+    int type = rnd::get(5);
+    if (type == 0) {
+        // 1 文字置換
+        int i = rnd::get((int)site.body.size());
+        static constexpr char ops[3] = {'F', 'R', 'L'};
+        site.body[i] = ops[rnd::get(3)];
+    } else if (type == 1) {
+        // 挿入
+        if ((int)site.body.size() < 160) {
+            int i = rnd::get((int)site.body.size() + 1);
+            static constexpr char ops[3] = {'F', 'R', 'L'};
+            site.body.insert(site.body.begin() + i, ops[rnd::get(3)]);
+        }
+    } else if (type == 2) {
+        // 削除
+        if ((int)site.body.size() > 6) {
+            int i = rnd::get((int)site.body.size());
+            site.body.erase(site.body.begin() + i);
+        }
+    } else if (type == 3) {
+        // 短い区間を反転
+        int n = (int)site.body.size();
+        if (n >= 2) {
+            int l = rnd::get(n);
+            int r = rnd::get(n);
+            if (l > r) swap(l, r);
+            if (l < r) reverse(site.body.begin() + l, site.body.begin() + r + 1);
+        }
+    } else {
+        // 短い区間を複製
+        int n = (int)site.body.size();
+        if (n >= 2 && n < 150) {
+            int len = 1 + rnd::get(min(8, n));
+            int l = rnd::get(n - len + 1);
+            int to = rnd::get(n + 1);
+            vector<char> part(site.body.begin() + l, site.body.begin() + l + len);
+            if ((int)site.body.size() + len > 160) part.resize(160 - (int)site.body.size());
+            site.body.insert(site.body.begin() + to, part.begin(), part.end());
+        }
+    }
+    site.len = (int)site.body.size();
+}
+
+void crossover_explicit_bodies(MacroSite &dst, const MacroSite &src) {
+    if (!dst.explicit_body || !src.explicit_body || dst.body.empty() || src.body.empty()) return;
+
+    int dn = (int)dst.body.size();
+    int sn = (int)src.body.size();
+    int dl = rnd::get(dn);
+    int dr = rnd::get(dn);
+    if (dl > dr) swap(dl, dr);
+    if (dl == dr) dr = min(dn, dl + 1);
+
+    int take = 1 + rnd::get(min(24, sn));
+    int sl = rnd::get(sn - take + 1);
+
+    dst.body.erase(dst.body.begin() + dl, dst.body.begin() + dr);
+    dst.body.insert(dst.body.begin() + dl, src.body.begin() + sl, src.body.begin() + sl + take);
+    if ((int)dst.body.size() > 160) dst.body.resize(160);
+    if ((int)dst.body.size() < 6) {
+        while ((int)dst.body.size() < 6) dst.body.push_back('F');
+    }
+    dst.len = (int)dst.body.size();
+    dst.explicit_body = true;
+}
+
+void randomize_macro_site_location_inplace(const vector<int> &order, const OrderContext &ctx, MacroSite &site) {
+    const int m = (int)order.size();
+    if (m <= 0) return;
+
+    for (int trial = 0; trial < 20; ++trial) {
+        int leg = rnd::get(max(1, 2 * m));
+        if (leg >= (int)ctx.basic_leg_len.size()) continue;
+        int L = ctx.basic_leg_len[leg];
+        site.ball = order[leg / 2];
+        site.phase = leg & 1;
+        site.offset = (L <= 0 ? 0 : rnd::get(L + 1));
+        return;
+    }
+
+    int leg = rnd::get(max(1, 2 * m));
+    site.ball = order[leg / 2];
+    site.phase = leg & 1;
+    site.offset = 0;
+}
+
 MacroSite random_macro_site(const Solver &solver, const vector<int> &order, const OrderContext &ctx) {
-    (void)solver;
     static const vector<int> lens = {6, 8, 10, 12, 16, 20, 24, 32, 40, 56, 72, 96, 120};
     const int m = (int)order.size();
 
@@ -1198,7 +1693,10 @@ MacroSite random_macro_site(const Solver &solver, const vector<int> &order, cons
             s.offset = rnd::get(L - 5);
             s.len = 6 + rnd::get(min(160, L - s.offset) - 5);
         }
-        return s;
+        // body-state 版では、MacroSite は「場所」ではなく「定義する body」を主状態として持つ。
+        // そのため、新規 site は必ず現在の route slice から explicit body として materialize する。
+        MacroSite explicit_site = s;
+        if (materialize_macro_site_body(solver, order, ctx, explicit_site)) return explicit_site;
     }
 
     MacroSite s;
@@ -1209,18 +1707,23 @@ MacroSite random_macro_site(const Solver &solver, const vector<int> &order, cons
     return s;
 }
 
+MacroSite random_macro_site(const Solver &solver, const vector<int> &order) {
+    OrderContext ctx = build_order_context(solver, order);
+    return random_macro_site(solver, order, ctx);
+}
 
-int sample_weighted_type(const array<int, 8> &weights) {
+template <size_t N>
+int sample_weighted_type(const array<int, N> &weights) {
     int total = 0;
     for (int w : weights) total += w;
-    if (total <= 0) return rnd::get(8);
+    if (total <= 0) return rnd::get((int)N);
 
     int x = rnd::get(total);
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < (int)N; ++i) {
         if (x < weights[i]) return i;
         x -= weights[i];
     }
-    return 7;
+    return (int)N - 1;
 }
 
 void mutate_order_inplace(vector<int> &order, int type) {
@@ -1306,6 +1809,51 @@ struct MacroContainStats {
     int max_contained_chain = 0;
 };
 
+vector<vector<char>> build_basic_movement_legs(const Solver &solver, const vector<int> &order) {
+    vector<vector<char>> legs;
+    int cell = 0;
+    int dir = 1;
+
+    for (int k : order) {
+        int end_cell, end_dir;
+        legs.push_back(solver.basic_move_ops(cell, dir, solver.ball_cell(k), end_cell, end_dir));
+        cell = end_cell;
+        dir = end_dir;
+        legs.push_back(solver.basic_move_ops(cell, dir, solver.basket_cell(k), end_cell, end_dir));
+        cell = end_cell;
+        dir = end_dir;
+    }
+
+    return legs;
+}
+
+vector<PMacroPlacement> collect_p_macro_placements(const vector<vector<char>> &legs) {
+    vector<PMacroPlacement> candidates;
+    const vector<int> lens = {6, 8, 10, 12, 16, 20, 24, 32, 40, 56, 72, 96, 120};
+
+    for (int leg = 0; leg < (int)legs.size(); ++leg) {
+        int m = (int)legs[leg].size();
+        for (int offset = 0; offset < m; ++offset) {
+            for (int len : lens) {
+                if (offset + len <= m) {
+                    candidates.push_back(PMacroPlacement{leg, offset, len, false, {}});
+                }
+            }
+        }
+    }
+
+    return candidates;
+}
+
+void apply_buttons_with_macro(const Solver &solver, const vector<char> &buttons, const vector<char> &macro, int &cell, int &dir) {
+    for (char op : buttons) {
+        if (op == 'P') {
+            solver.apply_basic_ops(macro, cell, dir);
+        } else {
+            solver.apply_basic_op(op, cell, dir);
+        }
+    }
+}
 
 vector<char> expand_buttons_with_macro(const vector<char> &buttons, const vector<char> &macro) {
     vector<char> expanded;
@@ -1416,7 +1964,9 @@ vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<
         while (plan_idx < (int)plan.size() && plan[plan_idx].leg < leg) ++plan_idx;
         if (plan_idx < (int)plan.size() && plan[plan_idx].leg == leg) {
             def = plan[plan_idx];
-            if (def.offset + def.len <= (int)route.size()) {
+            if (def.explicit_body) {
+                if (def.offset <= (int)route.size() && !def.body.empty()) define_here = true;
+            } else if (def.offset + def.len <= (int)route.size()) {
                 define_here = true;
             }
             ++plan_idx;
@@ -1431,8 +1981,13 @@ vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<
         vector<char> prefix(route.begin(), route.begin() + def.offset);
         append_and_apply(prefix, macro);
 
-        vector<char> raw_definition(route.begin() + def.offset, route.begin() + def.offset + def.len);
-        vector<char> new_macro = expand_buttons_with_macro(raw_definition, macro);
+        vector<char> new_macro;
+        if (def.explicit_body) {
+            new_macro = def.body;
+        } else {
+            vector<char> raw_definition(route.begin() + def.offset, route.begin() + def.offset + def.len);
+            new_macro = expand_buttons_with_macro(raw_definition, macro);
+        }
         vector<char> definition_buttons = encode_with_previous_macro(new_macro, macro);
 
         if (stats) {
@@ -1533,6 +2088,10 @@ struct PlanEvalCache {
     long long ops_misses = 0;
     int trim_counter = 0;
 
+    void reserve_memory() {
+        info_cache.reserve(300000);
+        ops_cache.reserve(80000);
+    }
 
     void trim_if_needed() {
         if (((++trim_counter) & 16383) != 0) return;
@@ -1546,6 +2105,13 @@ struct PlanEvalCache {
     }
 };
 
+int score_p_macro_program(const vector<char> &program, int limit) {
+    int score = (int)program.size();
+    int expanded = expanded_basic_count(program);
+    if (score > limit) score += 1000000 + score - limit;
+    if (expanded > limit) score += 1000 * (expanded - limit);
+    return score;
+}
 
 int score_p_macro_plan_fast(const Solver &solver, const vector<int> &order, vector<PMacroPlacement> plan, int limit, int cutoff = numeric_limits<int>::max() / 4, PlanEvalCache *cache = nullptr) {
     const int leg_count = (int)order.size() * 2;
@@ -1662,7 +2228,12 @@ int score_p_macro_plan_fast(const Solver &solver, const vector<int> &order, vect
         }
 
         vector<char> route = current_route(target);
-        bool define_here = (def.offset + def.len <= (int)route.size());
+        bool define_here = false;
+        if (def.explicit_body) {
+            define_here = (def.offset <= (int)route.size() && !def.body.empty());
+        } else {
+            define_here = (def.offset + def.len <= (int)route.size());
+        }
         if (!define_here) {
             append_and_apply(route, macro);
             ++leg;
@@ -1672,8 +2243,13 @@ int score_p_macro_plan_fast(const Solver &solver, const vector<int> &order, vect
         vector<char> prefix(route.begin(), route.begin() + def.offset);
         append_and_apply(prefix, macro);
 
-        vector<char> raw_definition(route.begin() + def.offset, route.begin() + def.offset + def.len);
-        vector<char> new_macro = expand_buttons_with_macro(raw_definition, macro);
+        vector<char> new_macro;
+        if (def.explicit_body) {
+            new_macro = def.body;
+        } else {
+            vector<char> raw_definition(route.begin() + def.offset, route.begin() + def.offset + def.len);
+            new_macro = expand_buttons_with_macro(raw_definition, macro);
+        }
         vector<char> definition_buttons = encode_with_previous_macro(new_macro, macro);
 
         out_len += 2;
@@ -1724,6 +2300,7 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
     if (initial_order.empty()) return solver.build_ops(initial_order);
 
     PlanEvalCache eval_cache;
+    //eval_cache.reserve_memory();
 
     auto eval = [&](const vector<int> &ord, const OrderContext &ctx, const vector<MacroSite> &sites,
                     int cutoff = numeric_limits<int>::max() / 4) {
@@ -1795,8 +2372,8 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
     int accepted_macro_mutations = 0;
     array<int, 8> order_type_attempt{};
     array<int, 8> order_type_accept{};
-    array<int, 8> macro_type_attempt{};
-    array<int, 8> macro_type_accept{};
+    array<int, 10> macro_type_attempt{};
+    array<int, 10> macro_type_accept{};
 
     while (true) {
         double progress = (get_time() - start_time) / time_limit_sec;
@@ -1821,69 +2398,96 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
             14,  // 6: insert + macro追加の可能性あり
             6,   // 7: reverse + site間引き
         };
-        static constexpr array<int, 8> MACRO_TYPE_WEIGHT = {
-            16,  // 0: macro追加
-            6,   // 1: macro削除
-            10,  // 2: macro置換
-            9,   // 3: ball/phase変更
-            18,  // 4: offset変更
-            18,  // 5: len変更
-            5,   // 6: 複数macro置換
-            18,  // 7: shuffle + 削除/追加
+        static constexpr array<int, 10> MACRO_TYPE_WEIGHT = {
+            14,  // 0: body macro 追加
+            5,   // 1: macro削除
+            9,   // 2: body macro 置換
+            12,  // 3: 定義場所だけ移動し、body は保持
+            16,  // 4: 現在 route slice と body を splice
+            18,  // 5: body の局所編集
+            8,   // 6: 2つの body を crossover
+            12,  // 7: shuffle + 削除/追加
+            14,  // 8: 現在 route slice で body を再生成
+            10,  // 9: 定義場所をランダム leg へジャンプ
         };
 
-        int type = -1;
         int order_type = -1;
         int macro_type = -1;
         const bool choose_macro = rnd::get(2) == 0;
 
         if (choose_macro) {
             macro_type = sample_weighted_type(MACRO_TYPE_WEIGHT);
-            type = macro_type;
             ++macro_mutations;
             ++macro_type_attempt[macro_type];
-            if (type == 0 || next_sites.empty()) {
+
+            if (macro_type == 0 || next_sites.empty()) {
                 if ((int)next_sites.size() < max_defs) {
                     MacroSite s = random_macro_site(solver, *next_order, *next_ctx);
-                    if (s.len >= 6) next_sites.push_back(s);
+                    if (s.len >= 6 && s.explicit_body) next_sites.push_back(std::move(s));
                 }
-            } else if (type == 1) {
+            } else if (macro_type == 1) {
                 int idx = rnd::get((int)next_sites.size());
                 next_sites.erase(next_sites.begin() + idx);
-            } else if (type == 2) {
+            } else if (macro_type == 2) {
                 int idx = rnd::get((int)next_sites.size());
                 MacroSite s = random_macro_site(solver, *next_order, *next_ctx);
-                if (s.len >= 6) next_sites[idx] = s;
-            } else if (type == 3) {
+                if (s.len >= 6 && s.explicit_body) next_sites[idx] = std::move(s);
+            } else if (macro_type == 3) {
+                // body は保持したまま、定義する ball/phase と offset だけを近傍移動する。
                 int idx = rnd::get((int)next_sites.size());
-                next_sites[idx].ball = (*next_order)[rnd::get((int)next_order->size())];
-                next_sites[idx].phase ^= rnd::get(2);
-            } else if (type == 4) {
+                if (rnd::get(100) < 50) next_sites[idx].ball = (*next_order)[rnd::get((int)next_order->size())];
+                if (rnd::get(100) < 50) next_sites[idx].phase ^= 1;
+                next_sites[idx].offset += rnd::range(-24, 25);
+                next_sites[idx].explicit_body = true;
+            } else if (macro_type == 4) {
+                // 現在 route の slice と既存 body を混ぜる。body を探索状態として育てる主近傍。
                 int idx = rnd::get((int)next_sites.size());
-                next_sites[idx].offset += rnd::range(-16, 17);
-            } else if (type == 5) {
-                int idx = rnd::get((int)next_sites.size());
-                next_sites[idx].len += rnd::range(-32, 33);
-            } else if (type == 6) {
-                int cnt = min(3, max(1, (int)next_sites.size()));
-                for (int i = 0; i < cnt; ++i) {
-                    int idx = rnd::get((int)next_sites.size());
-                    MacroSite s = random_macro_site(solver, *next_order, *next_ctx);
-                    if (s.len >= 6) next_sites[idx] = s;
+                if (!splice_explicit_body_with_route(solver, *next_order, *next_ctx, next_sites[idx])) {
+                    refresh_explicit_body_from_route(solver, *next_order, *next_ctx, next_sites[idx]);
                 }
-            } else {
+            } else if (macro_type == 5) {
+                // route から離れた純粋な body 編集。
+                int idx = rnd::get((int)next_sites.size());
+                if (!next_sites[idx].explicit_body || next_sites[idx].body.empty()) {
+                    refresh_explicit_body_from_route(solver, *next_order, *next_ctx, next_sites[idx]);
+                } else {
+                    int repeat = 1 + (rnd::get(100) < 20);
+                    for (int rep = 0; rep < repeat; ++rep) mutate_explicit_body_inplace(next_sites[idx]);
+                }
+            } else if (macro_type == 6) {
+                // 複数 body の交叉。MacroSite の場所ではなく body 自体を組み替える。
+                if ((int)next_sites.size() >= 2) {
+                    int a = rnd::get((int)next_sites.size());
+                    int b = rnd::get((int)next_sites.size());
+                    if (a != b) crossover_explicit_bodies(next_sites[a], next_sites[b]);
+                } else {
+                    MacroSite s = random_macro_site(solver, *next_order, *next_ctx);
+                    if (s.len >= 6 && s.explicit_body && (int)next_sites.size() < max_defs) next_sites.push_back(std::move(s));
+                }
+            } else if (macro_type == 7) {
                 rnd::shuffle(next_sites);
-                while ((int)next_sites.size() > 1 && rnd::get(100) < 35) {
+                while ((int)next_sites.size() > 1 && rnd::get(100) < 30) {
                     next_sites.erase(next_sites.begin() + rnd::get((int)next_sites.size()));
                 }
-                while ((int)next_sites.size() < max_defs && rnd::get(100) < 55) {
+                while ((int)next_sites.size() < max_defs && rnd::get(100) < 50) {
                     MacroSite s = random_macro_site(solver, *next_order, *next_ctx);
-                    if (s.len >= 6) next_sites.push_back(s);
+                    if (s.len >= 6 && s.explicit_body) next_sites.push_back(std::move(s));
                 }
+            } else if (macro_type == 8) {
+                // 同じ場所の現在 route slice で body を完全に再生成する。
+                int idx = rnd::get((int)next_sites.size());
+                if (!refresh_explicit_body_from_route(solver, *next_order, *next_ctx, next_sites[idx])) {
+                    MacroSite s = random_macro_site(solver, *next_order, *next_ctx);
+                    if (s.len >= 6 && s.explicit_body) next_sites[idx] = std::move(s);
+                }
+            } else {
+                // body は保持し、定義場所をランダムな leg へ大きく移動する。
+                int idx = rnd::get((int)next_sites.size());
+                randomize_macro_site_location_inplace(*next_order, *next_ctx, next_sites[idx]);
+                next_sites[idx].explicit_body = true;
             }
         } else {
             order_type = sample_weighted_type(ORDER_TYPE_WEIGHT);
-            type = 8 + order_type;
             ++order_mutations;
             ++order_type_attempt[order_type];
             touched_order = true;
@@ -1955,6 +2559,14 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
 
     MacroContainStats stats;
     vector<char> answer = build_answer(best_order, best_ctx, best_sites, &stats);
+    int explicit_sites = 0;
+    int explicit_body_total = 0;
+    for (const MacroSite &s : best_sites) {
+        if (s.explicit_body) {
+            ++explicit_sites;
+            explicit_body_total += (int)s.body.size();
+        }
+    }
     cerr << "joint_order_macro"
          << " initial_raw=" << raw_order_score(solver, initial_order)
          << " best_score=" << best_score
@@ -1965,6 +2577,8 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
          << " saving=" << stats.encoded_saving
          << " chain=" << stats.max_contained_chain
          << " bonus=" << macro_containment_bonus(stats)
+         << " explicit_sites=" << explicit_sites
+         << " explicit_body_total=" << explicit_body_total
          << " iter=" << iter
          << " order_mut=" << accepted_order_mutations << "/" << order_mutations
          << " macro_mut=" << accepted_macro_mutations << "/" << macro_mutations
@@ -1983,12 +2597,12 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
         cerr << order_type_accept[i];
     }
     cerr << " macro_type_attempt=";
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < (int)macro_type_attempt.size(); ++i) {
         if (i) cerr << ',';
         cerr << macro_type_attempt[i];
     }
     cerr << " macro_type_accept=";
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < (int)macro_type_accept.size(); ++i) {
         if (i) cerr << ',';
         cerr << macro_type_accept[i];
     }
