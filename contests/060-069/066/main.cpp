@@ -212,18 +212,6 @@ class Solver {
         return info;
     }
 
-    vector<int> build_macro_transition(const vector<char> &macro) const {
-        vector<int> transition(total * 4);
-        for (int cell = 0; cell < total; ++cell) {
-            for (int dir = 0; dir < 4; ++dir) {
-                int next_cell = cell;
-                int next_dir = dir;
-                apply_basic_ops(macro, next_cell, next_dir);
-                transition[cell * 4 + dir] = next_cell * 4 + next_dir;
-            }
-        }
-        return transition;
-    }
 
     vector<int> build_macro_transition_from_buttons(const vector<char> &buttons, const vector<int> &old_transition) const {
         const int states = total * 4;
@@ -265,8 +253,8 @@ class Solver {
         macro_bfs_queue[q_tail++] = start;
         int goal = -1;
 
-        auto push_next = [&](int cur_state, int next_cell, int next_dir, char op) {
-            int ns = sid(next_cell, next_dir);
+        auto push_next = [&](int cur_state, int next_cell_arg, int next_dir, char op) {
+            int ns = sid(next_cell_arg, next_dir);
             if (ns == cur_state || macro_bfs_seen[ns] == macro_bfs_stamp) return;
             macro_bfs_seen[ns] = macro_bfs_stamp;
             macro_bfs_dist[ns] = macro_bfs_dist[cur_state] + 1;
@@ -373,137 +361,8 @@ class Solver {
     }
 
 
-    template <class Emit>
-    RouteInfo greedy_macro_route_with_transition(int from, int from_dir, int to, const vector<int> &macro_transition, Emit emit) const {
-        RouteInfo info;
-        int cell = from;
-        int dir = from_dir;
-        const bool has_macro = !macro_transition.empty();
-
-        auto state_id = [](int c, int d) {
-            return c * 4 + d;
-        };
-
-        auto basic_len = [&](int c, int d) {
-            int end_dir = d;
-            return basic_move_len_fast(c, d, to, end_dir);
-        };
-
-        auto apply_basic_emit = [&](char op) {
-            emit(op);
-            ++info.len;
-            apply_basic_op(op, cell, dir);
-        };
-
-        auto apply_p_emit = [&]() {
-            emit('P');
-            ++info.len;
-            ++info.p_count;
-            int ns = macro_transition[state_id(cell, dir)];
-            cell = ns / 4;
-            dir = ns & 3;
-        };
-
-        auto basic_first_op = [&]() -> char {
-            if (cell == to) return 0;
-            int next_dir = first_dir_at(cell, to);
-            if (next_dir == NO_DIR) return 0;
-            int diff = (next_dir - dir + 4) & 3;
-            if (diff == 0) return 'F';
-            if (diff == 1) return 'R';
-            if (diff == 2) return 'R';
-            return 'L';
-        };
-
-        int start_basic = basic_len(cell, dir);
-        int safety = max(20, start_basic * 4 + 200);
-
-        while (cell != to && safety-- > 0) {
-            int base = basic_len(cell, dir);
-            if (base <= 0) break;
-
-            char first = basic_first_op();
-            if (first == 0) break;
-
-            struct Choice {
-                int est = INT_MAX;
-                char a = 0;
-                char b = 0;
-                int p_count = 0;
-            } best;
-            best.est = base;
-            best.a = first;
 
 
-            auto consider_p = [&](int c, int d, int prefix_cost, char a, char b) {
-                if (!has_macro) return;
-                int st = state_id(c, d);
-                int ns = macro_transition[st];
-                if (ns == st) return;
-                int nc = ns / 4;
-                int nd = ns & 3;
-                int est = prefix_cost + 1 + basic_len(nc, nd);
-                if (est < best.est) {
-                    best.est = est;
-                    best.a = a;
-                    best.b = b;
-                    best.p_count = 1;
-                }
-            };
-
-            consider_p(cell, dir, 0, 'P', 0);
-            consider_p(cell, (dir + 1) & 3, 1, 'R', 'P');
-            consider_p(cell, (dir + 3) & 3, 1, 'L', 'P');
-            if (next_cell[cell][dir] != -1) {
-                consider_p(next_cell[cell][dir], dir, 1, 'F', 'P');
-            }
-
-            if (best.p_count == 0) {
-                apply_basic_emit(best.a);
-            } else {
-                if (best.a == 'P') {
-                    apply_p_emit();
-                } else {
-                    apply_basic_emit(best.a);
-                    apply_p_emit();
-                }
-            }
-        }
-
-        if (cell != to) {
-            int end_cell = cell;
-            int end_dir = dir;
-            vector<char> rest = basic_move_ops(cell, dir, to, end_cell, end_dir);
-            for (char op : rest) {
-                emit(op);
-            }
-            info.len += (int)rest.size();
-            cell = end_cell;
-            dir = end_dir;
-        }
-
-        info.end_cell = cell;
-        info.end_dir = dir;
-        return info;
-    }
-
-    RouteInfo greedy_macro_move_info_with_transition(int from, int from_dir, int to, const vector<int> &macro_transition) const {
-        auto noop = [](char) {};
-        return greedy_macro_route_with_transition(from, from_dir, to, macro_transition, noop);
-    }
-
-    vector<char> greedy_macro_move_ops_with_transition(int from, int from_dir, int to, const vector<int> &macro_transition, int &end_cell, int &end_dir) const {
-        vector<char> ops;
-        int reserve_len = basic_move_len_fast(from, from_dir, to, end_dir);
-        ops.reserve(max(0, reserve_len));
-        auto emit = [&](char op) {
-            ops.push_back(op);
-        };
-        RouteInfo info = greedy_macro_route_with_transition(from, from_dir, to, macro_transition, emit);
-        end_cell = info.end_cell;
-        end_dir = info.end_dir;
-        return ops;
-    }
 
   private:
     static constexpr int UP = 0;
@@ -1135,105 +994,6 @@ vector<vector<int>> build_goal_reverse_orders(const Solver &solver) {
     return orders;
 }
 
-vector<int> build_light_goal_reverse_order(const Solver &solver) {
-    vector<vector<int>> orders = build_goal_reverse_orders(solver);
-    if (orders.empty()) return solver.build_greedy_order();
-
-    auto refine_by_local_moves = [&](vector<int> order, int current_score) {
-        const int m = (int)order.size();
-        auto move_one = [&](int from, int to) {
-            if (from == to) return;
-            int value = order[from];
-            if (from < to) {
-                for (int k = from; k < to; ++k) order[k] = order[k + 1];
-            } else {
-                for (int k = from; k > to; --k) order[k] = order[k - 1];
-            }
-            order[to] = value;
-        };
-
-        for (int pass = 0; pass < 2; ++pass) {
-            int best_type = 0;
-            int best_i = -1;
-            int best_j = -1;
-            int best_score = current_score;
-
-            for (int i = 0; i < m; ++i) {
-                for (int j = i + 1; j < m; ++j) {
-                    swap(order[i], order[j]);
-                    int score = raw_order_score(solver, order);
-                    if (score < best_score) {
-                        best_type = 1;
-                        best_score = score;
-                        best_i = i;
-                        best_j = j;
-                    }
-                    swap(order[i], order[j]);
-                }
-            }
-
-            for (int i = 0; i < m; ++i) {
-                for (int j = 0; j < m; ++j) {
-                    if (i == j) continue;
-                    move_one(i, j);
-                    int score = raw_order_score(solver, order);
-                    if (score < best_score) {
-                        best_type = 2;
-                        best_score = score;
-                        best_i = i;
-                        best_j = j;
-                    }
-                    move_one(j, i);
-                }
-            }
-
-            if (best_type == 0) break;
-            if (best_type == 1) {
-                swap(order[best_i], order[best_j]);
-            } else {
-                move_one(best_i, best_j);
-            }
-            current_score = best_score;
-        }
-        return pair<vector<int>, int>(order, current_score);
-    };
-
-    vector<pair<int, int>> scored;
-    scored.reserve(orders.size());
-    for (int i = 0; i < (int)orders.size(); ++i) {
-        scored.push_back({raw_order_score(solver, orders[i]), i});
-    }
-
-    sort(scored.begin(), scored.end());
-    const int original_best = scored.front().first;
-
-    const int refine_keep = min((int)scored.size(), 8);
-    int refined_best = original_best;
-    for (int rank = 0; rank < refine_keep; ++rank) {
-        auto [refined, score] = refine_by_local_moves(orders[scored[rank].second], scored[rank].first);
-        if (score < refined_best) refined_best = score;
-        orders.push_back(std::move(refined));
-    }
-
-    sort(orders.begin(), orders.end());
-    orders.erase(unique(orders.begin(), orders.end()), orders.end());
-
-    scored.clear();
-    scored.reserve(orders.size());
-    for (int i = 0; i < (int)orders.size(); ++i) {
-        scored.push_back({raw_order_score(solver, orders[i]), i});
-    }
-    sort(scored.begin(), scored.end());
-
-    cerr << "order_select candidates=" << orders.size()
-         << " refine_keep=" << refine_keep
-         << " original_raw=" << original_best
-         << " refined_raw=" << refined_best
-         << " chosen_raw=" << scored.front().first
-         << '\n';
-
-    return orders[scored[0].second];
-}
 
 int expanded_basic_count(const vector<char> &encoded) {
     int count = 0;
@@ -1282,10 +1042,6 @@ struct MacroSite {
     int len = 0;
 };
 
-struct JointSearchState {
-    vector<int> order;
-    vector<MacroSite> sites;
-};
 
 vector<int> build_pos_in_order(const vector<int> &order, int m) {
     vector<int> pos(m, -1);
@@ -1363,10 +1119,6 @@ MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, cons
     return s;
 }
 
-MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, MacroSite s) {
-    OrderContext ctx = build_order_context(solver, order);
-    return repair_macro_site(solver, order, ctx, s);
-}
 
 void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &order, const OrderContext &ctx,
                                    vector<MacroSite> &sites, int max_defs) {
@@ -1392,30 +1144,6 @@ void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &orde
     }
 }
 
-void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &order, vector<MacroSite> &sites, int max_defs) {
-    OrderContext ctx = build_order_context(solver, order);
-    normalize_macro_sites_inplace(solver, order, ctx, sites, max_defs);
-}
-
-vector<PMacroPlacement> convert_sites_to_plan(const Solver &solver, const vector<int> &order,
-                                              const OrderContext &ctx, const vector<MacroSite> &sites) {
-    vector<PMacroPlacement> plan;
-    plan.reserve(sites.size());
-
-    for (MacroSite s : sites) {
-        s = repair_macro_site(solver, order, ctx, s);
-        if (s.len < 6) continue;
-        int p = ctx.pos[s.ball];
-        if (p < 0) continue;
-        plan.push_back(PMacroPlacement{p * 2 + s.phase, s.offset, s.len});
-    }
-    return plan;
-}
-
-vector<PMacroPlacement> convert_sites_to_plan(const Solver &solver, const vector<int> &order, const vector<MacroSite> &sites) {
-    OrderContext ctx = build_order_context(solver, order);
-    return convert_sites_to_plan(solver, order, ctx, sites);
-}
 
 // normalize_macro_sites_inplace() 済みの sites を PMacroPlacement に変換する軽量版。
 // repair_macro_site() をここで再実行しないことで、評価時の重複計算を避ける。
@@ -1481,10 +1209,6 @@ MacroSite random_macro_site(const Solver &solver, const vector<int> &order, cons
     return s;
 }
 
-MacroSite random_macro_site(const Solver &solver, const vector<int> &order) {
-    OrderContext ctx = build_order_context(solver, order);
-    return random_macro_site(solver, order, ctx);
-}
 
 int sample_weighted_type(const array<int, 8> &weights) {
     int total = 0;
@@ -1582,51 +1306,6 @@ struct MacroContainStats {
     int max_contained_chain = 0;
 };
 
-vector<vector<char>> build_basic_movement_legs(const Solver &solver, const vector<int> &order) {
-    vector<vector<char>> legs;
-    int cell = 0;
-    int dir = 1;
-
-    for (int k : order) {
-        int end_cell, end_dir;
-        legs.push_back(solver.basic_move_ops(cell, dir, solver.ball_cell(k), end_cell, end_dir));
-        cell = end_cell;
-        dir = end_dir;
-        legs.push_back(solver.basic_move_ops(cell, dir, solver.basket_cell(k), end_cell, end_dir));
-        cell = end_cell;
-        dir = end_dir;
-    }
-
-    return legs;
-}
-
-vector<PMacroPlacement> collect_p_macro_placements(const vector<vector<char>> &legs) {
-    vector<PMacroPlacement> candidates;
-    const vector<int> lens = {6, 8, 10, 12, 16, 20, 24, 32, 40, 56, 72, 96, 120};
-
-    for (int leg = 0; leg < (int)legs.size(); ++leg) {
-        int m = (int)legs[leg].size();
-        for (int offset = 0; offset < m; ++offset) {
-            for (int len : lens) {
-                if (offset + len <= m) {
-                    candidates.push_back(PMacroPlacement{leg, offset, len});
-                }
-            }
-        }
-    }
-
-    return candidates;
-}
-
-void apply_buttons_with_macro(const Solver &solver, const vector<char> &buttons, const vector<char> &macro, int &cell, int &dir) {
-    for (char op : buttons) {
-        if (op == 'P') {
-            solver.apply_basic_ops(macro, cell, dir);
-        } else {
-            solver.apply_basic_op(op, cell, dir);
-        }
-    }
-}
 
 vector<char> expand_buttons_with_macro(const vector<char> &buttons, const vector<char> &macro) {
     vector<char> expanded;
@@ -1854,10 +1533,6 @@ struct PlanEvalCache {
     long long ops_misses = 0;
     int trim_counter = 0;
 
-    void reserve_memory() {
-        info_cache.reserve(300000);
-        ops_cache.reserve(80000);
-    }
 
     void trim_if_needed() {
         if (((++trim_counter) & 16383) != 0) return;
@@ -1871,13 +1546,6 @@ struct PlanEvalCache {
     }
 };
 
-int score_p_macro_program(const vector<char> &program, int limit) {
-    int score = (int)program.size();
-    int expanded = expanded_basic_count(program);
-    if (score > limit) score += 1000000 + score - limit;
-    if (expanded > limit) score += 1000 * (expanded - limit);
-    return score;
-}
 
 int score_p_macro_plan_fast(const Solver &solver, const vector<int> &order, vector<PMacroPlacement> plan, int limit, int cutoff = numeric_limits<int>::max() / 4, PlanEvalCache *cache = nullptr) {
     const int leg_count = (int)order.size() * 2;
@@ -2056,7 +1724,6 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
     if (initial_order.empty()) return solver.build_ops(initial_order);
 
     PlanEvalCache eval_cache;
-    //eval_cache.reserve_memory();
 
     auto eval = [&](const vector<int> &ord, const OrderContext &ctx, const vector<MacroSite> &sites,
                     int cutoff = numeric_limits<int>::max() / 4) {
