@@ -1264,13 +1264,10 @@ vector<int> build_light_goal_reverse_order(const Solver &solver) {
     }
 
     sort(scored.begin(), scored.end());
-    const int original_best = scored.front().first;
-
     const int refine_keep = min((int)scored.size(), 8);
-    int refined_best = original_best;
     for (int rank = 0; rank < refine_keep; ++rank) {
         auto [refined, score] = refine_by_local_moves(orders[scored[rank].second], scored[rank].first);
-        if (score < refined_best) refined_best = score;
+        (void)score;
         orders.push_back(std::move(refined));
     }
 
@@ -1283,13 +1280,6 @@ vector<int> build_light_goal_reverse_order(const Solver &solver) {
         scored.push_back({raw_order_score(solver, orders[i]), i});
     }
     sort(scored.begin(), scored.end());
-
-    cerr << "order_select candidates=" << orders.size()
-         << " refine_keep=" << refine_keep
-         << " original_raw=" << original_best
-         << " refined_raw=" << refined_best
-         << " chosen_raw=" << scored.front().first
-         << '\n';
 
     return orders[scored[0].second];
 }
@@ -1335,6 +1325,90 @@ struct PMacroPlacement {
     vector<char> body;
 };
 
+struct MacroBody {
+    static constexpr int CAPACITY = 160;
+    array<char, CAPACITY> data{};
+    int n = 0;
+
+    using iterator = char *;
+    using const_iterator = const char *;
+
+    int size() const { return n; }
+    bool empty() const { return n == 0; }
+    iterator begin() { return data.data(); }
+    iterator end() { return data.data() + n; }
+    const_iterator begin() const { return data.data(); }
+    const_iterator end() const { return data.data() + n; }
+
+    char &operator[](int idx) { return data[idx]; }
+    const char &operator[](int idx) const { return data[idx]; }
+
+    void clear() { n = 0; }
+
+    void resize(int sz) {
+        sz = max(0, min(sz, CAPACITY));
+        while (n < sz) data[n++] = 'F';
+        n = sz;
+    }
+
+    void push_back(char ch) {
+        if (n < CAPACITY) data[n++] = ch;
+    }
+
+    iterator erase(iterator first, iterator last) {
+        int l = max(0, min((int)(first - begin()), n));
+        int r = max(l, min((int)(last - begin()), n));
+        int removed = r - l;
+        for (int i = r; i < n; ++i) data[i - removed] = data[i];
+        n -= removed;
+        return begin() + l;
+    }
+
+    iterator erase(iterator pos) {
+        return erase(pos, pos + 1);
+    }
+
+    template <class It>
+    iterator insert(iterator pos, It first, It last) {
+        int p = max(0, min((int)(pos - begin()), n));
+        array<char, CAPACITY> tmp{};
+        int add = 0;
+        for (; first != last && add < CAPACITY; ++first) tmp[add++] = *first;
+        add = min(add, CAPACITY - n);
+        if (add <= 0) return begin() + p;
+        for (int i = n - 1; i >= p; --i) data[i + add] = data[i];
+        for (int i = 0; i < add; ++i) data[p + i] = tmp[i];
+        n += add;
+        return begin() + p;
+    }
+
+    iterator insert(iterator pos, char ch) {
+        int p = max(0, min((int)(pos - begin()), n));
+        if (n >= CAPACITY) return begin() + p;
+        for (int i = n - 1; i >= p; --i) data[i + 1] = data[i];
+        data[p] = ch;
+        ++n;
+        return begin() + p;
+    }
+
+    template <class It>
+    void assign(It first, It last) {
+        n = 0;
+        for (; first != last && n < CAPACITY; ++first) data[n++] = *first;
+    }
+
+    vector<char> to_vector() const {
+        return vector<char>(begin(), end());
+    }
+
+    operator vector<char>() const {
+        return to_vector();
+    }
+
+    bool operator==(const MacroBody &other) const {
+        return n == other.n && equal(begin(), end(), other.begin());
+    }
+};
 
 struct MacroSite {
     int ball = 0;
@@ -1342,38 +1416,13 @@ struct MacroSite {
     int offset = 0;
     int len = 0;
     bool explicit_body = true;   // body-state 版では基本的に常に true。false は旧 slice 候補の一時状態のみ
-    vector<char> body;           // 探索対象の expanded basic body
-};
-
-struct JointSearchState {
-    vector<int> order;
-    vector<MacroSite> sites;
+    MacroBody body;              // 探索対象の expanded basic body
 };
 
 vector<int> build_pos_in_order(const vector<int> &order, int m) {
     vector<int> pos(m, -1);
     for (int i = 0; i < (int)order.size(); ++i) pos[order[i]] = i;
     return pos;
-}
-
-vector<int> build_basic_leg_lengths(const Solver &solver, const vector<int> &order) {
-    vector<int> leg_len;
-    leg_len.reserve((int)order.size() * 2);
-
-    int cell = 0;
-    int dir = 1;
-    for (int k : order) {
-        Solver::RouteInfo to_ball = solver.basic_move_info(cell, dir, solver.ball_cell(k));
-        leg_len.push_back(to_ball.len);
-        cell = to_ball.end_cell;
-        dir = to_ball.end_dir;
-
-        Solver::RouteInfo to_basket = solver.basic_move_info(cell, dir, solver.basket_cell(k));
-        leg_len.push_back(to_basket.len);
-        cell = to_basket.end_cell;
-        dir = to_basket.end_dir;
-    }
-    return leg_len;
 }
 
 struct OrderContext {
@@ -1395,6 +1444,63 @@ OrderContext build_order_context(const Solver &solver, const vector<int> &order)
     int cell = 0;
     int dir = 1;
     for (int k : order) {
+        ctx.leg_start_cell.push_back(cell);
+        ctx.leg_start_dir.push_back(dir);
+        Solver::RouteInfo to_ball = solver.basic_move_info(cell, dir, solver.ball_cell(k));
+        ctx.basic_leg_len.push_back(to_ball.len);
+        cell = to_ball.end_cell;
+        dir = to_ball.end_dir;
+
+        ctx.leg_start_cell.push_back(cell);
+        ctx.leg_start_dir.push_back(dir);
+        Solver::RouteInfo to_basket = solver.basic_move_info(cell, dir, solver.basket_cell(k));
+        ctx.basic_leg_len.push_back(to_basket.len);
+        cell = to_basket.end_cell;
+        dir = to_basket.end_dir;
+    }
+
+    return ctx;
+}
+
+OrderContext build_order_context_reusing_prefix(const Solver &solver, const vector<int> &prev_order,
+                                                const OrderContext &prev_ctx, const vector<int> &order) {
+    OrderContext ctx;
+    ctx.pos.assign(solver.ball_count(), -1);
+    for (int i = 0; i < (int)order.size(); ++i) ctx.pos[order[i]] = i;
+
+    const int leg_count = (int)order.size() * 2;
+    ctx.basic_leg_len.reserve(leg_count);
+    ctx.leg_start_cell.reserve(leg_count);
+    ctx.leg_start_dir.reserve(leg_count);
+
+    int prefix = 0;
+    const int common_limit = min((int)prev_order.size(), (int)order.size());
+    while (prefix < common_limit && prev_order[prefix] == order[prefix]) ++prefix;
+
+    const int copied_legs = min(2 * prefix, leg_count);
+    if (copied_legs > (int)prev_ctx.basic_leg_len.size() ||
+        copied_legs > (int)prev_ctx.leg_start_cell.size() ||
+        copied_legs > (int)prev_ctx.leg_start_dir.size()) {
+        return build_order_context(solver, order);
+    }
+    ctx.basic_leg_len.insert(ctx.basic_leg_len.end(), prev_ctx.basic_leg_len.begin(),
+                             prev_ctx.basic_leg_len.begin() + copied_legs);
+    ctx.leg_start_cell.insert(ctx.leg_start_cell.end(), prev_ctx.leg_start_cell.begin(),
+                              prev_ctx.leg_start_cell.begin() + copied_legs);
+    ctx.leg_start_dir.insert(ctx.leg_start_dir.end(), prev_ctx.leg_start_dir.begin(),
+                             prev_ctx.leg_start_dir.begin() + copied_legs);
+
+    if (prefix >= (int)order.size()) return ctx;
+
+    int cell = 0;
+    int dir = 1;
+    if (copied_legs > 0) {
+        cell = prev_ctx.leg_start_cell[copied_legs];
+        dir = prev_ctx.leg_start_dir[copied_legs];
+    }
+
+    for (int i = prefix; i < (int)order.size(); ++i) {
+        int k = order[i];
         ctx.leg_start_cell.push_back(cell);
         ctx.leg_start_dir.push_back(dir);
         Solver::RouteInfo to_ball = solver.basic_move_info(cell, dir, solver.ball_cell(k));
@@ -1482,15 +1588,6 @@ void repair_macro_site_inplace(const Solver &solver, const vector<int> &order, c
     s.body.clear();
 }
 
-MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, const OrderContext &ctx, MacroSite s) {
-    repair_macro_site_inplace(solver, order, ctx, s);
-    return s;
-}
-MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, MacroSite s) {
-    OrderContext ctx = build_order_context(solver, order);
-    return repair_macro_site(solver, order, ctx, s);
-}
-
 void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &order, const OrderContext &ctx,
                                    vector<MacroSite> &sites, int max_defs) {
     for (MacroSite &s : sites) repair_macro_site_inplace(solver, order, ctx, s);
@@ -1515,39 +1612,8 @@ void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &orde
     }
 }
 
-void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &order, vector<MacroSite> &sites, int max_defs) {
-    OrderContext ctx = build_order_context(solver, order);
-    normalize_macro_sites_inplace(solver, order, ctx, sites, max_defs);
-}
-
-vector<PMacroPlacement> convert_sites_to_plan(const Solver &solver, const vector<int> &order,
-                                              const OrderContext &ctx, const vector<MacroSite> &sites) {
-    vector<PMacroPlacement> plan;
-    plan.reserve(sites.size());
-
-    for (MacroSite s : sites) {
-        s = repair_macro_site(solver, order, ctx, s);
-        if (s.len < 6) continue;
-        int p = ctx.pos[s.ball];
-        if (p < 0) continue;
-        PMacroPlacement pm;
-        pm.leg = p * 2 + s.phase;
-        pm.offset = s.offset;
-        pm.len = s.len;
-        pm.explicit_body = s.explicit_body;
-        if (s.explicit_body) pm.body = s.body;
-        plan.push_back(std::move(pm));
-    }
-    return plan;
-}
-
-vector<PMacroPlacement> convert_sites_to_plan(const Solver &solver, const vector<int> &order, const vector<MacroSite> &sites) {
-    OrderContext ctx = build_order_context(solver, order);
-    return convert_sites_to_plan(solver, order, ctx, sites);
-}
-
 // normalize_macro_sites_inplace() 済みの sites を PMacroPlacement に変換する軽量版。
-// repair_macro_site() をここで再実行しないことで、評価時の重複計算を避ける。
+// repair_macro_site_inplace() をここで再実行しないことで、評価時の重複計算を避ける。
 vector<PMacroPlacement> convert_sites_to_plan_no_repair(const vector<int> &order,
                                                         const OrderContext &ctx,
                                                         const vector<MacroSite> &sites) {
@@ -1600,7 +1666,7 @@ vector<char> build_basic_leg_ops_for_site(const Solver &solver, const vector<int
 bool materialize_macro_site_body(const Solver &solver, const vector<int> &order, const OrderContext &ctx, MacroSite &site) {
     site.explicit_body = false;
     site.body.clear();
-    site = repair_macro_site(solver, order, ctx, site);
+    repair_macro_site_inplace(solver, order, ctx, site);
     if (site.len < 6) return false;
 
     vector<char> leg_ops = build_basic_leg_ops_for_site(solver, order, ctx, site);
@@ -1868,64 +1934,7 @@ vector<int> build_initial_order_fast(const Solver &solver) {
         }
     }
 
-    cerr << "initial_order candidates=" << orders.size()
-         << " chosen_raw=" << best_score << '\n';
     return orders[best_idx];
-}
-
-struct MacroContainStats {
-    int definitions = 0;
-    int contained_definitions = 0;
-    int contained_p_count = 0;
-    int encoded_saving = 0;
-    int consecutive_contained = 0;
-    int max_contained_chain = 0;
-};
-
-vector<vector<char>> build_basic_movement_legs(const Solver &solver, const vector<int> &order) {
-    vector<vector<char>> legs;
-    int cell = 0;
-    int dir = 1;
-
-    for (int k : order) {
-        int end_cell, end_dir;
-        legs.push_back(solver.basic_move_ops(cell, dir, solver.ball_cell(k), end_cell, end_dir));
-        cell = end_cell;
-        dir = end_dir;
-        legs.push_back(solver.basic_move_ops(cell, dir, solver.basket_cell(k), end_cell, end_dir));
-        cell = end_cell;
-        dir = end_dir;
-    }
-
-    return legs;
-}
-
-vector<PMacroPlacement> collect_p_macro_placements(const vector<vector<char>> &legs) {
-    vector<PMacroPlacement> candidates;
-    const vector<int> lens = {6, 8, 10, 12, 16, 20, 24, 32, 40, 56, 72, 96, 120};
-
-    for (int leg = 0; leg < (int)legs.size(); ++leg) {
-        int m = (int)legs[leg].size();
-        for (int offset = 0; offset < m; ++offset) {
-            for (int len : lens) {
-                if (offset + len <= m) {
-                    candidates.push_back(PMacroPlacement{leg, offset, len, false, {}});
-                }
-            }
-        }
-    }
-
-    return candidates;
-}
-
-void apply_buttons_with_macro(const Solver &solver, const vector<char> &buttons, const vector<char> &macro, int &cell, int &dir) {
-    for (char op : buttons) {
-        if (op == 'P') {
-            solver.apply_basic_ops(macro, cell, dir);
-        } else {
-            solver.apply_basic_op(op, cell, dir);
-        }
-    }
 }
 
 vector<char> expand_buttons_with_macro(const vector<char> &buttons, const vector<char> &macro) {
@@ -1992,7 +2001,7 @@ vector<PMacroPlacement> normalize_p_macro_plan(vector<PMacroPlacement> plan, int
     return res;
 }
 
-vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<int> &order, vector<PMacroPlacement> plan, MacroContainStats *stats = nullptr) {
+vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<int> &order, vector<PMacroPlacement> plan) {
     const int leg_count = (int)order.size() * 2;
     plan = normalize_p_macro_plan(std::move(plan), leg_count);
 
@@ -2004,7 +2013,6 @@ vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<
     int dir = 1;
     int leg = 0;
     int plan_idx = 0;
-    int contained_chain = 0;
 
     auto append_and_apply = [&](const vector<char> &buttons, const vector<char> &active_macro) {
         program.insert(program.end(), buttons.begin(), buttons.end());
@@ -2075,21 +2083,6 @@ vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<
             new_macro = expand_buttons_with_macro(raw_definition, macro);
         }
         vector<char> definition_buttons = encode_with_previous_macro(new_macro, macro);
-
-        if (stats) {
-            ++stats->definitions;
-            int p_count = (int)count(definition_buttons.begin(), definition_buttons.end(), 'P');
-            if (p_count > 0) {
-                ++stats->contained_definitions;
-                stats->contained_p_count += p_count;
-                stats->encoded_saving += max(0, (int)new_macro.size() - (int)definition_buttons.size());
-                ++contained_chain;
-                stats->consecutive_contained += max(0, contained_chain - 1);
-                stats->max_contained_chain = max(stats->max_contained_chain, contained_chain);
-            } else {
-                contained_chain = 0;
-            }
-        }
 
         program.push_back('M');
         program.insert(program.end(), definition_buttons.begin(), definition_buttons.end());
@@ -2235,10 +2228,6 @@ struct CachedRouteOps {
 struct PlanEvalCache {
     RouteInfoFlatCache info_cache;
     unordered_map<RouteCacheKey, CachedRouteOps, RouteCacheKeyHash> ops_cache;
-    long long info_hits = 0;
-    long long info_misses = 0;
-    long long ops_hits = 0;
-    long long ops_misses = 0;
     int trim_counter = 0;
 
     void reserve_memory() {
@@ -2278,203 +2267,73 @@ struct MacroEvalTrace {
     vector<MacroActiveTraceState> macro_states;
 };
 
-int score_p_macro_program(const vector<char> &program, int limit) {
-    int score = (int)program.size();
-    int expanded = expanded_basic_count(program);
-    if (score > limit) score += 1000000 + score - limit;
-    if (expanded > limit) score += 1000 * (expanded - limit);
-    return score;
-}
+struct SmallIntOrder {
+    static constexpr int INLINE_CAP = 32;
+    array<int, INLINE_CAP> small{};
+    vector<int> large;
+    int n = 0;
+    bool large_mode = false;
 
-int score_p_macro_plan_fast(const Solver &solver, const vector<int> &order, vector<PMacroPlacement> plan, int limit, int cutoff = numeric_limits<int>::max() / 4, PlanEvalCache *cache = nullptr) {
-    const int leg_count = (int)order.size() * 2;
-    plan = normalize_p_macro_plan(std::move(plan), leg_count);
-
-    vector<char> macro;
-    vector<int> macro_transition;
-    bool has_macro = false;
-    int cell = 0;
-    int dir = 1;
-    int leg = 0;
-    int plan_idx = 0;
-    int out_len = 0;
-    int expanded_len = 0;
-
-    auto current_score_value = [&]() {
-        int score = out_len;
-        if (out_len > limit) score += 1000000 + out_len - limit;
-        if (expanded_len > limit) score += 1000 * (expanded_len - limit);
-        return score;
-    };
-
-    auto exceeded_cutoff = [&]() {
-        return current_score_value() > cutoff;
-    };
-
-    auto append_and_apply = [&](const vector<char> &buttons, const vector<char> &active_macro) {
-        out_len += (int)buttons.size();
-        int state = cell * 4 + dir;
-        for (char op : buttons) {
-            if (op == 'P') {
-                expanded_len += (int)active_macro.size();
-                if (!active_macro.empty()) state = macro_transition[state];
-            } else {
-                ++expanded_len;
-                state = solver.apply_basic_state(state, op);
-            }
+    void reserve(int sz) {
+        if (sz > INLINE_CAP) {
+            large_mode = true;
+            large.reserve(sz);
         }
-        cell = state >> 2;
-        dir = state & 3;
-    };
-
-    auto append_and_apply_slice = [&](const vector<char> &buttons, int l, int r, const vector<char> &active_macro) {
-        out_len += r - l;
-        int state = cell * 4 + dir;
-        for (int i = l; i < r; ++i) {
-            char op = buttons[i];
-            if (op == 'P') {
-                expanded_len += (int)active_macro.size();
-                if (!active_macro.empty()) state = macro_transition[state];
-            } else {
-                ++expanded_len;
-                state = solver.apply_basic_state(state, op);
-            }
-        }
-        cell = state >> 2;
-        dir = state & 3;
-    };
-
-    uint64_t macro_hash = 0;
-
-    auto current_route = [&](int target) {
-        int end_cell, end_dir;
-        if (!has_macro) {
-            return solver.basic_move_ops(cell, dir, target, end_cell, end_dir);
-        }
-
-        RouteCacheKey key{macro_hash, cell * 4 + dir, target};
-        if (cache) {
-            auto it = cache->ops_cache.find(key);
-            if (it != cache->ops_cache.end()) {
-                ++cache->ops_hits;
-                return it->second.ops;
-            }
-            ++cache->ops_misses;
-        }
-
-        vector<char> ops = solver.macro_move_ops_with_transition(cell, dir, target, macro_transition, end_cell, end_dir);
-        if (cache) {
-            cache->ops_cache.emplace(key, CachedRouteOps{ops});
-            cache->trim_if_needed();
-        }
-        return ops;
-    };
-
-    auto current_route_info = [&](int target) {
-        if (!has_macro) {
-            return solver.basic_move_info(cell, dir, target);
-        }
-
-        RouteCacheKey key{macro_hash, cell * 4 + dir, target};
-        if (cache) {
-            Solver::RouteInfo cached_info;
-            if (cache->info_cache.find(key, cached_info)) {
-                ++cache->info_hits;
-                return cached_info;
-            }
-            ++cache->info_misses;
-        }
-
-        Solver::RouteInfo info = solver.macro_move_info_with_transition(cell, dir, target, macro_transition);
-        if (cache) {
-            cache->info_cache.emplace(key, info);
-            cache->trim_if_needed();
-        }
-        return info;
-    };
-
-    auto append_info = [&](const Solver::RouteInfo &info) {
-        out_len += info.len;
-        expanded_len += info.len + info.p_count * ((int)macro.size() - 1);
-        cell = info.end_cell;
-        dir = info.end_dir;
-    };
-
-    auto move_to = [&](int target) {
-        PMacroPlacement def;
-        bool has_plan_here = false;
-        while (plan_idx < (int)plan.size() && plan[plan_idx].leg < leg) ++plan_idx;
-        if (plan_idx < (int)plan.size() && plan[plan_idx].leg == leg) {
-            def = plan[plan_idx];
-            has_plan_here = true;
-            ++plan_idx;
-        }
-
-        if (!has_plan_here) {
-            append_info(current_route_info(target));
-            ++leg;
-            return;
-        }
-
-        vector<char> route = current_route(target);
-        bool define_here = false;
-        if (def.explicit_body) {
-            define_here = (def.offset <= (int)route.size() && !def.body.empty());
-        } else {
-            define_here = (def.offset + def.len <= (int)route.size());
-        }
-        if (!define_here) {
-            append_and_apply(route, macro);
-            ++leg;
-            return;
-        }
-
-        append_and_apply_slice(route, 0, def.offset, macro);
-
-        vector<char> new_macro;
-        if (def.explicit_body) {
-            new_macro = def.body;
-        } else {
-            vector<char> raw_definition(route.begin() + def.offset, route.begin() + def.offset + def.len);
-            new_macro = expand_buttons_with_macro(raw_definition, macro);
-        }
-        vector<char> definition_buttons = encode_with_previous_macro(new_macro, macro);
-
-        out_len += 2;
-        append_and_apply(definition_buttons, macro);
-
-        vector<int> new_transition = solver.build_macro_transition_from_buttons(definition_buttons, macro_transition);
-        macro_hash = hash_definition_buttons(macro_hash, definition_buttons);
-        macro = std::move(new_macro);
-        macro_transition = std::move(new_transition);
-        has_macro = true;
-
-        append_info(current_route_info(target));
-        ++leg;
-    };
-
-    for (int k : order) {
-        move_to(solver.ball_cell(k));
-        if (exceeded_cutoff()) return cutoff + 1;
-        ++out_len;
-        ++expanded_len;
-        if (exceeded_cutoff()) return cutoff + 1;
-        move_to(solver.basket_cell(k));
-        if (exceeded_cutoff()) return cutoff + 1;
-        ++out_len;
-        ++expanded_len;
-        if (exceeded_cutoff()) return cutoff + 1;
     }
 
-    return current_score_value();
-}
+    void push_back(int value) {
+        if (large_mode) {
+            large.push_back(value);
+            return;
+        }
+        if (n < INLINE_CAP) {
+            small[n++] = value;
+            return;
+        }
+        large_mode = true;
+        large.assign(small.begin(), small.begin() + n);
+        large.push_back(value);
+    }
 
+    bool empty() const {
+        return size() == 0;
+    }
+
+    int size() const {
+        return large_mode ? (int)large.size() : n;
+    }
+
+    int &operator[](int idx) {
+        return large_mode ? large[idx] : small[idx];
+    }
+
+    const int &operator[](int idx) const {
+        return large_mode ? large[idx] : small[idx];
+    }
+
+    void resize(int sz) {
+        if (large_mode) {
+            large.resize(sz);
+        } else {
+            n = max(0, min(sz, n));
+        }
+    }
+
+    template <class Compare>
+    void sort_by(Compare comp) {
+        if (large_mode) {
+            sort(large.begin(), large.end(), comp);
+        } else {
+            sort(small.begin(), small.begin() + n, comp);
+        }
+    }
+};
 
 int score_p_macro_sites_fast(const Solver &solver, const vector<int> &order, const OrderContext &ctx,
                              const vector<MacroSite> &sites, int limit,
                              int cutoff = numeric_limits<int>::max() / 4,
                              PlanEvalCache *cache = nullptr) {
-    vector<int> site_order;
+    SmallIntOrder site_order;
     site_order.reserve(sites.size());
     for (int i = 0; i < (int)sites.size(); ++i) {
         const MacroSite &s = sites[i];
@@ -2491,7 +2350,7 @@ int score_p_macro_sites_fast(const Solver &solver, const vector<int> &order, con
         return ctx.pos[s.ball] * 2 + s.phase;
     };
 
-    sort(site_order.begin(), site_order.end(), [&](int lhs_idx, int rhs_idx) {
+    site_order.sort_by([&](int lhs_idx, int rhs_idx) {
         const MacroSite &lhs = sites[lhs_idx];
         const MacroSite &rhs = sites[rhs_idx];
         int lhs_leg = site_leg(lhs_idx);
@@ -2505,7 +2364,8 @@ int score_p_macro_sites_fast(const Solver &solver, const vector<int> &order, con
     if (!site_order.empty()) {
         int write = 0;
         int last_leg = -1;
-        for (int idx : site_order) {
+        for (int i = 0; i < site_order.size(); ++i) {
+            int idx = site_order[i];
             int leg_id = site_leg(idx);
             if (leg_id == last_leg) continue;
             site_order[write++] = idx;
@@ -2580,10 +2440,8 @@ int score_p_macro_sites_fast(const Solver &solver, const vector<int> &order, con
         if (cache) {
             auto it = cache->ops_cache.find(key);
             if (it != cache->ops_cache.end()) {
-                ++cache->ops_hits;
                 return it->second.ops;
             }
-            ++cache->ops_misses;
         }
 
         vector<char> ops = solver.macro_move_ops_with_transition(cell, dir, target, macro_transition, end_cell, end_dir);
@@ -2603,10 +2461,8 @@ int score_p_macro_sites_fast(const Solver &solver, const vector<int> &order, con
         if (cache) {
             Solver::RouteInfo cached_info;
             if (cache->info_cache.find(key, cached_info)) {
-                ++cache->info_hits;
                 return cached_info;
             }
-            ++cache->info_misses;
         }
 
         Solver::RouteInfo info = solver.macro_move_info_with_transition(cell, dir, target, macro_transition);
@@ -2762,7 +2618,7 @@ int score_p_macro_sites_fast_prefix(const Solver &solver, const vector<int> &ord
     const int leg_count = (int)order.size() * 2;
     start_leg = max(0, min(start_leg, leg_count));
 
-    vector<int> site_order;
+    SmallIntOrder site_order;
     site_order.reserve(sites.size());
     for (int i = 0; i < (int)sites.size(); ++i) {
         const MacroSite &s = sites[i];
@@ -2775,7 +2631,7 @@ int score_p_macro_sites_fast_prefix(const Solver &solver, const vector<int> &ord
         return macro_site_leg_id(ctx, sites[idx]);
     };
 
-    sort(site_order.begin(), site_order.end(), [&](int lhs_idx, int rhs_idx) {
+    site_order.sort_by([&](int lhs_idx, int rhs_idx) {
         const MacroSite &lhs = sites[lhs_idx];
         const MacroSite &rhs = sites[rhs_idx];
         int lhs_leg = site_leg(lhs_idx);
@@ -2788,7 +2644,8 @@ int score_p_macro_sites_fast_prefix(const Solver &solver, const vector<int> &ord
     if (!site_order.empty()) {
         int write = 0;
         int last_leg = -1;
-        for (int idx : site_order) {
+        for (int i = 0; i < site_order.size(); ++i) {
+            int idx = site_order[i];
             int leg_id = site_leg(idx);
             if (leg_id == last_leg) continue;
             site_order[write++] = idx;
@@ -2921,10 +2778,8 @@ int score_p_macro_sites_fast_prefix(const Solver &solver, const vector<int> &ord
         if (cache) {
             auto it = cache->ops_cache.find(key);
             if (it != cache->ops_cache.end()) {
-                ++cache->ops_hits;
                 return it->second.ops;
             }
-            ++cache->ops_misses;
         }
 
         vector<char> ops = solver.macro_move_ops_with_transition(cell, dir, target, *macro_transition, end_cell, end_dir);
@@ -2944,10 +2799,8 @@ int score_p_macro_sites_fast_prefix(const Solver &solver, const vector<int> &ord
         if (cache) {
             Solver::RouteInfo cached_info;
             if (cache->info_cache.find(key, cached_info)) {
-                ++cache->info_hits;
                 return cached_info;
             }
-            ++cache->info_misses;
         }
 
         Solver::RouteInfo info = solver.macro_move_info_with_transition(cell, dir, target, *macro_transition);
@@ -3046,16 +2899,6 @@ int score_p_macro_sites_fast_prefix(const Solver &solver, const vector<int> &ord
     return current_score_value();
 }
 
-int macro_containment_bonus(const MacroContainStats &stats) {
-    int bonus = 0;
-    bonus += 3 * stats.contained_definitions;
-    bonus += stats.contained_p_count;
-    bonus += 5 * stats.consecutive_contained;
-    bonus += 8 * stats.max_contained_chain;
-    return min(31, bonus);
-}
-
-
 vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector<int> &initial_order, int limit,
                                               double time_limit_sec, int seed_rounds = 3,
                                               int seed_trials = 32, int max_defs = 10) {
@@ -3079,9 +2922,9 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
     };
 
     auto build_answer = [&](const vector<int> &ord, const OrderContext &ctx,
-                            const vector<MacroSite> &sites, MacroContainStats *stats) {
+                            const vector<MacroSite> &sites) {
         vector<PMacroPlacement> plan = convert_sites_to_plan_no_repair(ord, ctx, sites);
-        return build_program_with_p_macro_plan(solver, ord, plan, stats);
+        return build_program_with_p_macro_plan(solver, ord, plan);
     };
 
     vector<int> current_order = initial_order;
@@ -3139,18 +2982,6 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
     const double T1 = 0.05;
     double heat = T0;
     int iter = 0;
-    int order_mutations = 0;
-    int macro_mutations = 0;
-    int accepted_order_mutations = 0;
-    int accepted_macro_mutations = 0;
-    long long prefix_eval_attempts = 0;
-    long long prefix_eval_used = 0;
-    long long prefix_eval_saved_legs = 0;
-    long long trace_rebuilds = 1;
-    array<int, 8> order_type_attempt{};
-    array<int, 8> order_type_accept{};
-    array<int, 10> macro_type_attempt{};
-    array<int, 10> macro_type_accept{};
 
     while (true) {
         double progress = (get_time() - start_time) / time_limit_sec;
@@ -3194,8 +3025,6 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
 
         if (choose_macro) {
             macro_type = sample_weighted_type(MACRO_TYPE_WEIGHT);
-            ++macro_mutations;
-            ++macro_type_attempt[macro_type];
 
             if (macro_type == 0 || next_sites.empty()) {
                 if ((int)next_sites.size() < max_defs) {
@@ -3265,8 +3094,6 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
             }
         } else {
             order_type = sample_weighted_type(ORDER_TYPE_WEIGHT);
-            ++order_mutations;
-            ++order_type_attempt[order_type];
             touched_order = true;
             next_order_storage = current_order;
 
@@ -3295,7 +3122,7 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
                 }
             }
 
-            next_ctx_storage = build_order_context(solver, next_order_storage);
+            next_ctx_storage = build_order_context_reusing_prefix(solver, current_order, current_ctx, next_order_storage);
             next_order = &next_order_storage;
             next_ctx = &next_ctx_storage;
 
@@ -3316,11 +3143,6 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
         if (!touched_order && current_trace.valid && next_order == &current_order && next_ctx == &current_ctx) {
             dirty_leg = earliest_changed_macro_leg(current_ctx, current_sites, next_sites, leg_count);
             tried_prefix_eval = true;
-            ++prefix_eval_attempts;
-            if (dirty_leg > 0) {
-                ++prefix_eval_used;
-                prefix_eval_saved_legs += dirty_leg;
-            }
             can_reuse_current_trace = true;
         }
 
@@ -3335,20 +3157,6 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
         } else {
             next_score = eval(*next_order, *next_ctx, next_sites, accept_cutoff);
         }
-#ifdef AHC_DEBUG_PREFIX_EVAL
-        if (tried_prefix_eval && ((iter & 4095) == 0)) {
-            int full_score = eval(*next_order, *next_ctx, next_sites, accept_cutoff);
-            if (full_score != next_score) {
-                cerr << "prefix_eval_mismatch"
-                     << " iter=" << iter
-                     << " dirty_leg=" << dirty_leg
-                     << " prefix_score=" << next_score
-                     << " full_score=" << full_score
-                     << '\n';
-                abort();
-            }
-        }
-#endif
         int delta = next_score - current_score;
 
         if (delta <= accept_margin) {
@@ -3356,11 +3164,7 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
                 current_order = std::move(next_order_storage);
                 current_ctx = std::move(next_ctx_storage);
                 current_trace.valid = false;
-                ++accepted_order_mutations;
-                if (order_type >= 0) ++order_type_accept[order_type];
             } else {
-                ++accepted_macro_mutations;
-                if (macro_type >= 0) ++macro_type_accept[macro_type];
                 if (dirty_leg < leg_count) {
                     MacroEvalTrace next_trace;
                     if (can_reuse_current_trace) {
@@ -3371,7 +3175,6 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
                                    nullptr, 0, &next_trace);
                     }
                     current_trace = std::move(next_trace);
-                    ++trace_rebuilds;
                 }
             }
             current_sites = std::move(next_sites);
@@ -3386,61 +3189,7 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
         }
     }
 
-    MacroContainStats stats;
-    vector<char> answer = build_answer(best_order, best_ctx, best_sites, &stats);
-    int explicit_sites = 0;
-    int explicit_body_total = 0;
-    for (const MacroSite &s : best_sites) {
-        if (s.explicit_body) {
-            ++explicit_sites;
-            explicit_body_total += (int)s.body.size();
-        }
-    }
-    cerr << "joint_order_macro"
-         << " initial_raw=" << raw_order_score(solver, initial_order)
-         << " best_score=" << best_score
-         << " best_raw=" << raw_order_score(solver, best_order)
-         << " defs=" << stats.definitions
-         << " contained_defs=" << stats.contained_definitions
-         << " p_count=" << stats.contained_p_count
-         << " saving=" << stats.encoded_saving
-         << " chain=" << stats.max_contained_chain
-         << " bonus=" << macro_containment_bonus(stats)
-         << " explicit_sites=" << explicit_sites
-         << " explicit_body_total=" << explicit_body_total
-         << " iter=" << iter
-         << " order_mut=" << accepted_order_mutations << "/" << order_mutations
-         << " macro_mut=" << accepted_macro_mutations << "/" << macro_mutations
-         << " prefix_eval=" << prefix_eval_used << "/" << prefix_eval_attempts
-         << " saved_legs=" << prefix_eval_saved_legs
-         << " trace_rebuilds=" << trace_rebuilds
-         << " route_info_cache=" << eval_cache.info_hits << "/" << (eval_cache.info_hits + eval_cache.info_misses)
-         << " route_ops_cache=" << eval_cache.ops_hits << "/" << (eval_cache.ops_hits + eval_cache.ops_misses)
-         << '\n';
-
-    cerr << "order_type_attempt=";
-    for (int i = 0; i < 8; ++i) {
-        if (i) cerr << ',';
-        cerr << order_type_attempt[i];
-    }
-    cerr << " order_type_accept=";
-    for (int i = 0; i < 8; ++i) {
-        if (i) cerr << ',';
-        cerr << order_type_accept[i];
-    }
-    cerr << " macro_type_attempt=";
-    for (int i = 0; i < (int)macro_type_attempt.size(); ++i) {
-        if (i) cerr << ',';
-        cerr << macro_type_attempt[i];
-    }
-    cerr << " macro_type_accept=";
-    for (int i = 0; i < (int)macro_type_accept.size(); ++i) {
-        if (i) cerr << ',';
-        cerr << macro_type_accept[i];
-    }
-    cerr << '\n';
-
-    return answer;
+    return build_answer(best_order, best_ctx, best_sites);
 }
 
 bool valid_program_for_limit(const vector<char> &program, int limit) {
