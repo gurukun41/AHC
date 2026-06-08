@@ -298,15 +298,18 @@ class Solver {
 
         while (q_head < q_tail) {
             int cur_state = macro_bfs_queue[q_head++];
+            int cur_dist = macro_bfs_dist[cur_state];
+            if (goal != -1 && cur_dist > macro_bfs_dist[goal]) break;
+
             int dir = cur_state & 3;
             if ((cur_state >> 2) == to) {
-                if (goal == -1 || macro_bfs_dist[cur_state] < macro_bfs_dist[goal] ||
-                    (macro_bfs_dist[cur_state] == macro_bfs_dist[goal] && dir < (goal & 3))) {
+                if (goal == -1 || cur_dist < macro_bfs_dist[goal] ||
+                    (cur_dist == macro_bfs_dist[goal] && dir < (goal & 3))) {
                     goal = cur_state;
                 }
                 continue;
             }
-            if (goal != -1 && macro_bfs_dist[cur_state] >= macro_bfs_dist[goal]) continue;
+            if (goal != -1 && cur_dist >= macro_bfs_dist[goal]) continue;
 
             push_next(cur_state, basic_state_transition[cur_state][1], 'R');
             push_next(cur_state, basic_state_transition[cur_state][2], 'L');
@@ -354,15 +357,18 @@ class Solver {
 
         while (q_head < q_tail) {
             int cur_state = macro_bfs_queue[q_head++];
+            int cur_dist = macro_bfs_dist[cur_state];
+            if (goal != -1 && cur_dist > macro_bfs_dist[goal]) break;
+
             int dir = cur_state & 3;
             if ((cur_state >> 2) == to) {
-                if (goal == -1 || macro_bfs_dist[cur_state] < macro_bfs_dist[goal] ||
-                    (macro_bfs_dist[cur_state] == macro_bfs_dist[goal] && dir < (goal & 3))) {
+                if (goal == -1 || cur_dist < macro_bfs_dist[goal] ||
+                    (cur_dist == macro_bfs_dist[goal] && dir < (goal & 3))) {
                     goal = cur_state;
                 }
                 continue;
             }
-            if (goal != -1 && macro_bfs_dist[cur_state] >= macro_bfs_dist[goal]) continue;
+            if (goal != -1 && cur_dist >= macro_bfs_dist[goal]) continue;
 
             push_next(cur_state, basic_state_transition[cur_state][1], 0);
             push_next(cur_state, basic_state_transition[cur_state][2], 0);
@@ -2252,6 +2258,26 @@ struct PlanEvalCache {
     }
 };
 
+struct MacroActiveTraceState {
+    uint64_t macro_hash = 0;
+    shared_ptr<const vector<char>> macro;
+    shared_ptr<const vector<int>> macro_transition;
+};
+
+struct LegPrefixTraceState {
+    int cell = 0;
+    int dir = 1;
+    int out_len = 0;
+    int expanded_len = 0;
+    int macro_state = 0;
+};
+
+struct MacroEvalTrace {
+    bool valid = false;
+    vector<LegPrefixTraceState> leg_start;
+    vector<MacroActiveTraceState> macro_states;
+};
+
 int score_p_macro_program(const vector<char> &program, int limit) {
     int score = (int)program.size();
     int expanded = expanded_basic_count(program);
@@ -2665,6 +2691,361 @@ int score_p_macro_sites_fast(const Solver &solver, const vector<int> &order, con
     return current_score_value();
 }
 
+int macro_site_leg_id(const OrderContext &ctx, const MacroSite &s) {
+    if (s.len < 6) return numeric_limits<int>::max() / 4;
+    if (s.phase < 0 || s.phase > 1) return numeric_limits<int>::max() / 4;
+    if (s.ball < 0 || s.ball >= (int)ctx.pos.size()) return numeric_limits<int>::max() / 4;
+    int p = ctx.pos[s.ball];
+    if (p < 0) return numeric_limits<int>::max() / 4;
+    return p * 2 + s.phase;
+}
+
+bool same_macro_site_definition(const MacroSite &a, const MacroSite &b) {
+    return a.ball == b.ball &&
+           a.phase == b.phase &&
+           a.offset == b.offset &&
+           a.len == b.len &&
+           a.explicit_body == b.explicit_body &&
+           a.body == b.body;
+}
+
+int earliest_changed_macro_leg(const OrderContext &ctx, const vector<MacroSite> &lhs,
+                               const vector<MacroSite> &rhs, int leg_count) {
+    auto key_less = [](const MacroSite &a, const MacroSite &b) {
+        if (a.ball != b.ball) return a.ball < b.ball;
+        return a.phase < b.phase;
+    };
+    auto key_equal = [](const MacroSite &a, const MacroSite &b) {
+        return a.ball == b.ball && a.phase == b.phase;
+    };
+
+    int dirty = leg_count;
+    int i = 0;
+    int j = 0;
+    while (i < (int)lhs.size() || j < (int)rhs.size()) {
+        if (i == (int)lhs.size()) {
+            dirty = min(dirty, macro_site_leg_id(ctx, rhs[j]));
+            ++j;
+            continue;
+        }
+        if (j == (int)rhs.size()) {
+            dirty = min(dirty, macro_site_leg_id(ctx, lhs[i]));
+            ++i;
+            continue;
+        }
+        if (key_equal(lhs[i], rhs[j])) {
+            if (!same_macro_site_definition(lhs[i], rhs[j])) {
+                dirty = min(dirty, macro_site_leg_id(ctx, lhs[i]));
+            }
+            ++i;
+            ++j;
+        } else if (key_less(lhs[i], rhs[j])) {
+            dirty = min(dirty, macro_site_leg_id(ctx, lhs[i]));
+            ++i;
+        } else {
+            dirty = min(dirty, macro_site_leg_id(ctx, rhs[j]));
+            ++j;
+        }
+    }
+
+    if (dirty >= leg_count) {
+        return leg_count;
+    }
+    return dirty;
+}
+
+int score_p_macro_sites_fast_prefix(const Solver &solver, const vector<int> &order, const OrderContext &ctx,
+                                    const vector<MacroSite> &sites, int limit,
+                                    int cutoff, PlanEvalCache *cache,
+                                    const MacroEvalTrace *prefix_trace, int start_leg,
+                                    MacroEvalTrace *out_trace = nullptr) {
+    const int leg_count = (int)order.size() * 2;
+    start_leg = max(0, min(start_leg, leg_count));
+
+    vector<int> site_order;
+    site_order.reserve(sites.size());
+    for (int i = 0; i < (int)sites.size(); ++i) {
+        const MacroSite &s = sites[i];
+        int leg_id = macro_site_leg_id(ctx, s);
+        if (leg_id >= leg_count) continue;
+        site_order.push_back(i);
+    }
+
+    auto site_leg = [&](int idx) {
+        return macro_site_leg_id(ctx, sites[idx]);
+    };
+
+    sort(site_order.begin(), site_order.end(), [&](int lhs_idx, int rhs_idx) {
+        const MacroSite &lhs = sites[lhs_idx];
+        const MacroSite &rhs = sites[rhs_idx];
+        int lhs_leg = site_leg(lhs_idx);
+        int rhs_leg = site_leg(rhs_idx);
+        if (lhs_leg != rhs_leg) return lhs_leg < rhs_leg;
+        if (lhs.offset != rhs.offset) return lhs.offset < rhs.offset;
+        return lhs.len > rhs.len;
+    });
+
+    if (!site_order.empty()) {
+        int write = 0;
+        int last_leg = -1;
+        for (int idx : site_order) {
+            int leg_id = site_leg(idx);
+            if (leg_id == last_leg) continue;
+            site_order[write++] = idx;
+            last_leg = leg_id;
+        }
+        site_order.resize(write);
+    }
+
+    vector<char> owned_macro;
+    vector<int> owned_macro_transition;
+    const vector<char> *macro = &owned_macro;
+    const vector<int> *macro_transition = &owned_macro_transition;
+    bool has_macro = false;
+    uint64_t macro_hash = 0;
+    int macro_state_idx = 0;
+    int cell = 0;
+    int dir = 1;
+    int leg = start_leg;
+    int plan_idx = 0;
+    int out_len = 0;
+    int expanded_len = 0;
+
+    const bool can_use_prefix = prefix_trace != nullptr &&
+                                prefix_trace->valid &&
+                                start_leg > 0 &&
+                                start_leg < (int)prefix_trace->leg_start.size();
+    if (can_use_prefix) {
+        const LegPrefixTraceState &pref = prefix_trace->leg_start[start_leg];
+        cell = pref.cell;
+        dir = pref.dir;
+        out_len = pref.out_len;
+        expanded_len = pref.expanded_len;
+        macro_state_idx = pref.macro_state;
+        if (0 <= macro_state_idx && macro_state_idx < (int)prefix_trace->macro_states.size()) {
+            const MacroActiveTraceState &ms = prefix_trace->macro_states[macro_state_idx];
+            if (ms.macro && ms.macro_transition) {
+                macro_hash = ms.macro_hash;
+                macro = ms.macro.get();
+                macro_transition = ms.macro_transition.get();
+                has_macro = !macro_transition->empty();
+            } else {
+                macro_state_idx = 0;
+            }
+        } else {
+            macro_state_idx = 0;
+        }
+    } else {
+        leg = 0;
+        start_leg = 0;
+    }
+
+    if (out_trace) {
+        out_trace->valid = false;
+        out_trace->leg_start.clear();
+        out_trace->macro_states.clear();
+
+        if (can_use_prefix) {
+            out_trace->macro_states = prefix_trace->macro_states;
+            out_trace->leg_start.assign(prefix_trace->leg_start.begin(),
+                                        prefix_trace->leg_start.begin() + start_leg + 1);
+        } else {
+            MacroActiveTraceState empty_state;
+            out_trace->macro_states.push_back(std::move(empty_state));
+        }
+    }
+
+    auto current_score_value = [&]() {
+        int score = out_len;
+        if (out_len > limit) score += 1000000 + out_len - limit;
+        if (expanded_len > limit) score += 1000 * (expanded_len - limit);
+        return score;
+    };
+
+    auto exceeded_cutoff = [&]() {
+        return current_score_value() > cutoff;
+    };
+
+    auto record_leg_start = [&](int target_leg) {
+        if (!out_trace) return;
+        if ((int)out_trace->leg_start.size() == target_leg) {
+            out_trace->leg_start.push_back(LegPrefixTraceState{cell, dir, out_len, expanded_len, macro_state_idx});
+        } else if (target_leg < (int)out_trace->leg_start.size()) {
+            out_trace->leg_start[target_leg] = LegPrefixTraceState{cell, dir, out_len, expanded_len, macro_state_idx};
+        }
+    };
+
+    auto append_and_apply = [&](const vector<char> &buttons, const vector<char> &active_macro,
+                                const vector<int> &active_macro_transition) {
+        out_len += (int)buttons.size();
+        int state = cell * 4 + dir;
+        for (char op : buttons) {
+            if (op == 'P') {
+                expanded_len += (int)active_macro.size();
+                if (!active_macro.empty()) state = active_macro_transition[state];
+            } else {
+                ++expanded_len;
+                state = solver.apply_basic_state(state, op);
+            }
+        }
+        cell = state >> 2;
+        dir = state & 3;
+    };
+
+    auto append_and_apply_slice = [&](const vector<char> &buttons, int l, int r,
+                                      const vector<char> &active_macro,
+                                      const vector<int> &active_macro_transition) {
+        out_len += r - l;
+        int state = cell * 4 + dir;
+        for (int i = l; i < r; ++i) {
+            char op = buttons[i];
+            if (op == 'P') {
+                expanded_len += (int)active_macro.size();
+                if (!active_macro.empty()) state = active_macro_transition[state];
+            } else {
+                ++expanded_len;
+                state = solver.apply_basic_state(state, op);
+            }
+        }
+        cell = state >> 2;
+        dir = state & 3;
+    };
+
+    auto current_route = [&](int target) {
+        int end_cell, end_dir;
+        if (!has_macro) {
+            return solver.basic_move_ops(cell, dir, target, end_cell, end_dir);
+        }
+
+        RouteCacheKey key{macro_hash, cell * 4 + dir, target};
+        if (cache) {
+            auto it = cache->ops_cache.find(key);
+            if (it != cache->ops_cache.end()) {
+                ++cache->ops_hits;
+                return it->second.ops;
+            }
+            ++cache->ops_misses;
+        }
+
+        vector<char> ops = solver.macro_move_ops_with_transition(cell, dir, target, *macro_transition, end_cell, end_dir);
+        if (cache) {
+            cache->ops_cache.emplace(key, CachedRouteOps{ops});
+            cache->trim_if_needed();
+        }
+        return ops;
+    };
+
+    auto current_route_info = [&](int target) {
+        if (!has_macro) {
+            return solver.basic_move_info(cell, dir, target);
+        }
+
+        RouteCacheKey key{macro_hash, cell * 4 + dir, target};
+        if (cache) {
+            Solver::RouteInfo cached_info;
+            if (cache->info_cache.find(key, cached_info)) {
+                ++cache->info_hits;
+                return cached_info;
+            }
+            ++cache->info_misses;
+        }
+
+        Solver::RouteInfo info = solver.macro_move_info_with_transition(cell, dir, target, *macro_transition);
+        if (cache) {
+            cache->info_cache.emplace(key, info);
+            cache->trim_if_needed();
+        }
+        return info;
+    };
+
+    auto append_info = [&](const Solver::RouteInfo &info) {
+        out_len += info.len;
+        expanded_len += info.len + info.p_count * ((int)macro->size() - 1);
+        cell = info.end_cell;
+        dir = info.end_dir;
+    };
+
+    auto move_to = [&](int target) {
+        const MacroSite *def = nullptr;
+        while (plan_idx < (int)site_order.size() && site_leg(site_order[plan_idx]) < leg) ++plan_idx;
+        if (plan_idx < (int)site_order.size() && site_leg(site_order[plan_idx]) == leg) {
+            def = &sites[site_order[plan_idx]];
+            ++plan_idx;
+        }
+
+        if (def == nullptr) {
+            append_info(current_route_info(target));
+            ++leg;
+            return;
+        }
+
+        vector<char> route = current_route(target);
+        bool define_here = false;
+        if (def->explicit_body) {
+            define_here = (def->offset <= (int)route.size() && !def->body.empty());
+        } else {
+            define_here = (def->offset + def->len <= (int)route.size());
+        }
+        if (!define_here) {
+            append_and_apply(route, *macro, *macro_transition);
+            ++leg;
+            return;
+        }
+
+        append_and_apply_slice(route, 0, def->offset, *macro, *macro_transition);
+
+        vector<char> new_macro;
+        if (def->explicit_body) {
+            new_macro = def->body;
+        } else {
+            vector<char> raw_definition(route.begin() + def->offset, route.begin() + def->offset + def->len);
+            new_macro = expand_buttons_with_macro(raw_definition, *macro);
+        }
+        vector<char> definition_buttons = encode_with_previous_macro(new_macro, *macro);
+
+        out_len += 2;
+        append_and_apply(definition_buttons, *macro, *macro_transition);
+
+        vector<int> new_transition = solver.build_macro_transition_from_buttons(definition_buttons, *macro_transition);
+        macro_hash = hash_definition_buttons(macro_hash, definition_buttons);
+        if (out_trace) {
+            shared_ptr<const vector<char>> macro_owner = make_shared<vector<char>>(std::move(new_macro));
+            shared_ptr<const vector<int>> transition_owner = make_shared<vector<int>>(std::move(new_transition));
+            macro = macro_owner.get();
+            macro_transition = transition_owner.get();
+            out_trace->macro_states.push_back(
+                MacroActiveTraceState{macro_hash, std::move(macro_owner), std::move(transition_owner)});
+            macro_state_idx = (int)out_trace->macro_states.size() - 1;
+        } else {
+            owned_macro = std::move(new_macro);
+            owned_macro_transition = std::move(new_transition);
+            macro = &owned_macro;
+            macro_transition = &owned_macro_transition;
+        }
+        has_macro = true;
+
+        append_info(current_route_info(target));
+        ++leg;
+    };
+
+    while (plan_idx < (int)site_order.size() && site_leg(site_order[plan_idx]) < leg) ++plan_idx;
+
+    for (; leg < leg_count;) {
+        record_leg_start(leg);
+        int ball = order[leg / 2];
+        int target = (leg & 1) == 0 ? solver.ball_cell(ball) : solver.basket_cell(ball);
+        move_to(target);
+        if (exceeded_cutoff()) return cutoff + 1;
+        ++out_len;
+        ++expanded_len;
+        if (exceeded_cutoff()) return cutoff + 1;
+    }
+
+    record_leg_start(leg_count);
+    if (out_trace) out_trace->valid = ((int)out_trace->leg_start.size() == leg_count + 1);
+    return current_score_value();
+}
+
 int macro_containment_bonus(const MacroContainStats &stats) {
     int bonus = 0;
     bonus += 3 * stats.contained_definitions;
@@ -2689,6 +3070,12 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
     auto eval = [&](const vector<int> &ord, const OrderContext &ctx, const vector<MacroSite> &sites,
                     int cutoff = numeric_limits<int>::max() / 4) {
         return score_p_macro_sites_fast(solver, ord, ctx, sites, limit, cutoff, &eval_cache);
+    };
+    auto eval_trace = [&](const vector<int> &ord, const OrderContext &ctx, const vector<MacroSite> &sites,
+                          const MacroEvalTrace *prefix, int start_leg, MacroEvalTrace *trace_out,
+                          int cutoff = numeric_limits<int>::max() / 4) {
+        return score_p_macro_sites_fast_prefix(solver, ord, ctx, sites, limit, cutoff, &eval_cache,
+                                               prefix, start_leg, trace_out);
     };
 
     auto build_answer = [&](const vector<int> &ord, const OrderContext &ctx,
@@ -2732,6 +3119,9 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
         }
     }
 
+    MacroEvalTrace current_trace;
+    current_score = eval_trace(current_order, current_ctx, current_sites, nullptr, 0, &current_trace);
+
     vector<int> best_order = current_order;
     OrderContext best_ctx = current_ctx;
     vector<MacroSite> best_sites = current_sites;
@@ -2753,6 +3143,10 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
     int macro_mutations = 0;
     int accepted_order_mutations = 0;
     int accepted_macro_mutations = 0;
+    long long prefix_eval_attempts = 0;
+    long long prefix_eval_used = 0;
+    long long prefix_eval_saved_legs = 0;
+    long long trace_rebuilds = 1;
     array<int, 8> order_type_attempt{};
     array<int, 8> order_type_accept{};
     array<int, 10> macro_type_attempt{};
@@ -2915,18 +3309,70 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
 
         double accept_margin = -heat * log_table[iter & 65535];
         int accept_cutoff = current_score + (int)floor(accept_margin);
-        int next_score = eval(*next_order, *next_ctx, next_sites, accept_cutoff);
+        int dirty_leg = 0;
+        bool tried_prefix_eval = false;
+        bool can_reuse_current_trace = false;
+        const int leg_count = (int)current_order.size() * 2;
+        if (!touched_order && current_trace.valid && next_order == &current_order && next_ctx == &current_ctx) {
+            dirty_leg = earliest_changed_macro_leg(current_ctx, current_sites, next_sites, leg_count);
+            tried_prefix_eval = true;
+            ++prefix_eval_attempts;
+            if (dirty_leg > 0) {
+                ++prefix_eval_used;
+                prefix_eval_saved_legs += dirty_leg;
+            }
+            can_reuse_current_trace = true;
+        }
+
+        int next_score;
+        if (tried_prefix_eval) {
+            if (dirty_leg >= leg_count) {
+                next_score = current_score;
+            } else {
+                next_score = eval_trace(current_order, current_ctx, next_sites,
+                                        &current_trace, dirty_leg, nullptr, accept_cutoff);
+            }
+        } else {
+            next_score = eval(*next_order, *next_ctx, next_sites, accept_cutoff);
+        }
+#ifdef AHC_DEBUG_PREFIX_EVAL
+        if (tried_prefix_eval && ((iter & 4095) == 0)) {
+            int full_score = eval(*next_order, *next_ctx, next_sites, accept_cutoff);
+            if (full_score != next_score) {
+                cerr << "prefix_eval_mismatch"
+                     << " iter=" << iter
+                     << " dirty_leg=" << dirty_leg
+                     << " prefix_score=" << next_score
+                     << " full_score=" << full_score
+                     << '\n';
+                abort();
+            }
+        }
+#endif
         int delta = next_score - current_score;
 
         if (delta <= accept_margin) {
             if (touched_order) {
                 current_order = std::move(next_order_storage);
                 current_ctx = std::move(next_ctx_storage);
+                current_trace.valid = false;
                 ++accepted_order_mutations;
                 if (order_type >= 0) ++order_type_accept[order_type];
             } else {
                 ++accepted_macro_mutations;
                 if (macro_type >= 0) ++macro_type_accept[macro_type];
+                if (dirty_leg < leg_count) {
+                    MacroEvalTrace next_trace;
+                    if (can_reuse_current_trace) {
+                        eval_trace(current_order, current_ctx, next_sites,
+                                   &current_trace, dirty_leg, &next_trace);
+                    } else {
+                        eval_trace(current_order, current_ctx, next_sites,
+                                   nullptr, 0, &next_trace);
+                    }
+                    current_trace = std::move(next_trace);
+                    ++trace_rebuilds;
+                }
             }
             current_sites = std::move(next_sites);
             current_score = next_score;
@@ -2965,6 +3411,9 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
          << " iter=" << iter
          << " order_mut=" << accepted_order_mutations << "/" << order_mutations
          << " macro_mut=" << accepted_macro_mutations << "/" << macro_mutations
+         << " prefix_eval=" << prefix_eval_used << "/" << prefix_eval_attempts
+         << " saved_legs=" << prefix_eval_saved_legs
+         << " trace_rebuilds=" << trace_rebuilds
          << " route_info_cache=" << eval_cache.info_hits << "/" << (eval_cache.info_hits + eval_cache.info_misses)
          << " route_ops_cache=" << eval_cache.ops_hits << "/" << (eval_cache.ops_hits + eval_cache.ops_misses)
          << '\n';
