@@ -87,6 +87,7 @@ class Solver {
             basket_id[k] = id(in.basket[k]);
         }
         build_neighbor_table();
+        build_basic_state_transition();
         build_shortest_paths();
     }
 
@@ -104,8 +105,15 @@ class Solver {
 
             for (int k = 0; k < in.M; ++k) {
                 if (used[k]) continue;
-                Candidate cand = build_candidate(k, cur, dir);
-                if (cand.cost < best.cost) best = std::move(cand);
+
+                Candidate cand;
+                cand.k = k;
+                cand.end_pos = basket_id[k];
+                int d1 = dir;
+                cand.cost = basic_move_len_fast(cur, dir, ball_id[k], d1) + 1;  // S
+                cand.cost += basic_move_len_fast(ball_id[k], d1, basket_id[k], cand.end_dir) + 1;  // S
+
+                if (cand.cost < best.cost) best = cand;
             }
 
             if (best.k == -1) break;
@@ -168,6 +176,11 @@ class Solver {
         for (char op : ops) apply_basic_op(op, cell, dir);
     }
 
+    int apply_basic_state(int state, char op) const {
+        int8_t code = basic_op_code(op);
+        return code >= 0 ? basic_state_transition[state][code] : state;
+    }
+
     vector<char> basic_move_ops(int from, int from_dir, int to, int &end_cell, int &end_dir) const {
         vector<char> ops;
         int dir = from_dir;
@@ -213,14 +226,19 @@ class Solver {
     }
 
     vector<int> build_macro_transition(const vector<char> &macro) const {
-        vector<int> transition(total * 4);
-        for (int cell = 0; cell < total; ++cell) {
-            for (int dir = 0; dir < 4; ++dir) {
-                int next_cell = cell;
-                int next_dir = dir;
-                apply_basic_ops(macro, next_cell, next_dir);
-                transition[cell * 4 + dir] = next_cell * 4 + next_dir;
+        const int states = total * 4;
+        vector<int> transition(states);
+
+        vector<int8_t> codes;
+        codes.reserve(macro.size());
+        for (char op : macro) codes.push_back(basic_op_code(op));
+
+        for (int st = 0; st < states; ++st) {
+            int cur = st;
+            for (int8_t code : codes) {
+                if (code >= 0) cur = basic_state_transition[cur][code];
             }
+            transition[st] = cur;
         }
         return transition;
     }
@@ -229,44 +247,47 @@ class Solver {
         const int states = total * 4;
         vector<int> transition(states);
         const bool has_old = !old_transition.empty();
+
+        vector<int8_t> codes;
+        codes.reserve(buttons.size());
+        for (char op : buttons) {
+            if (op == 'P') {
+                codes.push_back(-1);
+            } else {
+                codes.push_back(basic_op_code(op));
+            }
+        }
+
         for (int st = 0; st < states; ++st) {
-            int cell = st / 4;
-            int dir = st & 3;
-            for (char op : buttons) {
-                if (op == 'P') {
-                    if (has_old) {
-                        int ns = old_transition[cell * 4 + dir];
-                        cell = ns / 4;
-                        dir = ns & 3;
-                    }
-                } else {
-                    apply_basic_op(op, cell, dir);
+            int cur = st;
+            for (int8_t code : codes) {
+                if (code == -1) {
+                    if (has_old) cur = old_transition[cur];
+                } else if (code >= 0) {
+                    cur = basic_state_transition[cur][code];
                 }
             }
-            transition[st] = cell * 4 + dir;
+            transition[st] = cur;
         }
         return transition;
     }
 
     vector<char> macro_move_ops_with_transition(int from, int from_dir, int to, const vector<int> &macro_transition, int &end_cell, int &end_dir) const {
         const int states = total * 4;
-        auto sid = [](int cell, int dir) {
-            return cell * 4 + dir;
-        };
 
         ensure_macro_bfs_buffers(states);
         next_macro_bfs_stamp();
 
-        int start = sid(from, from_dir);
+        int start = from * 4 + from_dir;
         macro_bfs_dist[start] = 0;
         macro_bfs_seen[start] = macro_bfs_stamp;
         int q_head = 0;
         int q_tail = 0;
         macro_bfs_queue[q_tail++] = start;
         int goal = -1;
+        const bool has_macro = !macro_transition.empty();
 
-        auto push_next = [&](int cur_state, int next_cell, int next_dir, char op) {
-            int ns = sid(next_cell, next_dir);
+        auto push_next = [&](int cur_state, int ns, char op) {
             if (ns == cur_state || macro_bfs_seen[ns] == macro_bfs_stamp) return;
             macro_bfs_seen[ns] = macro_bfs_stamp;
             macro_bfs_dist[ns] = macro_bfs_dist[cur_state] + 1;
@@ -277,9 +298,8 @@ class Solver {
 
         while (q_head < q_tail) {
             int cur_state = macro_bfs_queue[q_head++];
-            int cell = cur_state / 4;
             int dir = cur_state & 3;
-            if (cell == to) {
+            if ((cur_state >> 2) == to) {
                 if (goal == -1 || macro_bfs_dist[cur_state] < macro_bfs_dist[goal] ||
                     (macro_bfs_dist[cur_state] == macro_bfs_dist[goal] && dir < (goal & 3))) {
                     goal = cur_state;
@@ -288,14 +308,10 @@ class Solver {
             }
             if (goal != -1 && macro_bfs_dist[cur_state] >= macro_bfs_dist[goal]) continue;
 
-            push_next(cur_state, cell, (dir + 1) & 3, 'R');
-            push_next(cur_state, cell, (dir + 3) & 3, 'L');
-            if (next_cell[cell][dir] != -1) push_next(cur_state, next_cell[cell][dir], dir, 'F');
-
-            if (!macro_transition.empty()) {
-                int next_state = macro_transition[cur_state];
-                push_next(cur_state, next_state / 4, next_state & 3, 'P');
-            }
+            push_next(cur_state, basic_state_transition[cur_state][1], 'R');
+            push_next(cur_state, basic_state_transition[cur_state][2], 'L');
+            push_next(cur_state, basic_state_transition[cur_state][0], 'F');
+            if (has_macro) push_next(cur_state, macro_transition[cur_state], 'P');
         }
 
         vector<char> ops;
@@ -308,42 +324,38 @@ class Solver {
             ops.push_back(macro_bfs_op[cur]);
         }
         reverse(ops.begin(), ops.end());
-        end_cell = goal / 4;
+        end_cell = goal >> 2;
         end_dir = goal & 3;
         return ops;
     }
 
     RouteInfo macro_move_info_with_transition(int from, int from_dir, int to, const vector<int> &macro_transition) const {
         const int states = total * 4;
-        auto sid = [](int cell, int dir) {
-            return cell * 4 + dir;
-        };
 
         ensure_macro_bfs_buffers(states);
         next_macro_bfs_stamp();
 
-        int start = sid(from, from_dir);
+        int start = from * 4 + from_dir;
         macro_bfs_dist[start] = 0;
         macro_bfs_seen[start] = macro_bfs_stamp;
         int q_head = 0;
         int q_tail = 0;
         macro_bfs_queue[q_tail++] = start;
         int goal = -1;
+        const bool has_macro = !macro_transition.empty();
 
-        auto push_next = [&](int cur_state, int next_state, char op) {
+        auto push_next = [&](int cur_state, int next_state, int is_p) {
             if (next_state == cur_state || macro_bfs_seen[next_state] == macro_bfs_stamp) return;
             macro_bfs_seen[next_state] = macro_bfs_stamp;
             macro_bfs_dist[next_state] = macro_bfs_dist[cur_state] + 1;
-            macro_bfs_prev[next_state] = cur_state;
-            macro_bfs_op[next_state] = op;
+            macro_bfs_prev[next_state] = (cur_state << 1) | is_p;
             macro_bfs_queue[q_tail++] = next_state;
         };
 
         while (q_head < q_tail) {
             int cur_state = macro_bfs_queue[q_head++];
-            int cell = cur_state / 4;
             int dir = cur_state & 3;
-            if (cell == to) {
+            if ((cur_state >> 2) == to) {
                 if (goal == -1 || macro_bfs_dist[cur_state] < macro_bfs_dist[goal] ||
                     (macro_bfs_dist[cur_state] == macro_bfs_dist[goal] && dir < (goal & 3))) {
                     goal = cur_state;
@@ -352,21 +364,23 @@ class Solver {
             }
             if (goal != -1 && macro_bfs_dist[cur_state] >= macro_bfs_dist[goal]) continue;
 
-            push_next(cur_state, sid(cell, (dir + 1) & 3), 'R');
-            push_next(cur_state, sid(cell, (dir + 3) & 3), 'L');
-            if (next_cell[cell][dir] != -1) push_next(cur_state, sid(next_cell[cell][dir], dir), 'F');
-            if (!macro_transition.empty()) push_next(cur_state, macro_transition[cur_state], 'P');
+            push_next(cur_state, basic_state_transition[cur_state][1], 0);
+            push_next(cur_state, basic_state_transition[cur_state][2], 0);
+            push_next(cur_state, basic_state_transition[cur_state][0], 0);
+            if (has_macro) push_next(cur_state, macro_transition[cur_state], 1);
         }
 
         if (goal == -1) return basic_move_info(from, from_dir, to);
 
         RouteInfo info;
         info.len = macro_bfs_dist[goal];
-        info.end_cell = goal / 4;
+        info.end_cell = goal >> 2;
         info.end_dir = goal & 3;
         int p_count = 0;
-        for (int cur = goal; cur != start; cur = macro_bfs_prev[cur]) {
-            if (macro_bfs_op[cur] == 'P') ++p_count;
+        for (int cur = goal; cur != start;) {
+            int packed_prev = macro_bfs_prev[cur];
+            p_count += packed_prev & 1;
+            cur = packed_prev >> 1;
         }
         info.p_count = p_count;
         return info;
@@ -527,6 +541,7 @@ class Solver {
     vector<int> ball_id;
     vector<int> basket_id;
     vector<array<int, 4>> next_cell;
+    vector<array<int, 4>> basic_state_transition;  // F, R, L, S/other identity
     vector<uint8_t> first_dir;
     mutable vector<int> macro_bfs_dist;
     mutable vector<int> macro_bfs_prev;
@@ -557,6 +572,14 @@ class Solver {
 
     uint8_t first_dir_at(int from, int to) const {
         return first_dir[from * total + to];
+    }
+
+    static int8_t basic_op_code(char op) {
+        if (op == 'F') return 0;
+        if (op == 'R') return 1;
+        if (op == 'L') return 2;
+        if (op == 'S') return 3;
+        return -2;
     }
 
     void ensure_macro_bfs_buffers(int states) const {
@@ -592,6 +615,22 @@ class Solver {
                 if (dir == LEFT) open = in.v[p.r][p.c - 1] == '0';
                 if (dir == RIGHT) open = in.v[p.r][p.c] == '0';
                 if (open) next_cell[cell][dir] = id(Pos{nr, nc});
+            }
+        }
+    }
+
+
+    void build_basic_state_transition() {
+        const int states = total * 4;
+        basic_state_transition.assign(states, array<int, 4>{});
+        for (int cell = 0; cell < total; ++cell) {
+            for (int dir = 0; dir < 4; ++dir) {
+                const int st = cell * 4 + dir;
+                const int f_cell = next_cell[cell][dir] == -1 ? cell : next_cell[cell][dir];
+                basic_state_transition[st][0] = f_cell * 4 + dir;                  // F
+                basic_state_transition[st][1] = cell * 4 + ((dir + 1) & 3);        // R
+                basic_state_transition[st][2] = cell * 4 + ((dir + 3) & 3);        // L
+                basic_state_transition[st][3] = st;                               // S / identity
             }
         }
     }
@@ -1047,11 +1086,25 @@ vector<char> best_macro_compress(const vector<char> &base, int limit, bool fast)
 
 int raw_order_score(const Solver &solver, const vector<int> &order) {
     constexpr int INF = 1000000000;
-    vector<char> raw = solver.build_ops(order);
-    if ((int)raw.size() > solver.time_limit()) {
-        return INF / 2 + (int)raw.size() - solver.time_limit();
+    int cell = 0;
+    int dir = 1;
+    int len = 0;
+
+    for (int k : order) {
+        int end_dir = dir;
+        len += solver.basic_move_len_fast(cell, dir, solver.ball_cell(k), end_dir) + 1;  // S
+        cell = solver.ball_cell(k);
+        dir = end_dir;
+
+        len += solver.basic_move_len_fast(cell, dir, solver.basket_cell(k), end_dir) + 1;  // S
+        cell = solver.basket_cell(k);
+        dir = end_dir;
     }
-    return (int)raw.size();
+
+    if (len > solver.time_limit()) {
+        return INF / 2 + len - solver.time_limit();
+    }
+    return len;
 }
 
 int basic_move_len(const Solver &solver, int from, int dir, int to) {
@@ -1320,16 +1373,41 @@ vector<int> build_basic_leg_lengths(const Solver &solver, const vector<int> &ord
 struct OrderContext {
     vector<int> pos;
     vector<int> basic_leg_len;
+    vector<int> leg_start_cell;
+    vector<int> leg_start_dir;
 };
 
 OrderContext build_order_context(const Solver &solver, const vector<int> &order) {
     OrderContext ctx;
     ctx.pos = build_pos_in_order(order, solver.ball_count());
-    ctx.basic_leg_len = build_basic_leg_lengths(solver, order);
+
+    const int leg_count = (int)order.size() * 2;
+    ctx.basic_leg_len.reserve(leg_count);
+    ctx.leg_start_cell.reserve(leg_count);
+    ctx.leg_start_dir.reserve(leg_count);
+
+    int cell = 0;
+    int dir = 1;
+    for (int k : order) {
+        ctx.leg_start_cell.push_back(cell);
+        ctx.leg_start_dir.push_back(dir);
+        Solver::RouteInfo to_ball = solver.basic_move_info(cell, dir, solver.ball_cell(k));
+        ctx.basic_leg_len.push_back(to_ball.len);
+        cell = to_ball.end_cell;
+        dir = to_ball.end_dir;
+
+        ctx.leg_start_cell.push_back(cell);
+        ctx.leg_start_dir.push_back(dir);
+        Solver::RouteInfo to_basket = solver.basic_move_info(cell, dir, solver.basket_cell(k));
+        ctx.basic_leg_len.push_back(to_basket.len);
+        cell = to_basket.end_cell;
+        dir = to_basket.end_dir;
+    }
+
     return ctx;
 }
 
-MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, const OrderContext &ctx, MacroSite s) {
+void repair_macro_site_inplace(const Solver &solver, const vector<int> &order, const OrderContext &ctx, MacroSite &s) {
     const int m = solver.ball_count();
     if (m <= 0 || order.empty()) {
         s.ball = 0;
@@ -1338,7 +1416,7 @@ MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, cons
         s.len = 0;
         s.explicit_body = false;
         s.body.clear();
-        return s;
+        return;
     }
 
     s.ball = max(0, min(s.ball, m - 1));
@@ -1350,7 +1428,7 @@ MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, cons
         s.len = 0;
         s.explicit_body = false;
         s.body.clear();
-        return s;
+        return;
     }
 
     int leg = p * 2 + s.phase;
@@ -1359,7 +1437,7 @@ MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, cons
         s.len = 0;
         s.explicit_body = false;
         s.body.clear();
-        return s;
+        return;
     }
 
     const int L = ctx.basic_leg_len[leg];
@@ -1375,30 +1453,33 @@ MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, cons
             s.len = 0;
             s.explicit_body = false;
             s.body.clear();
-            return s;
+            return;
         }
         if ((int)s.body.size() > 160) s.body.resize(160);
         s.len = (int)s.body.size();
-        return s;
+        return;
     }
 
     if (L < 6) {
         s.offset = 0;
         s.len = 0;
-        return s;
+        return;
     }
 
     s.offset = max(0, min(s.offset, L - 6));
     int max_len = min(160, L - s.offset);
     if (max_len < 6) {
         s.len = 0;
-        return s;
+        return;
     }
     s.len = max(6, min(s.len, max_len));
     s.body.clear();
-    return s;
 }
 
+MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, const OrderContext &ctx, MacroSite s) {
+    repair_macro_site_inplace(solver, order, ctx, s);
+    return s;
+}
 MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, MacroSite s) {
     OrderContext ctx = build_order_context(solver, order);
     return repair_macro_site(solver, order, ctx, s);
@@ -1406,7 +1487,7 @@ MacroSite repair_macro_site(const Solver &solver, const vector<int> &order, Macr
 
 void normalize_macro_sites_inplace(const Solver &solver, const vector<int> &order, const OrderContext &ctx,
                                    vector<MacroSite> &sites, int max_defs) {
-    for (MacroSite &s : sites) s = repair_macro_site(solver, order, ctx, s);
+    for (MacroSite &s : sites) repair_macro_site_inplace(solver, order, ctx, s);
     sites.erase(remove_if(sites.begin(), sites.end(), [](const MacroSite &s) {
                     return s.len < 6;
                 }),
@@ -1501,27 +1582,13 @@ vector<char> build_basic_leg_ops_for_site(const Solver &solver, const vector<int
     int pos = ctx.pos[site.ball];
     if (pos < 0 || pos >= (int)order.size()) return empty;
 
-    int cell = 0;
-    int dir = 1;
-    for (int i = 0; i < pos; ++i) {
-        int end_cell = cell;
-        int end_dir = dir;
-        vector<char> to_ball = solver.basic_move_ops(cell, dir, solver.ball_cell(order[i]), end_cell, end_dir);
-        cell = end_cell;
-        dir = end_dir;
-        vector<char> to_basket = solver.basic_move_ops(cell, dir, solver.basket_cell(order[i]), end_cell, end_dir);
-        cell = end_cell;
-        dir = end_dir;
-    }
+    const int leg = pos * 2 + (site.phase & 1);
+    if (leg < 0 || leg >= (int)ctx.leg_start_cell.size() || leg >= (int)ctx.leg_start_dir.size()) return empty;
 
-    int end_cell = cell;
-    int end_dir = dir;
-    vector<char> to_ball = solver.basic_move_ops(cell, dir, solver.ball_cell(site.ball), end_cell, end_dir);
-    if (site.phase == 0) return to_ball;
-
-    cell = end_cell;
-    dir = end_dir;
-    return solver.basic_move_ops(cell, dir, solver.basket_cell(site.ball), end_cell, end_dir);
+    int end_cell = ctx.leg_start_cell[leg];
+    int end_dir = ctx.leg_start_dir[leg];
+    const int target = ((site.phase & 1) == 0) ? solver.ball_cell(site.ball) : solver.basket_cell(site.ball);
+    return solver.basic_move_ops(end_cell, end_dir, target, end_cell, end_dir);
 }
 
 bool materialize_macro_site_body(const Solver &solver, const vector<int> &order, const OrderContext &ctx, MacroSite &site) {
@@ -1935,17 +2002,31 @@ vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<
 
     auto append_and_apply = [&](const vector<char> &buttons, const vector<char> &active_macro) {
         program.insert(program.end(), buttons.begin(), buttons.end());
+        int state = cell * 4 + dir;
         for (char op : buttons) {
             if (op == 'P') {
-                if (!active_macro.empty()) {
-                    int next_state = macro_transition[cell * 4 + dir];
-                    cell = next_state / 4;
-                    dir = next_state % 4;
-                }
+                if (!active_macro.empty()) state = macro_transition[state];
             } else {
-                solver.apply_basic_op(op, cell, dir);
+                state = solver.apply_basic_state(state, op);
             }
         }
+        cell = state >> 2;
+        dir = state & 3;
+    };
+
+    auto append_and_apply_slice = [&](const vector<char> &buttons, int l, int r, const vector<char> &active_macro) {
+        program.insert(program.end(), buttons.begin() + l, buttons.begin() + r);
+        int state = cell * 4 + dir;
+        for (int i = l; i < r; ++i) {
+            char op = buttons[i];
+            if (op == 'P') {
+                if (!active_macro.empty()) state = macro_transition[state];
+            } else {
+                state = solver.apply_basic_state(state, op);
+            }
+        }
+        cell = state >> 2;
+        dir = state & 3;
     };
 
     auto current_route = [&](int target) {
@@ -1978,8 +2059,7 @@ vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<
             return;
         }
 
-        vector<char> prefix(route.begin(), route.begin() + def.offset);
-        append_and_apply(prefix, macro);
+        append_and_apply_slice(route, 0, def.offset, macro);
 
         vector<char> new_macro;
         if (def.explicit_body) {
@@ -2008,16 +2088,17 @@ vector<char> build_program_with_p_macro_plan(const Solver &solver, const vector<
         program.push_back('M');
         program.insert(program.end(), definition_buttons.begin(), definition_buttons.end());
         program.push_back('M');
-        for (char op : definition_buttons) {
-            if (op == 'P') {
-                if (!macro.empty()) {
-                    int next_state = macro_transition[cell * 4 + dir];
-                    cell = next_state / 4;
-                    dir = next_state % 4;
+        {
+            int state = cell * 4 + dir;
+            for (char op : definition_buttons) {
+                if (op == 'P') {
+                    if (!macro.empty()) state = macro_transition[state];
+                } else {
+                    state = solver.apply_basic_state(state, op);
                 }
-            } else {
-                solver.apply_basic_op(op, cell, dir);
             }
+            cell = state >> 2;
+            dir = state & 3;
         }
 
         vector<int> new_transition = solver.build_macro_transition_from_buttons(definition_buttons, macro_transition);
@@ -2075,12 +2156,78 @@ struct RouteCacheKeyHash {
     }
 };
 
+static inline uint64_t route_cache_hash_value(const RouteCacheKey &key) {
+    uint64_t h = key.macro_hash;
+    h ^= (uint64_t)(uint32_t)key.start_state * 0x9e3779b97f4a7c15ULL;
+    h ^= (uint64_t)(uint32_t)key.target * 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    return h;
+}
+
+struct RouteInfoFlatCache {
+    static constexpr int CAPACITY = 1 << 19;
+    static constexpr int MASK = CAPACITY - 1;
+
+    vector<RouteCacheKey> keys;
+    vector<Solver::RouteInfo> values;
+    vector<unsigned char> used;
+    int count = 0;
+
+    void reserve(size_t) {
+        if (!keys.empty()) return;
+        keys.resize(CAPACITY);
+        values.resize(CAPACITY);
+        used.assign(CAPACITY, 0);
+        count = 0;
+    }
+
+    int size() const {
+        return count;
+    }
+
+    void clear() {
+        if (!used.empty()) fill(used.begin(), used.end(), 0);
+        count = 0;
+    }
+
+    bool find(const RouteCacheKey &key, Solver::RouteInfo &value) const {
+        if (used.empty()) return false;
+        uint32_t slot = (uint32_t)route_cache_hash_value(key) & MASK;
+        while (used[slot]) {
+            if (keys[slot] == key) {
+                value = values[slot];
+                return true;
+            }
+            slot = (slot + 1) & MASK;
+        }
+        return false;
+    }
+
+    void emplace(const RouteCacheKey &key, const Solver::RouteInfo &value) {
+        if (used.empty()) reserve(0);
+        uint32_t slot = (uint32_t)route_cache_hash_value(key) & MASK;
+        while (used[slot]) {
+            if (keys[slot] == key) {
+                values[slot] = value;
+                return;
+            }
+            slot = (slot + 1) & MASK;
+        }
+        used[slot] = 1;
+        keys[slot] = key;
+        values[slot] = value;
+        ++count;
+    }
+};
+
 struct CachedRouteOps {
     vector<char> ops;
 };
 
 struct PlanEvalCache {
-    unordered_map<RouteCacheKey, Solver::RouteInfo, RouteCacheKeyHash> info_cache;
+    RouteInfoFlatCache info_cache;
     unordered_map<RouteCacheKey, CachedRouteOps, RouteCacheKeyHash> ops_cache;
     long long info_hits = 0;
     long long info_misses = 0;
@@ -2140,19 +2287,35 @@ int score_p_macro_plan_fast(const Solver &solver, const vector<int> &order, vect
 
     auto append_and_apply = [&](const vector<char> &buttons, const vector<char> &active_macro) {
         out_len += (int)buttons.size();
+        int state = cell * 4 + dir;
         for (char op : buttons) {
             if (op == 'P') {
                 expanded_len += (int)active_macro.size();
-                if (!active_macro.empty()) {
-                    int next_state = macro_transition[cell * 4 + dir];
-                    cell = next_state / 4;
-                    dir = next_state % 4;
-                }
+                if (!active_macro.empty()) state = macro_transition[state];
             } else {
                 ++expanded_len;
-                solver.apply_basic_op(op, cell, dir);
+                state = solver.apply_basic_state(state, op);
             }
         }
+        cell = state >> 2;
+        dir = state & 3;
+    };
+
+    auto append_and_apply_slice = [&](const vector<char> &buttons, int l, int r, const vector<char> &active_macro) {
+        out_len += r - l;
+        int state = cell * 4 + dir;
+        for (int i = l; i < r; ++i) {
+            char op = buttons[i];
+            if (op == 'P') {
+                expanded_len += (int)active_macro.size();
+                if (!active_macro.empty()) state = macro_transition[state];
+            } else {
+                ++expanded_len;
+                state = solver.apply_basic_state(state, op);
+            }
+        }
+        cell = state >> 2;
+        dir = state & 3;
     };
 
     uint64_t macro_hash = 0;
@@ -2188,10 +2351,10 @@ int score_p_macro_plan_fast(const Solver &solver, const vector<int> &order, vect
 
         RouteCacheKey key{macro_hash, cell * 4 + dir, target};
         if (cache) {
-            auto it = cache->info_cache.find(key);
-            if (it != cache->info_cache.end()) {
+            Solver::RouteInfo cached_info;
+            if (cache->info_cache.find(key, cached_info)) {
                 ++cache->info_hits;
-                return it->second;
+                return cached_info;
             }
             ++cache->info_misses;
         }
@@ -2240,14 +2403,235 @@ int score_p_macro_plan_fast(const Solver &solver, const vector<int> &order, vect
             return;
         }
 
-        vector<char> prefix(route.begin(), route.begin() + def.offset);
-        append_and_apply(prefix, macro);
+        append_and_apply_slice(route, 0, def.offset, macro);
 
         vector<char> new_macro;
         if (def.explicit_body) {
             new_macro = def.body;
         } else {
             vector<char> raw_definition(route.begin() + def.offset, route.begin() + def.offset + def.len);
+            new_macro = expand_buttons_with_macro(raw_definition, macro);
+        }
+        vector<char> definition_buttons = encode_with_previous_macro(new_macro, macro);
+
+        out_len += 2;
+        append_and_apply(definition_buttons, macro);
+
+        vector<int> new_transition = solver.build_macro_transition_from_buttons(definition_buttons, macro_transition);
+        macro_hash = hash_definition_buttons(macro_hash, definition_buttons);
+        macro = std::move(new_macro);
+        macro_transition = std::move(new_transition);
+        has_macro = true;
+
+        append_info(current_route_info(target));
+        ++leg;
+    };
+
+    for (int k : order) {
+        move_to(solver.ball_cell(k));
+        if (exceeded_cutoff()) return cutoff + 1;
+        ++out_len;
+        ++expanded_len;
+        if (exceeded_cutoff()) return cutoff + 1;
+        move_to(solver.basket_cell(k));
+        if (exceeded_cutoff()) return cutoff + 1;
+        ++out_len;
+        ++expanded_len;
+        if (exceeded_cutoff()) return cutoff + 1;
+    }
+
+    return current_score_value();
+}
+
+
+int score_p_macro_sites_fast(const Solver &solver, const vector<int> &order, const OrderContext &ctx,
+                             const vector<MacroSite> &sites, int limit,
+                             int cutoff = numeric_limits<int>::max() / 4,
+                             PlanEvalCache *cache = nullptr) {
+    vector<int> site_order;
+    site_order.reserve(sites.size());
+    for (int i = 0; i < (int)sites.size(); ++i) {
+        const MacroSite &s = sites[i];
+        if (s.len < 6) continue;
+        if (s.phase < 0 || s.phase > 1) continue;
+        if (s.ball < 0 || s.ball >= (int)ctx.pos.size()) continue;
+        int p = ctx.pos[s.ball];
+        if (p < 0) continue;
+        site_order.push_back(i);
+    }
+
+    auto site_leg = [&](int idx) {
+        const MacroSite &s = sites[idx];
+        return ctx.pos[s.ball] * 2 + s.phase;
+    };
+
+    sort(site_order.begin(), site_order.end(), [&](int lhs_idx, int rhs_idx) {
+        const MacroSite &lhs = sites[lhs_idx];
+        const MacroSite &rhs = sites[rhs_idx];
+        int lhs_leg = site_leg(lhs_idx);
+        int rhs_leg = site_leg(rhs_idx);
+        if (lhs_leg != rhs_leg) return lhs_leg < rhs_leg;
+        if (lhs.offset != rhs.offset) return lhs.offset < rhs.offset;
+        return lhs.len > rhs.len;
+    });
+
+    // normalize_p_macro_plan() と同じく、同じ leg の定義は最初の1つだけ使う。
+    if (!site_order.empty()) {
+        int write = 0;
+        int last_leg = -1;
+        for (int idx : site_order) {
+            int leg_id = site_leg(idx);
+            if (leg_id == last_leg) continue;
+            site_order[write++] = idx;
+            last_leg = leg_id;
+        }
+        site_order.resize(write);
+    }
+
+    vector<char> macro;
+    vector<int> macro_transition;
+    bool has_macro = false;
+    int cell = 0;
+    int dir = 1;
+    int leg = 0;
+    int plan_idx = 0;
+    int out_len = 0;
+    int expanded_len = 0;
+
+    auto current_score_value = [&]() {
+        int score = out_len;
+        if (out_len > limit) score += 1000000 + out_len - limit;
+        if (expanded_len > limit) score += 1000 * (expanded_len - limit);
+        return score;
+    };
+
+    auto exceeded_cutoff = [&]() {
+        return current_score_value() > cutoff;
+    };
+
+    auto append_and_apply = [&](const vector<char> &buttons, const vector<char> &active_macro) {
+        out_len += (int)buttons.size();
+        int state = cell * 4 + dir;
+        for (char op : buttons) {
+            if (op == 'P') {
+                expanded_len += (int)active_macro.size();
+                if (!active_macro.empty()) state = macro_transition[state];
+            } else {
+                ++expanded_len;
+                state = solver.apply_basic_state(state, op);
+            }
+        }
+        cell = state >> 2;
+        dir = state & 3;
+    };
+
+    auto append_and_apply_slice = [&](const vector<char> &buttons, int l, int r, const vector<char> &active_macro) {
+        out_len += r - l;
+        int state = cell * 4 + dir;
+        for (int i = l; i < r; ++i) {
+            char op = buttons[i];
+            if (op == 'P') {
+                expanded_len += (int)active_macro.size();
+                if (!active_macro.empty()) state = macro_transition[state];
+            } else {
+                ++expanded_len;
+                state = solver.apply_basic_state(state, op);
+            }
+        }
+        cell = state >> 2;
+        dir = state & 3;
+    };
+
+    uint64_t macro_hash = 0;
+
+    auto current_route = [&](int target) {
+        int end_cell, end_dir;
+        if (!has_macro) {
+            return solver.basic_move_ops(cell, dir, target, end_cell, end_dir);
+        }
+
+        RouteCacheKey key{macro_hash, cell * 4 + dir, target};
+        if (cache) {
+            auto it = cache->ops_cache.find(key);
+            if (it != cache->ops_cache.end()) {
+                ++cache->ops_hits;
+                return it->second.ops;
+            }
+            ++cache->ops_misses;
+        }
+
+        vector<char> ops = solver.macro_move_ops_with_transition(cell, dir, target, macro_transition, end_cell, end_dir);
+        if (cache) {
+            cache->ops_cache.emplace(key, CachedRouteOps{ops});
+            cache->trim_if_needed();
+        }
+        return ops;
+    };
+
+    auto current_route_info = [&](int target) {
+        if (!has_macro) {
+            return solver.basic_move_info(cell, dir, target);
+        }
+
+        RouteCacheKey key{macro_hash, cell * 4 + dir, target};
+        if (cache) {
+            Solver::RouteInfo cached_info;
+            if (cache->info_cache.find(key, cached_info)) {
+                ++cache->info_hits;
+                return cached_info;
+            }
+            ++cache->info_misses;
+        }
+
+        Solver::RouteInfo info = solver.macro_move_info_with_transition(cell, dir, target, macro_transition);
+        if (cache) {
+            cache->info_cache.emplace(key, info);
+            cache->trim_if_needed();
+        }
+        return info;
+    };
+
+    auto append_info = [&](const Solver::RouteInfo &info) {
+        out_len += info.len;
+        expanded_len += info.len + info.p_count * ((int)macro.size() - 1);
+        cell = info.end_cell;
+        dir = info.end_dir;
+    };
+
+    auto move_to = [&](int target) {
+        const MacroSite *def = nullptr;
+        while (plan_idx < (int)site_order.size() && site_leg(site_order[plan_idx]) < leg) ++plan_idx;
+        if (plan_idx < (int)site_order.size() && site_leg(site_order[plan_idx]) == leg) {
+            def = &sites[site_order[plan_idx]];
+            ++plan_idx;
+        }
+
+        if (def == nullptr) {
+            append_info(current_route_info(target));
+            ++leg;
+            return;
+        }
+
+        vector<char> route = current_route(target);
+        bool define_here = false;
+        if (def->explicit_body) {
+            define_here = (def->offset <= (int)route.size() && !def->body.empty());
+        } else {
+            define_here = (def->offset + def->len <= (int)route.size());
+        }
+        if (!define_here) {
+            append_and_apply(route, macro);
+            ++leg;
+            return;
+        }
+
+        append_and_apply_slice(route, 0, def->offset, macro);
+
+        vector<char> new_macro;
+        if (def->explicit_body) {
+            new_macro = def->body;
+        } else {
+            vector<char> raw_definition(route.begin() + def->offset, route.begin() + def->offset + def->len);
             new_macro = expand_buttons_with_macro(raw_definition, macro);
         }
         vector<char> definition_buttons = encode_with_previous_macro(new_macro, macro);
@@ -2300,12 +2684,11 @@ vector<char> anneal_order_and_p_macro_reroute(const Solver &solver, const vector
     if (initial_order.empty()) return solver.build_ops(initial_order);
 
     PlanEvalCache eval_cache;
-    //eval_cache.reserve_memory();
+    eval_cache.reserve_memory();
 
     auto eval = [&](const vector<int> &ord, const OrderContext &ctx, const vector<MacroSite> &sites,
                     int cutoff = numeric_limits<int>::max() / 4) {
-        vector<PMacroPlacement> plan = convert_sites_to_plan_no_repair(ord, ctx, sites);
-        return score_p_macro_plan_fast(solver, ord, plan, limit, cutoff, &eval_cache);
+        return score_p_macro_sites_fast(solver, ord, ctx, sites, limit, cutoff, &eval_cache);
     };
 
     auto build_answer = [&](const vector<int> &ord, const OrderContext &ctx,
