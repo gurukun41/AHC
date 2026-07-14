@@ -1,47 +1,11 @@
-# Prerequisites
-*.d
+# Ignore everything except source code, personal notes, and this file.
+*
+!*/
+!*.cpp
+!*.md
+!/.gitignore
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-*.yml
-*.plist
-
-*.DS_Store
-
-*.txt
-
-# ignore AHC/tools directory
-tools/
-
-# pahcer
-*.toml
-vis
-*.html
+# Contest tooling and generated reports are not personal source/notes.
+/contests/**/tools/
+/contests/**/pahcer/
+/contests/**/pahcer-studio/
