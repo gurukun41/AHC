@@ -161,9 +161,12 @@ ostream& operator<<(ostream& os, const Operation& op) {
 
 class Solver {
     static constexpr int MAX_OPERATIONS = 100000;
-    static constexpr int MAX_SA_ITERATIONS = 10000;
-    static constexpr double SA_TIME_LIMIT = 1.75;
-    static constexpr double END_TEMPERATURE = 0.05;
+    static constexpr int MAX_BEAM_ROUNDS = 10000;
+    static constexpr int BEAM_WIDTH = 8;
+    static constexpr int BEAM_BRANCHING = 3;
+    static constexpr int BEAM_ELITE_COUNT = 1;
+    static constexpr int BEAM_WORSENING_SLACK = 20;
+    static constexpr double BEAM_TIME_LIMIT = 1.85;
 
     struct RouteStep {
         int from;
@@ -207,7 +210,7 @@ class Solver {
     // 1回の合法長方形操作を辺とした、全点対の最短操作回数。
     vvi rectangle_operation_distance;
     // 固定BFS順の各stageにおける、targetからの長方形遷移距離。
-    // 空なら未計算。active集合はstageだけで決まるためSA中に再利用できる。
+    // 空なら未計算。active集合はstageだけで決まるためビーム探索中に再利用できる。
     vvi stage_target_distance_cache;
 
     int id(int r, int c) const {
@@ -232,9 +235,22 @@ class Solver {
         ).count();
     }
 
-    double random_real() {
-        return (static_cast<double>(random_engine()) + 0.5)
-            / (static_cast<double>(mt19937::max()) + 1.0);
+    uint64_t operation_signature(const vector<Operation>& operations) const {
+        uint64_t hash = 1469598103934665603ULL;
+        auto mix = [&](uint64_t value) {
+            hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+            hash *= 1099511628211ULL;
+        };
+
+        mix(operations.size());
+        for (const Operation& op : operations) {
+            mix(static_cast<unsigned char>(op.direction));
+            mix(static_cast<uint64_t>(op.r));
+            mix(static_cast<uint64_t>(op.c));
+            mix(static_cast<uint64_t>(op.h));
+            mix(static_cast<uint64_t>(op.w));
+        }
+        return hash;
     }
 
     void add_edge(int u, int v) {
@@ -869,7 +885,7 @@ class Solver {
         size_t operation_limit,
         bool observe_time_limit
     ) {
-        if (observe_time_limit && elapsed_seconds() >= SA_TIME_LIMIT) return false;
+        if (observe_time_limit && elapsed_seconds() >= BEAM_TIME_LIMIT) return false;
 
         const int target = order[stage];
         const int source = pos[target];
@@ -880,7 +896,7 @@ class Solver {
         const vvi inactive_prefix = make_inactive_prefix();
         const vi path = find_rectangle_path(source, target, inactive_prefix);
         for (int i = 0; i + 1 < static_cast<int>(path.size()); ++i) {
-            if (observe_time_limit && elapsed_seconds() >= SA_TIME_LIMIT) {
+            if (observe_time_limit && elapsed_seconds() >= BEAM_TIME_LIMIT) {
                 return false;
             }
             if (answer.size() >= operation_limit) return false;
@@ -945,7 +961,7 @@ class Solver {
         SearchSolution& candidate
     ) {
         if (current.operations.empty()) return false;
-        if (elapsed_seconds() >= SA_TIME_LIMIT) return false;
+        if (elapsed_seconds() >= BEAM_TIME_LIMIT) return false;
 
         // 半分は全体、半分は後半から選び、長い近傍と安い近傍を両方試す。
         int first_step = 0;
@@ -979,7 +995,7 @@ class Solver {
         // completed stage の操作は answer にだけコピー済みで、盤面は checkpoint から復元済み。
         // 現在 stage 内の変更位置より前だけを盤面へ再適用する。
         for (int index = 0; index < selected_index; ++index) {
-            if (elapsed_seconds() >= SA_TIME_LIMIT) return false;
+            if (elapsed_seconds() >= BEAM_TIME_LIMIT) return false;
             const RouteStep& step = selected_steps[index];
             if (pos[target] != step.from) {
                 throw runtime_error("A replayed route starts at an unexpected cell.");
@@ -1037,7 +1053,7 @@ class Solver {
         if (!found_alternative) {
             return false;
         }
-        if (elapsed_seconds() >= SA_TIME_LIMIT) return false;
+        if (elapsed_seconds() >= BEAM_TIME_LIMIT) return false;
         if (answer.size() >= operation_limit) return false;
 
         candidate.stages.resize(vertex_count);
@@ -1073,7 +1089,7 @@ class Solver {
         }
 
         for (int stage = selected_stage - 1; stage >= 1; --stage) {
-            if (elapsed_seconds() >= SA_TIME_LIMIT) return false;
+            if (elapsed_seconds() >= BEAM_TIME_LIMIT) return false;
             candidate.stage_begin[stage] = answer.size();
             candidate.board_before_stage[stage] = board;
             if (!finish_target(
@@ -1231,64 +1247,98 @@ public:
         const int root = choose_open_root();
         const vi order = make_bfs_order(root);
         stage_target_distance_cache.assign(vertex_count, {});
-        SearchSolution current = make_initial_solution(order);
-        vector<Operation> best_answer = postprocess_operations(
-            current.operations
-        );
 
-        const double annealing_start = elapsed_seconds();
-        const double annealing_duration = max(
-            1e-9, SA_TIME_LIMIT - annealing_start
-        );
-        const double start_temperature = clamp(
-            static_cast<double>(current.operations.size()) * 0.005,
-            3.0,
-            20.0
-        );
+        SearchSolution initial = make_initial_solution(order);
+        vector<Operation> best_answer = initial.operations;
+        vector<SearchSolution> beam;
+        beam.push_back(std::move(initial));
 
-        for (int iteration = 0; iteration < MAX_SA_ITERATIONS; ++iteration) {
-            const double elapsed = elapsed_seconds();
-            if (elapsed >= SA_TIME_LIMIT) break;
+        struct BeamCandidate {
+            SearchSolution solution;
+            uint64_t signature;
+        };
 
-            const double progress = clamp(
-                (elapsed - annealing_start) / annealing_duration,
-                0.0,
-                1.0
-            );
-            const double temperature = start_temperature * pow(
-                END_TEMPERATURE / start_temperature,
-                progress
+        for (int round = 0; round < MAX_BEAM_ROUNDS; ++round) {
+            if (elapsed_seconds() >= BEAM_TIME_LIMIT) break;
+
+            vector<BeamCandidate> candidates;
+            candidates.reserve(
+                BEAM_ELITE_COUNT + static_cast<int>(beam.size()) * BEAM_BRANCHING
             );
 
-            // 同じ乱数を受理判定と安全な操作数cutoffの両方に使う。
-            const double acceptance_random = random_real();
-            const double allowed_delta = -temperature * log(acceptance_random);
-            const size_t allowed_worse = static_cast<size_t>(floor(allowed_delta));
-            const size_t operation_limit = min<size_t>(
-                MAX_OPERATIONS,
-                current.operations.size() + allowed_worse
-            );
-
-            SearchSolution candidate;
-            if (!make_neighbor(
-                current,
-                order,
-                operation_limit,
-                candidate
-            )) {
-                continue;
+            // 最良候補を残しつつ、残りの枠でその周辺を並列に探索する。
+            const int elite_count = min<int>(BEAM_ELITE_COUNT, beam.size());
+            for (int index = 0; index < elite_count; ++index) {
+                candidates.push_back({
+                    beam[index],
+                    operation_signature(beam[index].operations)
+                });
             }
 
-            // 探索traceは生操作列のまま保ち、最良解は安全な後処理後の手数で比較する。
-            vector<Operation> simplified_candidate = postprocess_operations(
-                candidate.operations
-            );
-            if (simplified_candidate.size() < best_answer.size()) {
-                best_answer = std::move(simplified_candidate);
+            bool generated_child = false;
+            for (const SearchSolution& parent : beam) {
+                for (int branch = 0; branch < BEAM_BRANCHING; ++branch) {
+                    if (elapsed_seconds() >= BEAM_TIME_LIMIT) break;
+
+                    // 一時的な悪化を許し、貪欲法では越えられない谷も探索する。
+                    const size_t relaxed_best_limit = min<size_t>(
+                        MAX_OPERATIONS,
+                        best_answer.size() + BEAM_WORSENING_SLACK
+                    );
+                    const size_t operation_limit = max(
+                        parent.operations.size(),
+                        relaxed_best_limit
+                    );
+
+                    SearchSolution child;
+                    if (!make_neighbor(
+                        parent,
+                        order,
+                        operation_limit,
+                        child
+                    )) {
+                        continue;
+                    }
+
+                    generated_child = true;
+                    if (child.operations.size() < best_answer.size()) {
+                        best_answer = child.operations;
+                    }
+                    const uint64_t signature = operation_signature(child.operations);
+                    candidates.push_back({std::move(child), signature});
+                }
+                if (elapsed_seconds() >= BEAM_TIME_LIMIT) break;
             }
-            current = std::move(candidate);
+
+            if (!generated_child) continue;
+
+            sort(candidates.begin(), candidates.end(),
+                [](const BeamCandidate& lhs, const BeamCandidate& rhs) {
+                    if (lhs.solution.operations.size()
+                        != rhs.solution.operations.size()) {
+                        return lhs.solution.operations.size()
+                            < rhs.solution.operations.size();
+                    }
+                    return lhs.signature < rhs.signature;
+                }
+            );
+
+            vector<SearchSolution> next_beam;
+            next_beam.reserve(BEAM_WIDTH);
+            unordered_set<uint64_t> used_signatures;
+            used_signatures.reserve(candidates.size() * 2 + 1);
+
+            for (BeamCandidate& candidate : candidates) {
+                if (!used_signatures.insert(candidate.signature).second) continue;
+                next_beam.push_back(std::move(candidate.solution));
+                if (static_cast<int>(next_beam.size()) >= BEAM_WIDTH) break;
+            }
+
+            if (next_beam.empty()) break;
+            beam = std::move(next_beam);
         }
-        return best_answer;
+
+        return postprocess_operations(best_answer);
     }
 };
 
