@@ -150,23 +150,45 @@ struct Operation {
     int w;
 };
 
+struct Region {
+    int r;
+    int c;
+    int h;
+    int w;
+    vi cells;
+};
+
 ostream& operator<<(ostream& os, const Operation& op) {
     return os << op.direction << ' ' << op.r << ' ' << op.c << ' '
               << op.h << ' ' << op.w;
 }
 
 class Solver {
-    static constexpr int MAX_OPERATIONS = 100000;
+    static constexpr int OUTPUT_OPERATION_LIMIT = 100000;
+    static constexpr int CANDIDATE_OPERATION_LIMIT = 200000;
+    static constexpr int OVERLAP_AFFINITY_BONUS = 4;
+
+    struct RegionLink {
+        int to;
+        int here;
+        int there;
+    };
 
     const Input& input;
     int n;
     int vertex_count;
 
     vvi graph;
+    vi initial_board;
     vi board;  // board[cell] = card
     vi pos;    // pos[card] = cell
+    vi goal_cell;  // goal_cell[card] = 現在の段階での目標マス
     vector<char> active;
     vector<Operation> answer;
+
+    vector<Region> regions;
+    vi region_id;
+    vvi rectangle_affinity;
 
     vvi vertical_wall_prefix;
     vvi horizontal_wall_prefix;
@@ -252,14 +274,18 @@ class Solver {
         horizontal_wall_prefix = make_prefix_sum(horizontal);
     }
 
-    bool rectangle_has_no_walls(const Operation& op) const {
+    bool area_has_no_walls(int r, int c, int h, int w) const {
         const int vertical_walls = rectangle_sum(
-            vertical_wall_prefix, op.r, op.c, op.h, op.w - 1
+            vertical_wall_prefix, r, c, h, w - 1
         );
         const int horizontal_walls = rectangle_sum(
-            horizontal_wall_prefix, op.r, op.c, op.h - 1, op.w
+            horizontal_wall_prefix, r, c, h - 1, w
         );
         return vertical_walls == 0 && horizontal_walls == 0;
+    }
+
+    bool rectangle_has_no_walls(const Operation& op) const {
+        return area_has_no_walls(op.r, op.c, op.h, op.w);
     }
 
     void add_thin_transition(int from, int to, const Operation& op) {
@@ -326,6 +352,348 @@ class Solver {
                 }
             }
         }
+    }
+
+    // 未割当部分から最大面積の壁なし長方形を繰り返し選び、
+    // 盤面を互いに素な長方形領域へ分割する。
+    void build_regions() {
+        regions.clear();
+        region_id.assign(vertex_count, -1);
+        vector<char> assigned(vertex_count, false);
+        int remaining = vertex_count;
+
+        while (remaining > 0) {
+            vvi assigned_values(n, vi(n, 0));
+            for (int r = 0; r < n; ++r) {
+                for (int c = 0; c < n; ++c) {
+                    assigned_values[r][c] = assigned[id(r, c)];
+                }
+            }
+            const vvi assigned_prefix = make_prefix_sum(assigned_values);
+
+            Region best{};
+            int best_area = 0;
+            int best_short_side = -1;
+
+            for (int top = 0; top < n; ++top) {
+                for (int left = 0; left < n; ++left) {
+                    for (int bottom = top + 1; bottom <= n; ++bottom) {
+                        for (int right = left + 1; right <= n; ++right) {
+                            const int h = bottom - top;
+                            const int w = right - left;
+                            const int area = h * w;
+                            const int short_side = min(h, w);
+
+                            if (area < best_area) continue;
+                            if (area == best_area && short_side <= best_short_side) continue;
+                            if (rectangle_sum(assigned_prefix, top, left, h, w) != 0) {
+                                continue;
+                            }
+                            if (!area_has_no_walls(top, left, h, w)) continue;
+
+                            best = {top, left, h, w, {}};
+                            best_area = area;
+                            best_short_side = short_side;
+                        }
+                    }
+                }
+            }
+
+            if (best_area == 0) {
+                throw runtime_error("Failed to partition the board into rectangles.");
+            }
+
+            const int rid = regions.size();
+            for (int r = best.r; r < best.r + best.h; ++r) {
+                for (int c = best.c; c < best.c + best.w; ++c) {
+                    const int v = id(r, c);
+                    assigned[v] = true;
+                    region_id[v] = rid;
+                    best.cells.push_back(v);
+                }
+            }
+            remaining -= best_area;
+            regions.push_back(std::move(best));
+        }
+    }
+
+    // 重なりを許して、これ以上上下左右へ拡張できない壁なし長方形を列挙する。
+    // affinity[u][v] は u と v が共通して属する最大長方形の個数。
+    void build_overlapping_rectangle_affinity() {
+        vector<Region> overlapping_rectangles;
+
+        for (int top = 0; top < n; ++top) {
+            for (int left = 0; left < n; ++left) {
+                for (int bottom = top + 1; bottom <= n; ++bottom) {
+                    for (int right = left + 1; right <= n; ++right) {
+                        const int h = bottom - top;
+                        const int w = right - left;
+                        if (!area_has_no_walls(top, left, h, w)) continue;
+
+                        bool maximal = true;
+                        if (top > 0 && area_has_no_walls(top - 1, left, h + 1, w)) {
+                            maximal = false;
+                        }
+                        if (bottom < n && area_has_no_walls(top, left, h + 1, w)) {
+                            maximal = false;
+                        }
+                        if (left > 0 && area_has_no_walls(top, left - 1, h, w + 1)) {
+                            maximal = false;
+                        }
+                        if (right < n && area_has_no_walls(top, left, h, w + 1)) {
+                            maximal = false;
+                        }
+                        if (!maximal) continue;
+
+                        Region region{top, left, h, w, {}};
+                        for (int r = top; r < bottom; ++r) {
+                            for (int c = left; c < right; ++c) {
+                                region.cells.push_back(id(r, c));
+                            }
+                        }
+                        overlapping_rectangles.push_back(std::move(region));
+                    }
+                }
+            }
+        }
+
+        if (overlapping_rectangles.empty()) {
+            throw runtime_error("No maximal wall-free rectangle was found.");
+        }
+
+        const int rectangle_count = overlapping_rectangles.size();
+        const int word_count = (rectangle_count + 63) / 64;
+        vector<vector<uint64_t>> membership(
+            vertex_count, vector<uint64_t>(word_count, 0)
+        );
+
+        for (int rid = 0; rid < rectangle_count; ++rid) {
+            for (const int v : overlapping_rectangles[rid].cells) {
+                membership[v][rid / 64] |= 1ULL << (rid % 64);
+            }
+        }
+
+        rectangle_affinity.assign(vertex_count, vi(vertex_count, 0));
+        for (int u = 0; u < vertex_count; ++u) {
+            for (int v = u; v < vertex_count; ++v) {
+                int common = 0;
+                for (int word = 0; word < word_count; ++word) {
+                    common += __builtin_popcountll(
+                        membership[u][word] & membership[v][word]
+                    );
+                }
+                rectangle_affinity[u][v] = rectangle_affinity[v][u] = common;
+            }
+        }
+    }
+
+    // 領域グラフの全域木と、各領域内部のBFS木を接続したセル順序を作る。
+    // 返す順序では、木の親は必ず子より前に現れる。
+    vi make_hierarchical_order() const {
+        const int region_count = regions.size();
+        vector<vector<RegionLink>> region_graph(region_count);
+        vvi linked(region_count, vi(region_count, 0));
+
+        for (int u = 0; u < vertex_count; ++u) {
+            for (const int v : graph[u]) {
+                const int ru = region_id[u];
+                const int rv = region_id[v];
+                if (ru == rv || linked[ru][rv]) continue;
+
+                linked[ru][rv] = linked[rv][ru] = 1;
+                region_graph[ru].push_back({rv, u, v});
+                region_graph[rv].push_back({ru, v, u});
+            }
+        }
+
+        // 階層木全体も、root領域の角にあたる盤面左上から始める。
+        const int root_cell = id(0, 0);
+        const int root_region = region_id[root_cell];
+        vi parent_region(region_count, -1);
+        vi entry_cell(region_count, -1);
+        vi parent_gateway(region_count, -1);
+        vi region_order;
+        queue<int> region_queue;
+
+        parent_region[root_region] = root_region;
+        entry_cell[root_region] = root_cell;
+        region_queue.push(root_region);
+
+        while (!region_queue.empty()) {
+            const int rid = region_queue.front();
+            region_queue.pop();
+            region_order.push_back(rid);
+
+            for (const RegionLink& link : region_graph[rid]) {
+                if (parent_region[link.to] != -1) continue;
+                parent_region[link.to] = rid;
+                entry_cell[link.to] = link.there;
+                parent_gateway[link.to] = link.here;
+                region_queue.push(link.to);
+            }
+        }
+
+        if (static_cast<int>(region_order.size()) != region_count) {
+            throw runtime_error("The region graph is disconnected.");
+        }
+
+        vi order;
+        vb added(vertex_count, false);
+        for (const int rid : region_order) {
+            const int entry = entry_cell[rid];
+            if (rid != root_region && !added[parent_gateway[rid]]) {
+                throw runtime_error("A parent gateway was not added first.");
+            }
+
+            queue<int> que;
+            added[entry] = true;
+            order.push_back(entry);
+            que.push(entry);
+
+            while (!que.empty()) {
+                const int v = que.front();
+                que.pop();
+
+                for (const int to : graph[v]) {
+                    if (region_id[to] != rid || added[to]) continue;
+                    added[to] = true;
+                    order.push_back(to);
+                    que.push(to);
+                }
+            }
+        }
+
+        if (static_cast<int>(order.size()) != vertex_count) {
+            throw runtime_error("A region is not internally connected.");
+        }
+        return order;
+    }
+
+    vi make_region_order(int rid) const {
+        const Region& region = regions[rid];
+        // active領域を角へ向かって残すため、長方形の左上角をrootにする。
+        const int root = id(region.r, region.c);
+        vi order;
+        vb visited(vertex_count, false);
+        queue<int> que;
+
+        visited[root] = true;
+        que.push(root);
+        while (!que.empty()) {
+            const int v = que.front();
+            que.pop();
+            order.push_back(v);
+
+            for (const int to : graph[v]) {
+                if (region_id[to] != rid || visited[to]) continue;
+                visited[to] = true;
+                que.push(to);
+            }
+        }
+
+        if (order.size() != region.cells.size()) {
+            throw runtime_error("A rectangular region is not connected.");
+        }
+        return order;
+    }
+
+    void assign_cards_min_cost(const vi& cards, const vi& cells, vi& desired) const {
+        const int size = cards.size();
+        if (size != static_cast<int>(cells.size())) {
+            throw runtime_error("Region supply and demand do not match.");
+        }
+        if (size == 0) return;
+
+        // Hungarian algorithm: cards[i] を cells[j] に割り当てる。
+        vl row_potential(size + 1, 0);
+        vl col_potential(size + 1, 0);
+        vi matching(size + 1, 0);
+        vi way(size + 1, 0);
+
+        for (int i = 1; i <= size; ++i) {
+            matching[0] = i;
+            int column = 0;
+            vl min_value(size + 1, numeric_limits<ll>::max());
+            vb used(size + 1, false);
+
+            do {
+                used[column] = true;
+                const int row = matching[column];
+                ll delta = numeric_limits<ll>::max();
+                int next_column = 0;
+
+                for (int j = 1; j <= size; ++j) {
+                    if (used[j]) continue;
+                    const ll cost = cell_distance[pos[cards[row - 1]]][cells[j - 1]];
+                    const ll value = cost - row_potential[row] - col_potential[j];
+                    if (value < min_value[j]) {
+                        min_value[j] = value;
+                        way[j] = column;
+                    }
+                    if (min_value[j] < delta) {
+                        delta = min_value[j];
+                        next_column = j;
+                    }
+                }
+
+                for (int j = 0; j <= size; ++j) {
+                    if (used[j]) {
+                        row_potential[matching[j]] += delta;
+                        col_potential[j] -= delta;
+                    } else {
+                        min_value[j] -= delta;
+                    }
+                }
+                column = next_column;
+            } while (matching[column] != 0);
+
+            do {
+                const int previous_column = way[column];
+                matching[column] = matching[previous_column];
+                column = previous_column;
+            } while (column != 0);
+        }
+
+        for (int j = 1; j <= size; ++j) {
+            desired[cells[j - 1]] = cards[matching[j] - 1];
+        }
+    }
+
+    // 各領域が、最終的にその領域へ属するカード集合を持つ一時目標盤面。
+    vi make_region_goal() const {
+        vi desired(vertex_count, -1);
+        vb assigned_card(vertex_count, false);
+
+        // 既に正しい領域内にいるカードは、その場に残す。
+        for (int v = 0; v < vertex_count; ++v) {
+            const int card = board[v];
+            if (region_id[v] == region_id[card]) {
+                desired[v] = card;
+                assigned_card[card] = true;
+            }
+        }
+
+        for (int rid = 0; rid < static_cast<int>(regions.size()); ++rid) {
+            vi cells;
+            vi cards;
+
+            for (const int v : regions[rid].cells) {
+                if (desired[v] == -1) cells.push_back(v);
+            }
+            for (int card = 0; card < vertex_count; ++card) {
+                if (!assigned_card[card] && region_id[card] == rid) {
+                    cards.push_back(card);
+                }
+            }
+
+            assign_cards_min_cost(cards, cells, desired);
+            for (const int card : cards) assigned_card[card] = true;
+        }
+
+        for (const int card : desired) {
+            if (card == -1) throw runtime_error("The region goal is incomplete.");
+        }
+        return desired;
     }
 
     // root から BFS 木を作る。逆順に頂点を除くと、常に木の葉から除ける。
@@ -413,9 +781,20 @@ class Solver {
     ll swapped_pair_gain(int u, int v) const {
         const int card_u = board[u];
         const int card_v = board[v];
-        const ll before = cell_distance[u][card_u] + cell_distance[v][card_v];
-        const ll after = cell_distance[v][card_u] + cell_distance[u][card_v];
-        return before - after;
+        const ll before = cell_distance[u][goal_cell[card_u]]
+            + cell_distance[v][goal_cell[card_v]];
+        const ll after = cell_distance[v][goal_cell[card_u]]
+            + cell_distance[u][goal_cell[card_v]];
+
+        const int affinity_before =
+            rectangle_affinity[u][goal_cell[card_u]]
+            + rectangle_affinity[v][goal_cell[card_v]];
+        const int affinity_after =
+            rectangle_affinity[v][goal_cell[card_u]]
+            + rectangle_affinity[u][goal_cell[card_v]];
+
+        return before - after
+            + OVERLAP_AFFINITY_BONUS * (affinity_after - affinity_before);
     }
 
     Operation choose_best_operation(
@@ -504,7 +883,7 @@ class Solver {
     }
 
     void swap_board_cells(int u, int v) {
-        if (static_cast<int>(answer.size()) > MAX_OPERATIONS) {
+        if (static_cast<int>(answer.size()) > CANDIDATE_OPERATION_LIMIT) {
             throw runtime_error("Too many operations.");
         }
 
@@ -537,7 +916,7 @@ class Solver {
         }
 
         answer.push_back(op);
-        if (static_cast<int>(answer.size()) > MAX_OPERATIONS) {
+        if (static_cast<int>(answer.size()) > CANDIDATE_OPERATION_LIMIT) {
             throw runtime_error("Too many operations.");
         }
 
@@ -560,6 +939,83 @@ class Solver {
         }
     }
 
+    void set_goal_cells(const vi& desired) {
+        if (static_cast<int>(desired.size()) != vertex_count) {
+            throw runtime_error("Invalid goal board size.");
+        }
+
+        goal_cell.assign(vertex_count, -1);
+        for (int v = 0; v < vertex_count; ++v) {
+            const int card = desired[v];
+            if (card < 0 || card >= vertex_count || goal_cell[card] != -1) {
+                throw runtime_error("The goal board is not a permutation.");
+            }
+            goal_cell[card] = v;
+        }
+    }
+
+    // order が表す木を葉から処理し、desired の配置へ揃える。
+    void route_to_goal(
+        const vi& desired,
+        const vi& order,
+        const vector<char>& initial_active
+    ) {
+        active = initial_active;
+        set_goal_cells(desired);
+
+        if (order.empty()) return;
+        for (int index = static_cast<int>(order.size()) - 1; index >= 1; --index) {
+            const int target_cell = order[index];
+            const int target_card = desired[target_cell];
+            const int source = pos[target_card];
+
+            if (!active[target_cell] || !active[source]) {
+                throw runtime_error("A phase target is outside the active region.");
+            }
+
+            const vvi inactive_prefix = make_inactive_prefix();
+            const vi path = find_rectangle_path(source, target_cell, inactive_prefix);
+            for (int i = 0; i + 1 < static_cast<int>(path.size()); ++i) {
+                if (pos[target_card] != path[i]) {
+                    throw runtime_error("The routed card is at an unexpected cell.");
+                }
+
+                const Operation op = choose_best_operation(
+                    path[i], path[i + 1], inactive_prefix
+                );
+                apply_operation(op);
+
+                if (pos[target_card] != path[i + 1]) {
+                    throw runtime_error("A rectangle did not realize its transition.");
+                }
+            }
+
+            if (board[target_cell] != target_card) {
+                throw runtime_error("Failed to place a phase target card.");
+            }
+            active[target_cell] = false;
+        }
+
+        const int root = order.front();
+        if (board[root] != desired[root]) {
+            throw runtime_error("The phase root card is incorrect.");
+        }
+    }
+
+    vi make_identity_goal() const {
+        vi desired(vertex_count);
+        iota(all(desired), 0);
+        return desired;
+    }
+
+    void restore_initial_state() {
+        board = initial_board;
+        pos.assign(vertex_count, -1);
+        for (int v = 0; v < vertex_count; ++v) pos[board[v]] = v;
+        active.assign(vertex_count, true);
+        answer.clear();
+    }
+
 public:
     explicit Solver(const Input& input)
         : input(input), n(input.n), vertex_count(n * n) {
@@ -570,8 +1026,9 @@ public:
 
         board.resize(vertex_count);
         pos.resize(vertex_count);
+        goal_cell.resize(vertex_count);
         active.assign(vertex_count, true);
-        answer.reserve(MAX_OPERATIONS);
+        answer.reserve(CANDIDATE_OPERATION_LIMIT);
 
         for (int r = 0; r < n; ++r) {
             for (int c = 0; c < n; ++c) {
@@ -580,48 +1037,23 @@ public:
                 pos[board[v]] = v;
             }
         }
+        initial_board = board;
     }
 
     vector<Operation> solve() {
-        // 中央付近を最後まで残す根として固定する。
+        build_overlapping_rectangle_affinity();
+        const vi identity_goal = make_identity_goal();
+
+        // 領域は評価値にだけ使い、固定境界を設けず全盤面を一度で完成させる。
         const int root = id(n / 2, n / 2);
-        const vi order = make_bfs_order(root);
+        route_to_goal(
+            identity_goal,
+            make_bfs_order(root),
+            vector<char>(vertex_count, true)
+        );
 
-        // BFS 順の逆順では target は残った全域木の葉になる。
-        // target のカードを運んだ後にそのマスを固定し、以後触らない。
-        for (int index = vertex_count - 1; index >= 1; --index) {
-            const int target = order[index];
-            const int source = pos[target];
-
-            if (!active[source]) {
-                throw runtime_error("A target card is in an inactive cell.");
-            }
-
-            const vvi inactive_prefix = make_inactive_prefix();
-            const vi path = find_rectangle_path(source, target, inactive_prefix);
-            for (int i = 0; i + 1 < static_cast<int>(path.size()); ++i) {
-                if (pos[target] != path[i]) {
-                    throw runtime_error("The routed card is at an unexpected cell.");
-                }
-
-                const Operation op = choose_best_operation(
-                    path[i], path[i + 1], inactive_prefix
-                );
-                apply_operation(op);
-
-                if (pos[target] != path[i + 1]) {
-                    throw runtime_error("A rectangle did not realize its transition.");
-                }
-            }
-
-            if (board[target] != target) {
-                throw runtime_error("Failed to place a target card.");
-            }
-            active[target] = false;
-        }
-
-        if (board[root] != root) {
-            throw runtime_error("The last card is incorrect.");
+        if (static_cast<int>(answer.size()) > OUTPUT_OPERATION_LIMIT) {
+            throw runtime_error("The final answer exceeds the operation limit.");
         }
         return answer;
     }
