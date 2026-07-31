@@ -206,10 +206,14 @@ struct Timer {
 
 constexpr double FUTURE_EMERGENCY_TIME_LIMIT = 1.20;
 constexpr double RELOCATION_TIME_LIMIT = 1.60;
-constexpr bool ENABLE_RELOCATION = false;
 constexpr bool ENABLE_ADMISSION_CONTROL = true;
 constexpr long double ADMISSION_MAX_HISTORY_QUANTILE = 0.25L;
 constexpr ll ARRIVAL_TIME_HORIZON = 100000;
+constexpr int TIME_BUCKET_COUNT = 64;
+constexpr int THETA_MIN = 2000;
+constexpr int THETA_MAX = 8000;
+constexpr int THETA_STEP = 100;
+constexpr int THETA_QUADRATURE_STEPS = 48;
 constexpr array<int, 8> FUTURE_SLOT_SIZES = {4, 9, 16, 25, 36, 64, 100, 150};
 constexpr long double FUTURE_SHAPE_WEIGHT = 0.08L;
 
@@ -346,6 +350,13 @@ vector<vi> make_blocked_prefix(const vs &park, const vvi &owner) {
 int rectangle_sum(const vector<vi> &prefix, int x, int y, int h, int w) {
     if (h == 0 || w == 0) return 0;
     return prefix[x + h][y + w] - prefix[x][y + w] - prefix[x + h][y] + prefix[x][y];
+}
+
+long double rectangle_sum(const vector<vector<long double>> &prefix,
+                          int x, int y, int h, int w) {
+    if (h == 0 || w == 0) return 0.0L;
+    return prefix[x + h][y + w] - prefix[x][y + w] -
+           prefix[x + h][y] + prefix[x][y];
 }
 
 optional<vector<Cell>> find_compact_region_ordered(
@@ -857,6 +868,463 @@ optional<NormalPlacementChoice> choose_demand_aware_region(
     return NormalPlacementChoice{regions[best_index], best_perimeter};
 }
 
+// The hidden duration scale is shared by all groups in one test case.  Besides
+// observed durations, the likelihood below uses the fact that every unseen
+// group must start after the current order statistic S.
+struct ThetaEstimator {
+    int observed_count = 0;
+    long double exponential_sample_sum = 0.0L;
+
+    void observe(ll duration) {
+        observed_count++;
+        exponential_sample_sum += duration - 1;
+    }
+
+    long double start_survival(ll current_s, long double theta) const {
+        if (current_s >= ARRIVAL_TIME_HORIZON - 1) return 0.0L;
+
+        const long double horizon = ARRIVAL_TIME_HORIZON;
+        const long double last_start_without_duration = horizon - 1.0L;
+        const long double upper =
+            (last_start_without_duration - current_s) / theta;
+        // y = 1-exp(-x) absorbs the exponential measure.  Uniform steps in x
+        // are inaccurate near S=0 because the integration range can be about
+        // 50 while almost all probability mass is near x=0.
+        const long double y_upper = -expm1l(-upper);
+        const long double dy = y_upper / THETA_QUADRATURE_STEPS;
+        long double integral = 0.0L;
+        for (int k = 0; k < THETA_QUADRATURE_STEPS; k++) {
+            long double y = (k + 0.5L) * dy;
+            long double x = -log1pl(-y);
+            long double numerator =
+                last_start_without_duration - current_s - theta * x;
+            long double denominator = horizon - theta * x;
+            integral += numerator / denominator;
+        }
+        integral *= dy;
+        long double normalizer = -expm1l(-horizon / theta);
+        return clamp(integral / normalizer, 1e-300L, 1.0L);
+    }
+
+    long double estimate(ll current_s, int remaining_groups) const {
+        constexpr int PARTICLE_COUNT =
+            (THETA_MAX - THETA_MIN) / THETA_STEP + 1;
+        array<long double, PARTICLE_COUNT> log_weights{};
+        long double max_log_weight = -numeric_limits<long double>::infinity();
+
+        for (int k = 0; k < PARTICLE_COUNT; k++) {
+            long double theta = THETA_MIN + THETA_STEP * k;
+            long double normalizer =
+                -expm1l(-(long double)ARRIVAL_TIME_HORIZON / theta);
+            long double log_weight =
+                -observed_count * logl(theta) -
+                exponential_sample_sum / theta -
+                observed_count * logl(normalizer);
+            if (remaining_groups > 0) {
+                log_weight += remaining_groups *
+                    logl(start_survival(current_s, theta));
+            }
+            log_weights[k] = log_weight;
+            chmax(max_log_weight, log_weight);
+        }
+
+        long double weight_sum = 0.0L;
+        long double theta_sum = 0.0L;
+        for (int k = 0; k < PARTICLE_COUNT; k++) {
+            long double weight = expl(log_weights[k] - max_log_weight);
+            weight_sum += weight;
+            theta_sum += weight * (THETA_MIN + THETA_STEP * k);
+        }
+        return theta_sum / weight_sum;
+    }
+};
+
+long double inverse_standard_normal(long double probability) {
+    // Peter J. Acklam's rational approximation.
+    static constexpr array<long double, 6> A = {
+        -3.969683028665376e+01L, 2.209460984245205e+02L,
+        -2.759285104469687e+02L, 1.383577518672690e+02L,
+        -3.066479806614716e+01L, 2.506628277459239e+00L,
+    };
+    static constexpr array<long double, 5> B = {
+        -5.447609879822406e+01L, 1.615858368580409e+02L,
+        -1.556989798598866e+02L, 6.680131188771972e+01L,
+        -1.328068155288572e+01L,
+    };
+    static constexpr array<long double, 6> C = {
+        -7.784894002430293e-03L, -3.223964580411365e-01L,
+        -2.400758277161838e+00L, -2.549732539343734e+00L,
+        4.374664141464968e+00L, 2.938163982698783e+00L,
+    };
+    static constexpr array<long double, 4> D = {
+        7.784695709041462e-03L, 3.224671290700398e-01L,
+        2.445134137142996e+00L, 3.754408661907416e+00L,
+    };
+    constexpr long double LOW = 0.02425L;
+    constexpr long double HIGH = 1.0L - LOW;
+
+    probability = clamp(probability, 1e-15L, 1.0L - 1e-15L);
+    if (probability < LOW) {
+        long double q = sqrtl(-2.0L * logl(probability));
+        return (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q +
+                  C[4]) * q + C[5]) /
+               ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0L);
+    }
+    if (probability > HIGH) {
+        long double q = sqrtl(-2.0L * logl(1.0L - probability));
+        return -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q +
+                   C[4]) * q + C[5]) /
+               ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0L);
+    }
+
+    long double q = probability - 0.5L;
+    long double r = q * q;
+    return (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r +
+              A[4]) * r + A[5]) * q /
+           (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r +
+              B[4]) * r + 1.0L);
+}
+
+struct DensityModel {
+    long double expected_group_size = 0.0L;
+    long double mean_log2_compactness = 0.0L;
+    long double variance_log2_compactness = 0.0L;
+    long double base_log_density_variance = 0.0L;
+
+    explicit DensityModel(const vector<vector<Shape>> &compact_shapes) {
+        const long double sqrt_150 = sqrtl(150.0L);
+        const long double denominator = sqrt_150 - 2.0L;
+        long double size_weight_sum = 0.0L;
+        long double weighted_log_sum = 0.0L;
+        long double weighted_log_square_sum = 0.0L;
+
+        for (int p = 4; p <= 150; p++) {
+            long double lower = sqrtl(max(4.0L, (long double)p - 0.5L));
+            long double upper = sqrtl(min(150.0L, (long double)p + 0.5L));
+            long double probability = max(0.0L, upper - lower) / denominator;
+            expected_group_size += probability * p;
+
+            int perimeter = compact_shapes[p].front().perimeter;
+            long double compactness =
+                4.0L * sqrtl((long double)p) / perimeter;
+            long double log_compactness = log2l(compactness);
+            long double size_weight = probability * p;
+            size_weight_sum += size_weight;
+            weighted_log_sum += size_weight * log_compactness;
+            weighted_log_square_sum +=
+                size_weight * log_compactness * log_compactness;
+        }
+
+        mean_log2_compactness = weighted_log_sum / size_weight_sum;
+        variance_log2_compactness =
+            weighted_log_square_sum / size_weight_sum -
+            mean_log2_compactness * mean_log2_compactness;
+
+        base_log_density_variance =
+            0.8L * 0.8L + variance_log2_compactness;
+    }
+
+    long double shadow_price(long double mean_log_duration,
+                             long double variance_log_duration,
+                             long double rejected_fraction) const {
+        if (rejected_fraction <= 0.0L) return 0.0L;
+        const long double ln2 = logl(2.0L);
+        long double mean_log_density = mean_log2_compactness -
+            0.1L * mean_log_duration / ln2;
+        long double log_density_variance = base_log_density_variance +
+            0.01L * variance_log_duration / (ln2 * ln2);
+        long double quantile = min(rejected_fraction, 1.0L - 1e-9L);
+        return exp2l(mean_log_density +
+                     sqrtl(max(log_density_variance, 0.0L)) *
+                     inverse_standard_normal(quantile));
+    }
+};
+
+struct FutureBucketDemand {
+    long double cell_time = 0.0L;
+    long double mean_log_duration = 0.0L;
+    long double variance_log_duration = 0.0L;
+};
+
+// Distribution of one unseen group conditional on its start being after S.
+// The generator samples l from the exponential distribution, then uses stay
+// duration D=l+1 and H-l possible integer start times.  The exponential
+// density is absorbed by y=1-exp(-l/theta); its truncation normalizer cancels
+// between the overlap integral and Q(S, theta).
+struct ConditionalFutureDemand {
+    struct Node {
+        long double stay_duration;
+        long double last_start;
+        long double joint_weight;
+        long double log_duration;
+    };
+
+    ll current_s;
+    array<Node, THETA_QUADRATURE_STEPS> nodes{};
+    long double remaining_start_measure = 0.0L;
+
+    ConditionalFutureDemand(ll current_s_, long double theta)
+        : current_s(current_s_) {
+        const long double horizon = ARRIVAL_TIME_HORIZON;
+        long double sampled_length_upper = horizon - 1.0L - current_s;
+        long double y_upper = -expm1l(-sampled_length_upper / theta);
+        long double dy = y_upper / THETA_QUADRATURE_STEPS;
+
+        for (int k = 0; k < THETA_QUADRATURE_STEPS; k++) {
+            long double y = (k + 0.5L) * dy;
+            long double sampled_length = -theta * log1pl(-y);
+            long double stay_duration = sampled_length + 1.0L;
+            long double last_start = horizon - 1.0L - sampled_length;
+            long double joint_weight = dy / (horizon - sampled_length);
+            nodes[k] = {
+                stay_duration,
+                last_start,
+                joint_weight,
+                logl(stay_duration),
+            };
+            remaining_start_measure +=
+                joint_weight * (last_start - current_s);
+        }
+    }
+
+    FutureBucketDemand in_bucket(
+        long double a, long double c, int remaining_groups,
+        long double expected_group_size) const {
+        FutureBucketDemand result;
+        if (remaining_groups <= 0 || remaining_start_measure <= 0.0L) {
+            return result;
+        }
+
+        long double weight_sum = 0.0L;
+        long double weighted_log_sum = 0.0L;
+        long double weighted_log_square_sum = 0.0L;
+        for (const Node &node : nodes) {
+            auto integrated_positive_part = [&](long double boundary) {
+                long double at_first =
+                    max(0.0L, boundary - current_s);
+                long double at_last =
+                    max(0.0L, boundary - node.last_start);
+                return 0.5L *
+                    (at_first * at_first - at_last * at_last);
+            };
+            long double integrated_overlap =
+                integrated_positive_part(c) -
+                integrated_positive_part(a) -
+                integrated_positive_part(c - node.stay_duration) +
+                integrated_positive_part(a - node.stay_duration);
+            integrated_overlap = max(0.0L, integrated_overlap);
+
+            long double weight = node.joint_weight * integrated_overlap;
+            weight_sum += weight;
+            weighted_log_sum += weight * node.log_duration;
+            weighted_log_square_sum +=
+                weight * node.log_duration * node.log_duration;
+        }
+        if (weight_sum <= 0.0L) return result;
+
+        result.cell_time = remaining_groups * expected_group_size *
+            weight_sum / remaining_start_measure;
+        result.mean_log_duration = weighted_log_sum / weight_sum;
+        result.variance_log_duration = max(
+            0.0L,
+            weighted_log_square_sum / weight_sum -
+                result.mean_log_duration * result.mean_log_duration);
+        return result;
+    }
+};
+
+struct ShadowEvaluation {
+    long double opportunity_cost = 0.0L;
+    long double duration_weighted_rejected_fraction = 0.0L;
+    long double maximum_rejected_fraction = 0.0L;
+    int priced_buckets = 0;
+};
+
+ShadowEvaluation evaluate_shadow_cost(
+    const vector<GroupState> &groups, ll current_s, ll arrival_t, int p,
+    int remaining_groups, int grass_cells, long double theta,
+    const DensityModel &density_model) {
+    ShadowEvaluation result;
+    if (remaining_groups <= 0) return result;
+
+    const long double horizon = ARRIVAL_TIME_HORIZON;
+    long double total_candidate_duration = arrival_t - current_s;
+    ConditionalFutureDemand future_demand(current_s, theta);
+
+    for (int bucket = 0; bucket < TIME_BUCKET_COUNT; bucket++) {
+        long double bucket_begin =
+            horizon * bucket / TIME_BUCKET_COUNT;
+        long double bucket_end =
+            horizon * (bucket + 1) / TIME_BUCKET_COUNT;
+        long double a = max((long double)current_s, bucket_begin);
+        long double c = bucket_end;
+        long double candidate_end = min((long double)arrival_t, c);
+        long double candidate_overlap = max(0.0L, candidate_end - a);
+        if (candidate_overlap <= 0.0L) continue;
+
+        long double committed_cell_time = 0.0L;
+        for (const GroupState &group : groups) {
+            if (!group.active) continue;
+            long double overlap =
+                max(0.0L, min((long double)group.t, c) - a);
+            committed_cell_time += group.p * overlap;
+        }
+
+        long double interval_length = c - a;
+        long double capacity = grass_cells * interval_length;
+        long double available_capacity =
+            max(0.0L, capacity - committed_cell_time);
+        FutureBucketDemand bucket_demand = future_demand.in_bucket(
+            a, c, remaining_groups, density_model.expected_group_size);
+        long double future_cell_time = bucket_demand.cell_time;
+
+        long double rejected_fraction = 0.0L;
+        if (future_cell_time > available_capacity) {
+            rejected_fraction = clamp(
+                1.0L - available_capacity / future_cell_time, 0.0L, 1.0L);
+        }
+        long double price = density_model.shadow_price(
+            bucket_demand.mean_log_duration,
+            bucket_demand.variance_log_duration,
+            rejected_fraction);
+        result.opportunity_cost += p * candidate_overlap * price;
+        result.duration_weighted_rejected_fraction +=
+            candidate_overlap * rejected_fraction / total_candidate_duration;
+        chmax(result.maximum_rejected_fraction, rejected_fraction);
+        if (rejected_fraction > 0.0L) result.priced_buckets++;
+    }
+    return result;
+}
+
+struct TemporalPlacementDiagnostics {
+    int attempts = 0;
+    int compact_successes = 0;
+    int fallback_successes = 0;
+    long long anchors_checked = 0;
+    long long legal_compact_candidates = 0;
+};
+
+optional<NormalPlacementChoice> choose_temporally_coherent_region(
+    const vs &park, const vvi &owner, const vector<GroupState> &groups,
+    ll current_s, ll arrival_t, int p, long double theta,
+    const vector<Shape> &shapes, TemporalPlacementDiagnostics &diagnostics) {
+    diagnostics.attempts++;
+    int n = park.size();
+    vector<vi> blocked_prefix = make_blocked_prefix(park, owner);
+
+    auto release_level = [&](ll release_time) {
+        long double remaining = max(0LL, release_time - current_s);
+        return -expm1l(-remaining / theta);
+    };
+    long double candidate_level = release_level(arrival_t);
+
+    vector<vector<long double>> edge_prefix(
+        n + 1, vector<long double>(n + 1));
+    constexpr int DX[4] = {-1, 1, 0, 0};
+    constexpr int DY[4] = {0, 0, -1, 1};
+    for (int x = 0; x < n; x++) {
+        for (int y = 0; y < n; y++) {
+            long double edge_cost = 0.0L;
+            if (park[x][y] == '.' && owner[x][y] == -1) {
+                for (int dir = 0; dir < 4; dir++) {
+                    int nx = x + DX[dir];
+                    int ny = y + DY[dir];
+                    if (!inside(nx, ny, n, n) || park[nx][ny] == '#') continue;
+                    int adjacent_owner = owner[nx][ny];
+                    long double adjacent_level = adjacent_owner == -1
+                        ? 0.0L
+                        : release_level(groups[adjacent_owner].t);
+                    edge_cost += fabsl(candidate_level - adjacent_level);
+                }
+            }
+            edge_prefix[x + 1][y + 1] =
+                edge_cost + edge_prefix[x][y + 1] +
+                edge_prefix[x + 1][y] - edge_prefix[x][y];
+        }
+    }
+
+    optional<vector<Cell>> best_region;
+    long double best_boundary_cost =
+        numeric_limits<long double>::infinity();
+    int best_perimeter = 0;
+    for (const Shape &shape : shapes) {
+        int max_x = n - shape.h;
+        int max_y = n - shape.w;
+        for (int base_x = 0; base_x <= max_x; base_x++) {
+            for (int base_y = 0; base_y <= max_y; base_y++) {
+                diagnostics.anchors_checked++;
+                const Rect &main_rect = shape.main_rect;
+                const Rect &extra_rect = shape.extra_rect;
+                if (rectangle_sum(blocked_prefix,
+                                  base_x + main_rect.x,
+                                  base_y + main_rect.y,
+                                  main_rect.h, main_rect.w) != 0) {
+                    continue;
+                }
+                if (rectangle_sum(blocked_prefix,
+                                  base_x + extra_rect.x,
+                                  base_y + extra_rect.y,
+                                  extra_rect.h, extra_rect.w) != 0) {
+                    continue;
+                }
+                diagnostics.legal_compact_candidates++;
+
+                long double boundary_cost =
+                    rectangle_sum(edge_prefix,
+                                  base_x + main_rect.x,
+                                  base_y + main_rect.y,
+                                  main_rect.h, main_rect.w) +
+                    rectangle_sum(edge_prefix,
+                                  base_x + extra_rect.x,
+                                  base_y + extra_rect.y,
+                                  extra_rect.h, extra_rect.w) -
+                    (4 * p - shape.perimeter) * candidate_level;
+                if (boundary_cost + 1e-15L >= best_boundary_cost) continue;
+
+                vector<Cell> region;
+                region.reserve(p);
+                auto append_rectangle = [&](const Rect &rect) {
+                    for (int dx = 0; dx < rect.h; dx++) {
+                        for (int dy = 0; dy < rect.w; dy++) {
+                            region.emplace_back(base_x + rect.x + dx,
+                                                base_y + rect.y + dy);
+                        }
+                    }
+                };
+                append_rectangle(main_rect);
+                append_rectangle(extra_rect);
+                best_region = std::move(region);
+                best_boundary_cost = boundary_cost;
+                best_perimeter = shape.perimeter;
+            }
+        }
+    }
+
+    if (best_region) {
+        diagnostics.compact_successes++;
+        return NormalPlacementChoice{std::move(*best_region), best_perimeter};
+    }
+    if (auto fallback = find_connected_region(park, owner, p)) {
+        diagnostics.fallback_successes++;
+        int perimeter = calc_perimeter(*fallback, n);
+        return NormalPlacementChoice{std::move(*fallback), perimeter};
+    }
+    return nullopt;
+}
+
+struct ShadowDiagnostics {
+    int considered = 0;
+    int upper_bound_rejected = 0;
+    int actual_fee_rejected = 0;
+    int no_region_rejected = 0;
+    int accepted = 0;
+    long double theta_sum = 0.0L;
+    long double opportunity_cost_sum = 0.0L;
+    long double rejected_fraction_sum = 0.0L;
+    long double maximum_rejected_fraction = 0.0L;
+    long long priced_buckets = 0;
+};
+
 struct FreeComponents {
     vvi id;
     vi size;
@@ -1066,22 +1534,20 @@ int main() {
     for (int p = 4; p <= 150; p++) {
         compact_shapes[p] = make_compact_shapes(p, N);
     }
-    FutureSlotWeights future_slot_weights =
-        make_future_slot_weights(compact_shapes);
+    DensityModel density_model(compact_shapes);
+    ThetaEstimator theta_estimator;
+    int grass_cells = 0;
+    for (const string &row : park) {
+        grass_cells += count(row.begin(), row.end(), '.');
+    }
 
     vvi owner(N, vi(N, -1));
     vector<GroupState> groups(M);
     priority_queue<pair<ll, int>, vector<pair<ll, int>>, greater<pair<ll, int>>> departures;
-    int r_milli = (int)llroundl(R * 1000.0L);
     int accepted_count = 0;
     int rejected_count = 0;
-    int relocation_count = 0;
-    bool future_disabled = false;
-    FutureDiagnostics future_diagnostics;
-    AdmissionDiagnostics admission_diagnostics;
-    vector<long double> observed_potential_densities;
-    observed_potential_densities.reserve(M);
-    ll estimated_relocation_gain = 0;
+    ShadowDiagnostics shadow_diagnostics;
+    TemporalPlacementDiagnostics placement_diagnostics;
 
     for (int turn = 0; turn < M; turn++) {
         int i, P;
@@ -1091,12 +1557,10 @@ int main() {
         groups[i].t = T;
         groups[i].v = V;
         groups[i].p = P;
-
-        ll potential_fee = round_payment(
-            V, P, compact_shapes[P].front().perimeter);
-        ll potential_cell_time = (ll)P * (T - S);
-        observed_potential_densities.push_back(
-            (long double)potential_fee / (long double)potential_cell_time);
+        theta_estimator.observe(T - S);
+        int remaining_groups = M - i - 1;
+        long double theta =
+            theta_estimator.estimate(S, remaining_groups);
 
         while (!departures.empty() && departures.top().first < S) {
             int j = departures.top().second;
@@ -1108,34 +1572,39 @@ int main() {
         }
 
         TurnPlan plan;
-        optional<NormalPlacementChoice> normal_choice;
-        if (!future_disabled && timer.elapsed() >= FUTURE_EMERGENCY_TIME_LIMIT) {
-            future_disabled = true;
-            future_diagnostics.emergency_stops++;
-        }
-        if (!future_disabled) {
-            normal_choice = choose_demand_aware_region(
-                park, owner, groups, i, S, T, P, V, compact_shapes[P],
-                future_slot_weights, timer, future_disabled,
-                future_diagnostics);
-        } else if (auto region = find_region(park, owner, P, compact_shapes[P])) {
-            normal_choice = NormalPlacementChoice{
-                *region, calc_perimeter(*region, N)};
-        }
+        ShadowEvaluation shadow = evaluate_shadow_cost(
+            groups, S, T, P, remaining_groups, grass_cells, theta,
+            density_model);
+        shadow_diagnostics.considered++;
+        shadow_diagnostics.theta_sum += theta;
+        shadow_diagnostics.opportunity_cost_sum += shadow.opportunity_cost;
+        shadow_diagnostics.rejected_fraction_sum +=
+            shadow.duration_weighted_rejected_fraction;
+        chmax(shadow_diagnostics.maximum_rejected_fraction,
+              shadow.maximum_rejected_fraction);
+        shadow_diagnostics.priced_buckets += shadow.priced_buckets;
 
-        if (normal_choice) {
-            bool admission_rejected = reject_by_admission_control(
-                i, M, S, T, P, V, normal_choice->perimeter,
-                observed_potential_densities,
-                admission_diagnostics);
-            if (!admission_rejected) {
-                plan.arrival = normal_choice->cells;
-                plan.arrival_perimeter = normal_choice->perimeter;
-            }
-        } else if (ENABLE_RELOCATION) {
-            if (auto relocation = try_single_relocation(
-                    park, owner, groups, P, V, r_milli, compact_shapes, timer)) {
-                plan = std::move(*relocation);
+        int minimum_perimeter = compact_shapes[P].front().perimeter;
+        ll upper_bound_fee = round_payment(V, P, minimum_perimeter);
+        if ((long double)upper_bound_fee <= shadow.opportunity_cost) {
+            shadow_diagnostics.upper_bound_rejected++;
+        } else {
+            optional<NormalPlacementChoice> placement =
+                choose_temporally_coherent_region(
+                    park, owner, groups, S, T, P, theta,
+                    compact_shapes[P], placement_diagnostics);
+            if (!placement) {
+                shadow_diagnostics.no_region_rejected++;
+            } else {
+                ll actual_fee = round_payment(
+                    V, P, placement->perimeter);
+                if ((long double)actual_fee <= shadow.opportunity_cost) {
+                    shadow_diagnostics.actual_fee_rejected++;
+                } else {
+                    plan.arrival = std::move(placement->cells);
+                    plan.arrival_perimeter = placement->perimeter;
+                    shadow_diagnostics.accepted++;
+                }
             }
         }
 
@@ -1146,58 +1615,50 @@ int main() {
         } else {
             rejected_count++;
         }
-        if (!plan.moves.empty()) {
-            relocation_count++;
-            estimated_relocation_gain += plan.immediate_gain;
-        }
 
         emit_plan(plan);
     }
 
-    long double final_reference_density = empirical_quantile(
-        observed_potential_densities, ADMISSION_MAX_HISTORY_QUANTILE);
-    long double mean_rejected_density = admission_diagnostics.rejected == 0
+    long double mean_theta = shadow_diagnostics.considered == 0
         ? 0.0L
-        : admission_diagnostics.rejected_density_sum /
-              admission_diagnostics.rejected;
-    long double mean_rejected_threshold = admission_diagnostics.rejected == 0
+        : shadow_diagnostics.theta_sum / shadow_diagnostics.considered;
+    long double mean_opportunity_cost = shadow_diagnostics.considered == 0
         ? 0.0L
-        : admission_diagnostics.threshold_sum / admission_diagnostics.rejected;
-    long double mean_dynamic_quantile =
-        admission_diagnostics.density_comparisons == 0
+        : shadow_diagnostics.opportunity_cost_sum /
+              shadow_diagnostics.considered;
+    long double mean_rejected_fraction = shadow_diagnostics.considered == 0
         ? 0.0L
-        : admission_diagnostics.dynamic_quantile_sum /
-              admission_diagnostics.density_comparisons;
-    long double mean_expected_arrivals =
-        admission_diagnostics.density_comparisons == 0
-        ? 0.0L
-        : admission_diagnostics.expected_arrivals_sum /
-              admission_diagnostics.density_comparisons;
+        : shadow_diagnostics.rejected_fraction_sum /
+              shadow_diagnostics.considered;
     cerr << "accepted=" << accepted_count
          << " rejected=" << rejected_count
-         << " relocations=" << relocation_count
-         << " future_attempts=" << future_diagnostics.attempts
-         << " future_turns=" << future_diagnostics.evaluated_turns
-         << " future_candidates=" << future_diagnostics.candidates
-         << " future_emergency_stops=" << future_diagnostics.emergency_stops
-         << " future_last_turn=" << future_diagnostics.last_turn
-         << " changed_placements=" << future_diagnostics.changed_placements
-         << " admission_considered=" << admission_diagnostics.considered
-         << " admission_density_comparisons="
-         << admission_diagnostics.density_comparisons
-         << " admission_rejected=" << admission_diagnostics.rejected
-         << " admission_other_rejected="
-         << rejected_count - admission_diagnostics.rejected
-         << " admission_rejected_fee=" << admission_diagnostics.rejected_fee
-         << " admission_rejected_cell_time="
-         << admission_diagnostics.rejected_cell_time
-         << " admission_reference_density=" << fixed << setprecision(6)
-         << final_reference_density
-         << " admission_mean_rejected_density=" << mean_rejected_density
-         << " admission_mean_rejected_threshold=" << mean_rejected_threshold
-         << " admission_mean_dynamic_quantile=" << mean_dynamic_quantile
-         << " admission_mean_expected_arrivals=" << mean_expected_arrivals
-         << " estimated_relocation_gain=" << estimated_relocation_gain
+         << " relocations=0"
+         << " shadow_considered=" << shadow_diagnostics.considered
+         << " shadow_upper_rejected="
+         << shadow_diagnostics.upper_bound_rejected
+         << " shadow_actual_rejected="
+         << shadow_diagnostics.actual_fee_rejected
+         << " shadow_no_region_rejected="
+         << shadow_diagnostics.no_region_rejected
+         << " shadow_accepted=" << shadow_diagnostics.accepted
+         << " placement_attempts=" << placement_diagnostics.attempts
+         << " placement_compact_successes="
+         << placement_diagnostics.compact_successes
+         << " placement_fallback_successes="
+         << placement_diagnostics.fallback_successes
+         << " placement_anchors_checked="
+         << placement_diagnostics.anchors_checked
+         << " placement_legal_compact_candidates="
+         << placement_diagnostics.legal_compact_candidates
+         << fixed << setprecision(6)
+         << " theta_mean=" << mean_theta
+         << " shadow_mean_opportunity=" << mean_opportunity_cost
+         << " shadow_mean_rejected_fraction=" << mean_rejected_fraction
+         << " shadow_max_rejected_fraction="
+         << shadow_diagnostics.maximum_rejected_fraction
+         << " shadow_priced_buckets="
+         << shadow_diagnostics.priced_buckets
+         << " model_expected_p=" << density_model.expected_group_size
          << " elapsed=" << setprecision(3) << timer.elapsed() << '\n';
 
     return 0;
