@@ -216,6 +216,12 @@ constexpr int THETA_STEP = 100;
 constexpr int THETA_QUADRATURE_STEPS = 48;
 constexpr array<int, 8> FUTURE_SLOT_SIZES = {4, 9, 16, 25, 36, 64, 100, 150};
 constexpr long double FUTURE_SHAPE_WEIGHT = 0.08L;
+constexpr int COMPACT_PERIMETER_MARGIN = 4;
+constexpr int PLACEMENT_GLOBAL_SHORTLIST = 3;
+constexpr int PLACEMENT_SHORTLIST_LIMIT = 6;
+constexpr int CONNECTED_GROWTH_SEED_LIMIT = 16;
+constexpr int FUTURE_FIT_SNAPSHOT_COUNT = 3;
+constexpr array<int, 8> FUTURE_FIT_SIDES = {2, 3, 4, 5, 6, 8, 10, 12};
 
 struct Rect {
     int x;
@@ -255,7 +261,8 @@ struct TurnPlan {
 };
 
 // P cells arranged as a rectangle plus, if necessary, one partial row/column.
-// Only the minimum-perimeter shapes in this family are kept.
+// A short perimeter ladder is retained so that near-compact templates can be
+// tried before falling back to an arbitrary connected polyomino.
 vector<Shape> make_compact_shapes(int p, int n) {
     vector<Shape> shapes;
 
@@ -301,11 +308,9 @@ vector<Shape> make_compact_shapes(int p, int n) {
         chmin(min_perimeter, shape.perimeter);
     }
 
-    // BFS below remains a complete fallback, so retaining only the most compact
-    // templates keeps the per-turn search small without affecting legality.
-    constexpr int PERIMETER_MARGIN = 0;
     shapes.erase(remove_if(shapes.begin(), shapes.end(), [&](const Shape &shape) {
-                     return shape.perimeter > min_perimeter + PERIMETER_MARGIN;
+                     return shape.perimeter >
+                         min_perimeter + COMPACT_PERIMETER_MARGIN;
                  }),
                  shapes.end());
 
@@ -333,6 +338,23 @@ vector<Shape> make_compact_shapes(int p, int n) {
                  shapes.end());
 
     return shapes;
+}
+
+vector<Cell> materialize_shape(const Shape &shape, int base_x, int base_y,
+                               int p) {
+    vector<Cell> region;
+    region.reserve(p);
+    auto append_rectangle = [&](const Rect &rect) {
+        for (int dx = 0; dx < rect.h; dx++) {
+            for (int dy = 0; dy < rect.w; dy++) {
+                region.emplace_back(base_x + rect.x + dx,
+                                    base_y + rect.y + dy);
+            }
+        }
+    };
+    append_rectangle(shape.main_rect);
+    append_rectangle(shape.extra_rect);
+    return region;
 }
 
 vector<vi> make_blocked_prefix(const vs &park, const vvi &owner) {
@@ -1087,6 +1109,21 @@ struct ConditionalFutureDemand {
         }
     }
 
+    long double future_start_cdf(long double time) const {
+        if (remaining_start_measure <= 0.0L || time <= current_s) {
+            return 0.0L;
+        }
+        long double measure = 0.0L;
+        for (const Node &node : nodes) {
+            long double available_length = max(
+                0.0L, node.last_start - (long double)current_s);
+            long double prefix_length = clamp(
+                time - (long double)current_s, 0.0L, available_length);
+            measure += node.joint_weight * prefix_length;
+        }
+        return clamp(measure / remaining_start_measure, 0.0L, 1.0L);
+    }
+
     FutureBucketDemand in_bucket(
         long double a, long double c, int remaining_groups,
         long double expected_group_size) const {
@@ -1199,55 +1236,581 @@ ShadowEvaluation evaluate_shadow_cost(
 struct TemporalPlacementDiagnostics {
     int attempts = 0;
     int compact_successes = 0;
+    int extended_template_successes = 0;
     int fallback_successes = 0;
+    int future_fit_evaluated_turns = 0;
+    int future_fit_changed_placements = 0;
+    int incremental_changed_from_absolute = 0;
+    int final_changed_from_absolute = 0;
     long long anchors_checked = 0;
     long long legal_compact_candidates = 0;
+    long long connected_growth_candidates = 0;
+    long long shortlisted_candidates = 0;
+    long long future_fit_snapshots = 0;
 };
+
+enum class PlacementSource {
+    MinimumTemplate,
+    ExtendedTemplate,
+    ConnectedGrowth,
+};
+
+struct PlacementCandidate {
+    vector<Cell> cells;
+    uint64_t region_hash = 0;
+    int perimeter = 0;
+    long double incremental_cost = 0.0L;
+    long double absolute_cost = 0.0L;
+    long long enumeration_order = 0;
+    int quadrant = 0;
+    PlacementSource source = PlacementSource::MinimumTemplate;
+};
+
+uint64_t placement_region_hash(const vector<Cell> &cells) {
+    uint64_t hash = 0;
+    for (auto [x, y] : cells) {
+        uint64_t value = (uint64_t)(x * 64 + y + 1) +
+                         0x9e3779b97f4a7c15ULL;
+        value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+        hash ^= value ^ (value >> 31);
+    }
+    return hash;
+}
+
+bool placement_increment_less(const PlacementCandidate &lhs,
+                              const PlacementCandidate &rhs) {
+    if (lhs.incremental_cost != rhs.incremental_cost) {
+        return lhs.incremental_cost < rhs.incremental_cost;
+    }
+    if (lhs.absolute_cost != rhs.absolute_cost) {
+        return lhs.absolute_cost < rhs.absolute_cost;
+    }
+    return lhs.enumeration_order < rhs.enumeration_order;
+}
+
+bool placement_absolute_less(const PlacementCandidate &lhs,
+                             const PlacementCandidate &rhs) {
+    if (lhs.absolute_cost != rhs.absolute_cost) {
+        return lhs.absolute_cost < rhs.absolute_cost;
+    }
+    return placement_increment_less(lhs, rhs);
+}
+
+struct PlacementShortlistBuilder {
+    int best_perimeter = numeric_limits<int>::max();
+    vector<PlacementCandidate> global_best;
+    optional<PlacementCandidate> absolute_best;
+    optional<PlacementCandidate> first_candidate;
+    array<optional<PlacementCandidate>, 4> quadrant_best;
+
+    void reset(int perimeter) {
+        best_perimeter = perimeter;
+        global_best.clear();
+        absolute_best.reset();
+        first_candidate.reset();
+        for (auto &candidate : quadrant_best) candidate.reset();
+    }
+
+    template <class Maker>
+    void consider(int perimeter, long double incremental_cost,
+                  long double absolute_cost, long long enumeration_order,
+                  int quadrant, PlacementSource source, Maker &&maker) {
+        if (perimeter < best_perimeter) reset(perimeter);
+        if (perimeter > best_perimeter) return;
+
+        optional<PlacementCandidate> cache;
+        auto get_candidate = [&]() -> const PlacementCandidate & {
+            if (!cache) {
+                vector<Cell> cells = maker();
+                uint64_t region_hash = placement_region_hash(cells);
+                cache = PlacementCandidate{
+                    std::move(cells), region_hash, perimeter,
+                    incremental_cost, absolute_cost, enumeration_order,
+                    quadrant, source};
+            }
+            return *cache;
+        };
+
+        if (!first_candidate) first_candidate = get_candidate();
+
+        PlacementCandidate key_candidate{
+            {}, 0, perimeter, incremental_cost, absolute_cost,
+            enumeration_order, quadrant, source};
+        if ((int)global_best.size() < PLACEMENT_GLOBAL_SHORTLIST ||
+            placement_increment_less(key_candidate, global_best.back())) {
+            const PlacementCandidate &full_candidate = get_candidate();
+            bool duplicate = false;
+            for (const PlacementCandidate &existing : global_best) {
+                if (existing.region_hash == full_candidate.region_hash &&
+                    same_region(existing.cells, full_candidate.cells)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                global_best.push_back(full_candidate);
+                sort(global_best.begin(), global_best.end(),
+                     placement_increment_less);
+                if ((int)global_best.size() > PLACEMENT_GLOBAL_SHORTLIST) {
+                    global_best.pop_back();
+                }
+            }
+        }
+
+        if (!absolute_best ||
+            placement_absolute_less(key_candidate, *absolute_best)) {
+            absolute_best = get_candidate();
+        }
+        if (!quadrant_best[quadrant] ||
+            placement_increment_less(key_candidate,
+                                     *quadrant_best[quadrant])) {
+            quadrant_best[quadrant] = get_candidate();
+        }
+    }
+
+    vector<PlacementCandidate> finalize() const {
+        vector<PlacementCandidate> result;
+        auto add = [&](const optional<PlacementCandidate> &candidate) {
+            if (!candidate) return;
+            for (const PlacementCandidate &existing : result) {
+                if (existing.region_hash == candidate->region_hash &&
+                    same_region(existing.cells, candidate->cells)) {
+                    return;
+                }
+            }
+            result.push_back(*candidate);
+        };
+        auto add_value = [&](const PlacementCandidate &candidate) {
+            add(optional<PlacementCandidate>(candidate));
+        };
+
+        for (const PlacementCandidate &candidate : global_best) {
+            add_value(candidate);
+        }
+        add(absolute_best);
+        add(first_candidate);
+
+        int primary_quadrant = global_best.empty() ? -1
+                                                    : global_best.front().quadrant;
+        optional<PlacementCandidate> diverse;
+        for (int quadrant = 0; quadrant < 4; quadrant++) {
+            if (quadrant == primary_quadrant || !quadrant_best[quadrant]) {
+                continue;
+            }
+            if (!diverse || placement_increment_less(
+                                *quadrant_best[quadrant], *diverse)) {
+                diverse = quadrant_best[quadrant];
+            }
+        }
+        add(diverse);
+        if ((int)result.size() > PLACEMENT_SHORTLIST_LIMIT) {
+            result.resize(PLACEMENT_SHORTLIST_LIMIT);
+        }
+        return result;
+    }
+};
+
+vector<vector<Cell>> make_connected_growth_candidates(
+    const vs &park, const vvi &owner, int p) {
+    int n = park.size();
+    constexpr int DX[4] = {-1, 1, 0, 0};
+    constexpr int DY[4] = {0, 0, -1, 1};
+    vector<vector<Cell>> candidates;
+
+    auto add_candidate = [&](optional<vector<Cell>> candidate) {
+        if (!candidate) return;
+        for (const vector<Cell> &existing : candidates) {
+            if (same_region(existing, *candidate)) return;
+        }
+        candidates.push_back(std::move(*candidate));
+    };
+    add_candidate(find_connected_region(park, owner, p));
+
+    vvb visited(n, vb(n));
+    vector<vector<Cell>> components;
+    for (int start_x = 0; start_x < n; start_x++) {
+        for (int start_y = 0; start_y < n; start_y++) {
+            if (visited[start_x][start_y] || park[start_x][start_y] == '#' ||
+                owner[start_x][start_y] != -1) {
+                continue;
+            }
+            vector<Cell> component;
+            queue<Cell> que;
+            visited[start_x][start_y] = true;
+            que.emplace(start_x, start_y);
+            while (!que.empty()) {
+                auto [x, y] = que.front();
+                que.pop();
+                component.emplace_back(x, y);
+                for (int dir = 0; dir < 4; dir++) {
+                    int nx = x + DX[dir];
+                    int ny = y + DY[dir];
+                    if (!inside(nx, ny, n, n) || visited[nx][ny]) continue;
+                    if (park[nx][ny] == '#' || owner[nx][ny] != -1) continue;
+                    visited[nx][ny] = true;
+                    que.emplace(nx, ny);
+                }
+            }
+            if ((int)component.size() >= p) {
+                components.push_back(std::move(component));
+            }
+        }
+    }
+    vi component_order(components.size());
+    iota(component_order.begin(), component_order.end(), 0);
+    sort(component_order.begin(), component_order.end(),
+         [&](int lhs, int rhs) {
+             return components[lhs].size() > components[rhs].size();
+         });
+
+    const int INF_DISTANCE = n * n + 1;
+    vvi obstacle_distance(n, vi(n, INF_DISTANCE));
+    queue<Cell> distance_queue;
+    for (int x = 0; x < n; x++) {
+        for (int y = 0; y < n; y++) {
+            if (park[x][y] == '#' || owner[x][y] != -1) {
+                obstacle_distance[x][y] = 0;
+                distance_queue.emplace(x, y);
+            } else if (x == 0 || y == 0 || x + 1 == n || y + 1 == n) {
+                obstacle_distance[x][y] = 1;
+                distance_queue.emplace(x, y);
+            }
+        }
+    }
+    while (!distance_queue.empty()) {
+        auto [x, y] = distance_queue.front();
+        distance_queue.pop();
+        for (int dir = 0; dir < 4; dir++) {
+            int nx = x + DX[dir];
+            int ny = y + DY[dir];
+            if (!inside(nx, ny, n, n)) continue;
+            if (obstacle_distance[nx][ny] <= obstacle_distance[x][y] + 1) {
+                continue;
+            }
+            obstacle_distance[nx][ny] = obstacle_distance[x][y] + 1;
+            distance_queue.emplace(nx, ny);
+        }
+    }
+
+    constexpr int SEED_FEATURE_COUNT = 10;
+    vector<array<Cell, SEED_FEATURE_COUNT>> feature_seeds(components.size());
+    auto feature_key = [&](int feature, const Cell &cell) {
+        auto [x, y] = cell;
+        switch (feature) {
+            case 0: return pair<int, int>{x, y};
+            case 1: return pair<int, int>{-x, y};
+            case 2: return pair<int, int>{y, x};
+            case 3: return pair<int, int>{-y, x};
+            case 4: return pair<int, int>{x + y, x};
+            case 5: return pair<int, int>{-(x + y), x};
+            case 6: return pair<int, int>{x - y, x};
+            case 7: return pair<int, int>{-(x - y), x};
+            case 8: return pair<int, int>{obstacle_distance[x][y], x * n + y};
+            default: return pair<int, int>{-obstacle_distance[x][y], x * n + y};
+        }
+    };
+    for (int component_id = 0;
+         component_id < (int)components.size(); component_id++) {
+        for (int feature = 0; feature < SEED_FEATURE_COUNT; feature++) {
+            Cell best = components[component_id].front();
+            for (const Cell &cell : components[component_id]) {
+                if (feature_key(feature, cell) < feature_key(feature, best)) {
+                    best = cell;
+                }
+            }
+            feature_seeds[component_id][feature] = best;
+        }
+    }
+
+    struct Seed {
+        Cell cell;
+        int bias;
+    };
+    vector<Seed> seeds;
+    set<Cell> used_seeds;
+    for (int feature = 0; feature < SEED_FEATURE_COUNT &&
+         (int)seeds.size() < CONNECTED_GROWTH_SEED_LIMIT; feature++) {
+        for (int order_index = 0;
+             order_index < (int)component_order.size() &&
+             (int)seeds.size() < CONNECTED_GROWTH_SEED_LIMIT;
+             order_index++) {
+            int component_id = component_order[order_index];
+            Cell seed = feature_seeds[component_id][feature];
+            if (used_seeds.insert(seed).second) {
+                seeds.push_back({seed, feature % 4});
+            }
+        }
+    }
+
+    struct GrowthEntry {
+        int cell;
+        int selected_neighbors;
+        int distance;
+        int bias_key;
+    };
+    auto entry_worse = [](const GrowthEntry &lhs, const GrowthEntry &rhs) {
+        return tuple(lhs.selected_neighbors, -lhs.distance, -lhs.bias_key,
+                     -lhs.cell) <
+               tuple(rhs.selected_neighbors, -rhs.distance, -rhs.bias_key,
+                     -rhs.cell);
+    };
+
+    for (const Seed &seed_info : seeds) {
+        int seed_x = seed_info.cell.first;
+        int seed_y = seed_info.cell.second;
+        vector<char> selected(n * n, false);
+        vector<Cell> region;
+        region.reserve(p);
+        priority_queue<GrowthEntry, vector<GrowthEntry>,
+                       decltype(entry_worse)> frontier(entry_worse);
+
+        auto count_selected_neighbors = [&](int cell) {
+            int x = cell / n;
+            int y = cell % n;
+            int count = 0;
+            for (int dir = 0; dir < 4; dir++) {
+                int nx = x + DX[dir];
+                int ny = y + DY[dir];
+                if (inside(nx, ny, n, n) && selected[nx * n + ny]) count++;
+            }
+            return count;
+        };
+        auto bias_key = [&](int x, int y) {
+            if (seed_info.bias == 0) return x * n + y;
+            if (seed_info.bias == 1) return x * n + (n - 1 - y);
+            if (seed_info.bias == 2) return (n - 1 - x) * n + y;
+            return (n - 1 - x) * n + (n - 1 - y);
+        };
+        auto push_frontier = [&](int x, int y) {
+            if (!inside(x, y, n, n) || park[x][y] == '#' ||
+                owner[x][y] != -1 || selected[x * n + y]) {
+                return;
+            }
+            int cell = x * n + y;
+            frontier.push({cell, count_selected_neighbors(cell),
+                           abs(x - seed_x) + abs(y - seed_y),
+                           bias_key(x, y)});
+        };
+        auto select_cell = [&](int x, int y) {
+            selected[x * n + y] = true;
+            region.emplace_back(x, y);
+            for (int dir = 0; dir < 4; dir++) {
+                push_frontier(x + DX[dir], y + DY[dir]);
+            }
+        };
+
+        select_cell(seed_x, seed_y);
+        while ((int)region.size() < p && !frontier.empty()) {
+            GrowthEntry entry = frontier.top();
+            frontier.pop();
+            if (selected[entry.cell]) continue;
+            int current_neighbors = count_selected_neighbors(entry.cell);
+            if (current_neighbors != entry.selected_neighbors) {
+                int x = entry.cell / n;
+                int y = entry.cell % n;
+                frontier.push({entry.cell, current_neighbors,
+                               abs(x - seed_x) + abs(y - seed_y),
+                               bias_key(x, y)});
+                continue;
+            }
+            select_cell(entry.cell / n, entry.cell % n);
+        }
+        if ((int)region.size() == p) {
+            add_candidate(optional<vector<Cell>>(std::move(region)));
+        }
+    }
+    return candidates;
+}
+
+int placement_quadrant(const vector<Cell> &cells, int n) {
+    long long sum_x = 0;
+    long long sum_y = 0;
+    for (auto [x, y] : cells) {
+        sum_x += x;
+        sum_y += y;
+    }
+    int lower_half = 2 * sum_x >= (long long)cells.size() * n;
+    int right_half = 2 * sum_y >= (long long)cells.size() * n;
+    return 2 * lower_half + right_half;
+}
+
+long double compact_fit_utility(
+    const vs &park, const vvi &owner, const vector<GroupState> &groups,
+    const vector<char> &in_candidate, ll snapshot_time) {
+    int n = park.size();
+    constexpr int MAX_SIDE = FUTURE_FIT_SIDES.back();
+    array<int, MAX_SIDE + 2> histogram{};
+    vector<int> previous(n + 1), current(n + 1);
+
+    for (int x = 0; x < n; x++) {
+        fill(current.begin(), current.end(), 0);
+        for (int y = 0; y < n; y++) {
+            int cell = x * n + y;
+            int occupied_by = owner[x][y];
+            bool is_free = park[x][y] == '#' ? false
+                : !in_candidate[cell] &&
+                  (occupied_by == -1 || groups[occupied_by].t < snapshot_time);
+            if (!is_free) continue;
+            current[y + 1] = 1 + min({previous[y + 1], current[y],
+                                      previous[y]});
+            histogram[min(current[y + 1], MAX_SIDE)]++;
+        }
+        swap(previous, current);
+    }
+
+    array<int, MAX_SIDE + 2> at_least{};
+    for (int side = MAX_SIDE; side >= 1; side--) {
+        at_least[side] = at_least[side + 1] + histogram[side];
+    }
+    long double weighted_utility = 0.0L;
+    long double weight_sum = 0.0L;
+    for (int side : FUTURE_FIT_SIDES) {
+        long double weight = (long double)side * side;
+        weighted_utility += weight * log1pl((long double)at_least[side]);
+        weight_sum += weight;
+    }
+    return weighted_utility / weight_sum;
+}
+
+array<ll, FUTURE_FIT_SNAPSHOT_COUNT> make_future_fit_snapshots(
+    const ConditionalFutureDemand &future_demand, ll current_s,
+    ll arrival_t) {
+    array<ll, FUTURE_FIT_SNAPSHOT_COUNT> snapshots{};
+    long double total_mass = future_demand.future_start_cdf(arrival_t);
+    for (int index = 0; index < FUTURE_FIT_SNAPSHOT_COUNT; index++) {
+        long double fraction =
+            (2.0L * index + 1.0L) / (2.0L * FUTURE_FIT_SNAPSHOT_COUNT);
+        long double target = total_mass * fraction;
+        ll low = current_s;
+        ll high = arrival_t;
+        while (high - low > 1) {
+            ll middle = (low + high) / 2;
+            if (future_demand.future_start_cdf(middle) >= target) {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        snapshots[index] = high;
+    }
+    return snapshots;
+}
+
+long double evaluate_compact_fit(
+    const vs &park, const vvi &owner, const vector<GroupState> &groups,
+    const vector<Cell> &candidate,
+    const array<ll, FUTURE_FIT_SNAPSHOT_COUNT> &snapshots) {
+    int n = park.size();
+    vector<char> in_candidate(n * n, false);
+    for (auto [x, y] : candidate) in_candidate[x * n + y] = true;
+
+    long double sum = 0.0L;
+    long double minimum = numeric_limits<long double>::infinity();
+    for (ll snapshot : snapshots) {
+        long double utility = compact_fit_utility(
+            park, owner, groups, in_candidate, snapshot);
+        sum += utility;
+        chmin(minimum, utility);
+    }
+    long double average = sum / FUTURE_FIT_SNAPSHOT_COUNT;
+    return 0.75L * average + 0.25L * minimum;
+}
 
 optional<NormalPlacementChoice> choose_temporally_coherent_region(
     const vs &park, const vvi &owner, const vector<GroupState> &groups,
     ll current_s, ll arrival_t, int p, long double theta,
-    const vector<Shape> &shapes, TemporalPlacementDiagnostics &diagnostics) {
+    int remaining_groups, const vector<Shape> &shapes,
+    TemporalPlacementDiagnostics &diagnostics) {
     diagnostics.attempts++;
     int n = park.size();
     vector<vi> blocked_prefix = make_blocked_prefix(park, owner);
+
+    ConditionalFutureDemand future_demand(current_s, theta);
+    long double candidate_arrival_level =
+        future_demand.future_start_cdf(arrival_t);
 
     auto release_level = [&](ll release_time) {
         long double remaining = max(0LL, release_time - current_s);
         return -expm1l(-remaining / theta);
     };
-    long double candidate_level = release_level(arrival_t);
+    long double candidate_release_level = release_level(arrival_t);
+    vector<long double> group_arrival_level(groups.size(), -1.0L);
+    vector<long double> group_release_level(groups.size(), -1.0L);
 
-    vector<vector<long double>> edge_prefix(
-        n + 1, vector<long double>(n + 1));
+    vector<vector<long double>> incremental_cell(
+        n, vector<long double>(n));
+    vector<vector<long double>> absolute_cell(
+        n, vector<long double>(n));
     constexpr int DX[4] = {-1, 1, 0, 0};
     constexpr int DY[4] = {0, 0, -1, 1};
     for (int x = 0; x < n; x++) {
         for (int y = 0; y < n; y++) {
-            long double edge_cost = 0.0L;
-            if (park[x][y] == '.' && owner[x][y] == -1) {
-                for (int dir = 0; dir < 4; dir++) {
-                    int nx = x + DX[dir];
-                    int ny = y + DY[dir];
-                    if (!inside(nx, ny, n, n) || park[nx][ny] == '#') continue;
-                    int adjacent_owner = owner[nx][ny];
-                    long double adjacent_level = adjacent_owner == -1
-                        ? 0.0L
-                        : release_level(groups[adjacent_owner].t);
-                    edge_cost += fabsl(candidate_level - adjacent_level);
+            if (park[x][y] != '.' || owner[x][y] != -1) continue;
+            for (int dir = 0; dir < 4; dir++) {
+                int nx = x + DX[dir];
+                int ny = y + DY[dir];
+                if (!inside(nx, ny, n, n) || park[nx][ny] == '#') continue;
+                int adjacent_owner = owner[nx][ny];
+                long double adjacent_arrival_level = 0.0L;
+                long double adjacent_release_level = 0.0L;
+                if (adjacent_owner != -1) {
+                    if (group_arrival_level[adjacent_owner] < 0.0L) {
+                        group_arrival_level[adjacent_owner] =
+                            future_demand.future_start_cdf(
+                                groups[adjacent_owner].t);
+                        group_release_level[adjacent_owner] =
+                            release_level(groups[adjacent_owner].t);
+                    }
+                    adjacent_arrival_level =
+                        group_arrival_level[adjacent_owner];
+                    adjacent_release_level =
+                        group_release_level[adjacent_owner];
                 }
+                incremental_cell[x][y] +=
+                    fabsl(candidate_arrival_level - adjacent_arrival_level) -
+                    adjacent_arrival_level;
+                absolute_cell[x][y] +=
+                    fabsl(candidate_release_level - adjacent_release_level);
             }
-            edge_prefix[x + 1][y + 1] =
-                edge_cost + edge_prefix[x][y + 1] +
-                edge_prefix[x + 1][y] - edge_prefix[x][y];
         }
     }
 
-    optional<vector<Cell>> best_region;
-    long double best_boundary_cost =
-        numeric_limits<long double>::infinity();
-    int best_perimeter = 0;
-    for (const Shape &shape : shapes) {
+    auto make_prefix = [&](const vector<vector<long double>> &values) {
+        vector<vector<long double>> prefix(
+            n + 1, vector<long double>(n + 1));
+        for (int x = 0; x < n; x++) {
+            for (int y = 0; y < n; y++) {
+                prefix[x + 1][y + 1] = values[x][y] +
+                    prefix[x][y + 1] + prefix[x + 1][y] - prefix[x][y];
+            }
+        }
+        return prefix;
+    };
+    vector<vector<long double>> incremental_prefix =
+        make_prefix(incremental_cell);
+    vector<vector<long double>> absolute_prefix =
+        make_prefix(absolute_cell);
+
+    PlacementShortlistBuilder shortlist_builder;
+    long long enumeration_order = 0;
+    int minimum_perimeter = shapes.front().perimeter;
+
+    auto scan_shape = [&](const Shape &shape, PlacementSource source) {
+        bool found_legal = false;
+        auto relative_coordinate_sum = [](const Rect &rect, bool x_axis) {
+            long long coordinate = x_axis ? rect.x : rect.y;
+            long long length = x_axis ? rect.h : rect.w;
+            long long copies = x_axis ? rect.w : rect.h;
+            return copies *
+                (length * coordinate + length * (length - 1) / 2);
+        };
+        long long relative_sum_x =
+            relative_coordinate_sum(shape.main_rect, true) +
+            relative_coordinate_sum(shape.extra_rect, true);
+        long long relative_sum_y =
+            relative_coordinate_sum(shape.main_rect, false) +
+            relative_coordinate_sum(shape.extra_rect, false);
         int max_x = n - shape.h;
         int max_y = n - shape.w;
         for (int base_x = 0; base_x <= max_x; base_x++) {
@@ -1268,48 +1831,157 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(
                     continue;
                 }
                 diagnostics.legal_compact_candidates++;
+                found_legal = true;
 
-                long double boundary_cost =
-                    rectangle_sum(edge_prefix,
+                long double incremental_cost =
+                    rectangle_sum(incremental_prefix,
                                   base_x + main_rect.x,
                                   base_y + main_rect.y,
                                   main_rect.h, main_rect.w) +
-                    rectangle_sum(edge_prefix,
+                    rectangle_sum(incremental_prefix,
                                   base_x + extra_rect.x,
                                   base_y + extra_rect.y,
                                   extra_rect.h, extra_rect.w) -
-                    (4 * p - shape.perimeter) * candidate_level;
-                if (boundary_cost + 1e-15L >= best_boundary_cost) continue;
-
-                vector<Cell> region;
-                region.reserve(p);
-                auto append_rectangle = [&](const Rect &rect) {
-                    for (int dx = 0; dx < rect.h; dx++) {
-                        for (int dy = 0; dy < rect.w; dy++) {
-                            region.emplace_back(base_x + rect.x + dx,
-                                                base_y + rect.y + dy);
-                        }
-                    }
-                };
-                append_rectangle(main_rect);
-                append_rectangle(extra_rect);
-                best_region = std::move(region);
-                best_boundary_cost = boundary_cost;
-                best_perimeter = shape.perimeter;
+                    (4 * p - shape.perimeter) * candidate_arrival_level;
+                long double absolute_cost =
+                    rectangle_sum(absolute_prefix,
+                                  base_x + main_rect.x,
+                                  base_y + main_rect.y,
+                                  main_rect.h, main_rect.w) +
+                    rectangle_sum(absolute_prefix,
+                                  base_x + extra_rect.x,
+                                  base_y + extra_rect.y,
+                                  extra_rect.h, extra_rect.w) -
+                    (4 * p - shape.perimeter) * candidate_release_level;
+                long long sum_x = (long long)p * base_x + relative_sum_x;
+                long long sum_y = (long long)p * base_y + relative_sum_y;
+                int lower_half = 2 * sum_x >= (long long)p * n;
+                int right_half = 2 * sum_y >= (long long)p * n;
+                int quadrant = 2 * lower_half + right_half;
+                long long order = enumeration_order++;
+                shortlist_builder.consider(
+                    shape.perimeter, incremental_cost, absolute_cost, order,
+                    quadrant, source,
+                    [&] { return materialize_shape(shape, base_x, base_y, p); });
             }
+        }
+        return found_legal;
+    };
+
+    bool found_minimum_template = false;
+    for (const Shape &shape : shapes) {
+        if (shape.perimeter != minimum_perimeter) continue;
+        found_minimum_template |=
+            scan_shape(shape, PlacementSource::MinimumTemplate);
+    }
+
+    if (!found_minimum_template) {
+        // Shapes are sorted by perimeter.  Once one extended tier has a
+        // legal placement, every later tier is strictly worse in immediate
+        // perimeter, so it cannot survive the minimum-perimeter collector.
+        for (size_t first = 0; first < shapes.size();) {
+            size_t last = first + 1;
+            while (last < shapes.size() &&
+                   shapes[last].perimeter == shapes[first].perimeter) {
+                last++;
+            }
+            if (shapes[first].perimeter > minimum_perimeter) {
+                bool found_in_tier = false;
+                for (size_t index = first; index < last; index++) {
+                    found_in_tier |= scan_shape(
+                        shapes[index], PlacementSource::ExtendedTemplate);
+                }
+                if (found_in_tier) break;
+            }
+            first = last;
+        }
+
+        vector<vector<Cell>> growth_candidates =
+            make_connected_growth_candidates(park, owner, p);
+        diagnostics.connected_growth_candidates += growth_candidates.size();
+        for (vector<Cell> &region : growth_candidates) {
+            int perimeter = calc_perimeter(region, n);
+            long double incremental_cost = 0.0L;
+            long double absolute_cost = 0.0L;
+            for (auto [x, y] : region) {
+                incremental_cost += incremental_cell[x][y];
+                absolute_cost += absolute_cell[x][y];
+            }
+            incremental_cost -=
+                (4 * p - perimeter) * candidate_arrival_level;
+            absolute_cost -=
+                (4 * p - perimeter) * candidate_release_level;
+            int quadrant = placement_quadrant(region, n);
+            long long order = enumeration_order++;
+            shortlist_builder.consider(
+                perimeter, incremental_cost, absolute_cost, order, quadrant,
+                PlacementSource::ConnectedGrowth,
+                [&] { return region; });
         }
     }
 
-    if (best_region) {
-        diagnostics.compact_successes++;
-        return NormalPlacementChoice{std::move(*best_region), best_perimeter};
+    vector<PlacementCandidate> candidates = shortlist_builder.finalize();
+    if (candidates.empty()) return nullopt;
+    diagnostics.shortlisted_candidates += candidates.size();
+
+    int incremental_best = 0;
+    int absolute_best = 0;
+    for (int index = 1; index < (int)candidates.size(); index++) {
+        if (placement_increment_less(candidates[index],
+                                     candidates[incremental_best])) {
+            incremental_best = index;
+        }
+        if (placement_absolute_less(candidates[index],
+                                    candidates[absolute_best])) {
+            absolute_best = index;
+        }
     }
-    if (auto fallback = find_connected_region(park, owner, p)) {
+    if (!same_region(candidates[incremental_best].cells,
+                     candidates[absolute_best].cells)) {
+        diagnostics.incremental_changed_from_absolute++;
+    }
+    int best_index = incremental_best;
+
+    long double future_mass = future_demand.future_start_cdf(arrival_t);
+    if ((int)candidates.size() >= 2 && remaining_groups > 0 &&
+        arrival_t - current_s > 1 &&
+        future_mass > 1e-12L) {
+        array<ll, FUTURE_FIT_SNAPSHOT_COUNT> snapshots =
+            make_future_fit_snapshots(future_demand, current_s, arrival_t);
+        long double best_fit = -numeric_limits<long double>::infinity();
+        for (int index = 0; index < (int)candidates.size(); index++) {
+            long double fit = evaluate_compact_fit(
+                park, owner, groups, candidates[index].cells, snapshots);
+            diagnostics.future_fit_snapshots += FUTURE_FIT_SNAPSHOT_COUNT;
+            if (fit > best_fit + 1e-15L ||
+                (fabsl(fit - best_fit) <= 1e-15L &&
+                 placement_increment_less(candidates[index],
+                                          candidates[best_index]))) {
+                best_fit = fit;
+                best_index = index;
+            }
+        }
+        diagnostics.future_fit_evaluated_turns++;
+        if (!same_region(candidates[incremental_best].cells,
+                         candidates[best_index].cells)) {
+            diagnostics.future_fit_changed_placements++;
+        }
+    }
+
+    if (!same_region(candidates[best_index].cells,
+                     candidates[absolute_best].cells)) {
+        diagnostics.final_changed_from_absolute++;
+    }
+    PlacementCandidate choice = std::move(candidates[best_index]);
+    if (choice.source == PlacementSource::ConnectedGrowth) {
         diagnostics.fallback_successes++;
-        int perimeter = calc_perimeter(*fallback, n);
-        return NormalPlacementChoice{std::move(*fallback), perimeter};
+    } else {
+        diagnostics.compact_successes++;
+        if (choice.source == PlacementSource::ExtendedTemplate) {
+            diagnostics.extended_template_successes++;
+        }
     }
-    return nullopt;
+    return NormalPlacementChoice{std::move(choice.cells), choice.perimeter};
 }
 
 struct ShadowDiagnostics {
@@ -1592,7 +2264,8 @@ int main() {
             optional<NormalPlacementChoice> placement =
                 choose_temporally_coherent_region(
                     park, owner, groups, S, T, P, theta,
-                    compact_shapes[P], placement_diagnostics);
+                    remaining_groups, compact_shapes[P],
+                    placement_diagnostics);
             if (!placement) {
                 shadow_diagnostics.no_region_rejected++;
             } else {
@@ -1644,12 +2317,28 @@ int main() {
          << " placement_attempts=" << placement_diagnostics.attempts
          << " placement_compact_successes="
          << placement_diagnostics.compact_successes
+         << " placement_extended_template_successes="
+         << placement_diagnostics.extended_template_successes
          << " placement_fallback_successes="
          << placement_diagnostics.fallback_successes
+         << " placement_future_fit_turns="
+         << placement_diagnostics.future_fit_evaluated_turns
+         << " placement_future_fit_changes="
+         << placement_diagnostics.future_fit_changed_placements
+         << " placement_incremental_changes_from_absolute="
+         << placement_diagnostics.incremental_changed_from_absolute
+         << " placement_final_changes_from_absolute="
+         << placement_diagnostics.final_changed_from_absolute
          << " placement_anchors_checked="
          << placement_diagnostics.anchors_checked
          << " placement_legal_compact_candidates="
          << placement_diagnostics.legal_compact_candidates
+         << " placement_growth_candidates="
+         << placement_diagnostics.connected_growth_candidates
+         << " placement_shortlisted_candidates="
+         << placement_diagnostics.shortlisted_candidates
+         << " placement_future_fit_snapshots="
+         << placement_diagnostics.future_fit_snapshots
          << fixed << setprecision(6)
          << " theta_mean=" << mean_theta
          << " shadow_mean_opportunity=" << mean_opportunity_cost
