@@ -48,19 +48,39 @@ constexpr int PLACEMENT_SHORTLIST_LIMIT = 6;
 constexpr int CONNECTED_GROWTH_SEED_LIMIT = 16;
 constexpr int FUTURE_FIT_SNAPSHOT_COUNT = 3;
 constexpr array<int, 8> FUTURE_FIT_SIDES = {2, 3, 4, 5, 6, 8, 10, 12};
-constexpr int CLEANUP_SEARCH_LIMIT = 24;
-constexpr int CLEANUP_MOVER_LIMIT = 8;
-constexpr int CLEANUP_DESTINATION_ANCHOR_LIMIT = 4096;
-constexpr long long CLEANUP_DESTINATION_ANCHOR_GLOBAL_LIMIT = 160000;
-constexpr int CLEANUP_DESTINATION_LIMIT = 3;
-constexpr int CLEANUP_CANDIDATE_EVALUATION_LIMIT = 192;
-// Submission setting: compare at most two cleanup candidates by two mirrored
-// synthetic futures, each looking 48 arrivals ahead.
-constexpr int CLEANUP_FINALIST_LIMIT = 2;
-constexpr int CLEANUP_ROLLOUT_LENGTH = 48;
-constexpr int CLEANUP_ROLLOUT_SCENARIO_COUNT = 2;
-constexpr int CLEANUP_FRESH_OVERLAP_NUMERATOR = 3;
-constexpr int CLEANUP_FRESH_OVERLAP_DENOMINATOR = 4;
+// Every minimum-perimeter target is cheap-scanned.  Exact blocker sets are
+// recovered only for the union of two shortlists, then repaired in economic
+// upper-bound order.  These are work limits, not limits on blocker count.
+constexpr int RESCUE_TARGET_SHORTLIST_PER_METRIC = 160;
+constexpr int RESCUE_TARGET_REPAIR_LIMIT = 8;
+constexpr int RESCUE_DESTINATION_ANCHOR_LIMIT = 4096;
+constexpr int RESCUE_DESTINATION_ANCHOR_GLOBAL_LIMIT = 50000;
+constexpr int RESCUE_DESTINATION_LEGAL_LIMIT = 64;
+constexpr int RESCUE_DESTINATION_LIMIT = 10;
+constexpr int RESCUE_BEAM_WIDTH = 32;
+constexpr int RESCUE_REPAIR_NODE_LIMIT = 2048;
+constexpr int RESCUE_ROLLOUT_CANDIDATE_LIMIT = 2;
+constexpr int ROOT_SCREEN_SCENARIO_COUNT = 2;
+constexpr int ROOT_SCREEN_ROLLOUT_LENGTH = 4;
+constexpr int ROOT_CONFIRM_SCENARIO_COUNT = 8;
+constexpr int ROOT_CONFIRM_ROLLOUT_LENGTH = 12;
+constexpr int ROOT_CONFIRMATION_TURN_LIMIT = 4;
+constexpr int ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT = 2;
+#ifdef AHC069_PROTECTED_ONLY
+constexpr bool ROOT_PROTECTED_ONLY = true;
+#else
+constexpr bool ROOT_PROTECTED_ONLY = false;
+#endif
+constexpr int ROOT_SCREEN_MAX_ACTIONS =
+    1 + RESCUE_ROLLOUT_CANDIDATE_LIMIT + ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT;
+// Compatibility aliases keep the existing screen implementation intact while
+// the root driver is split into screen and confirmation stages.
+constexpr int RESCUE_ROLLOUT_SCENARIO_COUNT = ROOT_SCREEN_SCENARIO_COUNT;
+constexpr int RESCUE_ROLLOUT_LENGTH = ROOT_SCREEN_ROLLOUT_LENGTH;
+constexpr int ROOT_ROLLOUT_MAX_ACTIONS = ROOT_SCREEN_MAX_ACTIONS;
+constexpr uint64_t ROOT_ROLLOUT_SEQUENCE_BLOCK_SIZE = 1000003ULL;
+constexpr int ROOT_ROLLOUT_SEQUENCE_BLOCKS_PER_BATCH = ROOT_CONFIRM_SCENARIO_COUNT / 2;
+constexpr int BOARD_MASK_WORDS = (50 * 50 + 63) / 64;
 
 struct Rect {
     int x;
@@ -101,9 +121,9 @@ struct TurnPlan {
 };
 
 // P cells arranged as a rectangle plus, if necessary, one partial row/column.
-// A short perimeter ladder is retained so that near-compact templates can be
-// tried before falling back to an arbitrary connected polyomino.
-vector<Shape> make_compact_shapes(int p, int n) {
+// The full ladder is used when an already-admitted group is repaired: any
+// template preserving its confirmed fee is a valid destination.
+vector<Shape> make_template_shapes(int p, int n) {
     vector<Shape> shapes;
 
     auto add_shape = [&](Rect main_rect, Rect extra_rect, int h, int w, int perimeter) {
@@ -141,16 +161,6 @@ vector<Shape> make_compact_shapes(int p, int n) {
             }
         }
     }
-
-    int min_perimeter = numeric_limits<int>::max();
-    for (const Shape &shape : shapes) {
-        chmin(min_perimeter, shape.perimeter);
-    }
-
-    shapes.erase(
-        remove_if(shapes.begin(), shapes.end(),
-                  [&](const Shape &shape) { return shape.perimeter > min_perimeter + COMPACT_PERIMETER_MARGIN; }),
-        shapes.end());
 
     auto key = [](const Shape &shape) {
         return array<int, 11>{
@@ -319,15 +329,29 @@ void place_cells(vvi &owner, const vector<Cell> &cells, int id) {
     }
 }
 
+enum class PlacementSource {
+    MinimumTemplate,
+    ExtendedTemplate,
+    ConnectedGrowth,
+};
+
 struct NormalPlacementChoice {
     vector<Cell> cells;
     int perimeter;
+    PlacementSource source;
 };
 
 // The hidden duration scale is shared by all groups in one test case.  Besides
 // observed durations, the likelihood below uses the fact that every unseen
 // group must start after the current order statistic S.
 struct ThetaEstimator {
+    static constexpr int PARTICLE_COUNT = (THETA_MAX - THETA_MIN) / THETA_STEP + 1;
+
+    struct PosteriorParticles {
+        array<long double, PARTICLE_COUNT> weights{};
+        long double weight_sum = 0.0L;
+    };
+
     int observed_count = 0;
     long double exponential_sample_sum = 0.0L;
 
@@ -360,8 +384,36 @@ struct ThetaEstimator {
         return clamp(integral / normalizer, 1e-300L, 1.0L);
     }
 
+    PosteriorParticles make_posterior(ll current_s, int remaining_groups) const {
+        array<long double, PARTICLE_COUNT> log_weights{};
+        long double max_log_weight = -numeric_limits<long double>::infinity();
+
+        for (int k = 0; k < PARTICLE_COUNT; k++) {
+            long double theta = THETA_MIN + THETA_STEP * k;
+            long double normalizer = -expm1l(-(long double)ARRIVAL_TIME_HORIZON / theta);
+            long double log_weight =
+                -observed_count * logl(theta) - exponential_sample_sum / theta - observed_count * logl(normalizer);
+            if (remaining_groups > 0) {
+                log_weight += remaining_groups * logl(start_survival(current_s, theta));
+            }
+            log_weights[k] = log_weight;
+            chmax(max_log_weight, log_weight);
+        }
+
+        PosteriorParticles posterior;
+        for (int k = 0; k < PARTICLE_COUNT; k++) {
+            long double weight = expl(log_weights[k] - max_log_weight);
+            posterior.weights[k] = weight;
+            posterior.weight_sum += weight;
+        }
+        return posterior;
+    }
+
     long double estimate(ll current_s, int remaining_groups) const {
-        constexpr int PARTICLE_COUNT = (THETA_MAX - THETA_MIN) / THETA_STEP + 1;
+        // Keep the legacy v3/v4 accumulation path byte-compatible.  Computing
+        // the particles in make_posterior() and reducing them in a second
+        // function changed the generated floating-point reduction (including
+        // FMA use), and tiny theta differences could change placement ties.
         array<long double, PARTICLE_COUNT> log_weights{};
         long double max_log_weight = -numeric_limits<long double>::infinity();
 
@@ -385,6 +437,19 @@ struct ThetaEstimator {
             theta_sum += weight * (THETA_MIN + THETA_STEP * k);
         }
         return theta_sum / weight_sum;
+    }
+
+    long double posterior_quantile(ll current_s, int remaining_groups, long double probability) const {
+        PosteriorParticles posterior = make_posterior(current_s, remaining_groups);
+        long double target = clamp(probability, 0.0L, 1.0L) * posterior.weight_sum;
+        long double cumulative = 0.0L;
+        // The posterior itself is the fixed 61-point theta grid, so use its
+        // left-continuous inverse CDF rather than interpolating new particles.
+        for (int k = 0; k < PARTICLE_COUNT; k++) {
+            cumulative += posterior.weights[k];
+            if (cumulative >= target) return THETA_MIN + THETA_STEP * k;
+        }
+        return THETA_MAX;
     }
 };
 
@@ -472,40 +537,6 @@ struct DensityModel {
         long double log_density_variance = base_log_density_variance + 0.01L * variance_log_duration / (ln2 * ln2);
         long double quantile = min(rejected_fraction, 1.0L - 1e-9L);
         return exp2l(mean_log_density + sqrtl(max(log_density_variance, 0.0L)) * inverse_standard_normal(quantile));
-    }
-};
-
-struct FutureSpaceValueModel {
-    array<long double, FUTURE_FIT_SIDES.size()> size_probability{};
-    array<long double, FUTURE_FIT_SIDES.size()> compact_fee_coefficient{};
-
-    explicit FutureSpaceValueModel(const vector<vector<Shape>> &compact_shapes) {
-        const long double sqrt_150 = sqrtl(150.0L);
-        const long double denominator = sqrt_150 - 2.0L;
-        for (int p = 4; p <= 150; p++) {
-            long double lower = sqrtl(max(4.0L, (long double)p - 0.5L));
-            long double upper = sqrtl(min(150.0L, (long double)p + 0.5L));
-            long double probability = max(0.0L, upper - lower) / denominator;
-
-            int bucket = 0;
-            for (int index = 1; index < (int)FUTURE_FIT_SIDES.size(); index++) {
-                if (fabsl(sqrtl((long double)p) - FUTURE_FIT_SIDES[index]) <
-                    fabsl(sqrtl((long double)p) - FUTURE_FIT_SIDES[bucket])) {
-                    bucket = index;
-                }
-            }
-
-            int minimum_perimeter = compact_shapes[p].front().perimeter;
-            long double compactness = 4.0L * sqrtl((long double)p) / minimum_perimeter;
-            size_probability[bucket] += probability;
-            compact_fee_coefficient[bucket] += probability * p * compactness;
-        }
-
-        for (int bucket = 0; bucket < (int)FUTURE_FIT_SIDES.size(); bucket++) {
-            if (size_probability[bucket] > 0.0L) {
-                compact_fee_coefficient[bucket] /= size_probability[bucket];
-            }
-        }
     }
 };
 
@@ -611,8 +642,8 @@ struct ShadowEvaluation {
 };
 
 // Price the candidate's occupied cell-time by the fee density of future groups
-// that would be crowded out.  The same price is used before and after cleanup,
-// so relocation changes only the board and the realizable arrival fee.
+// that would be crowded out.  Compact rescue is considered only after this
+// ordinary admission decision has accepted the fallback placement.
 ShadowEvaluation evaluate_shadow_cost(const vector<GroupState> &groups, ll current_s, ll arrival_t, int p,
                                       int remaining_groups, int grass_cells, long double theta,
                                       const DensityModel &density_model) {
@@ -674,12 +705,6 @@ struct TemporalPlacementDiagnostics {
     long long connected_growth_candidates = 0;
     long long shortlisted_candidates = 0;
     long long future_fit_snapshots = 0;
-};
-
-enum class PlacementSource {
-    MinimumTemplate,
-    ExtendedTemplate,
-    ConnectedGrowth,
 };
 
 struct PlacementCandidate {
@@ -1116,117 +1141,15 @@ long double evaluate_compact_fit(const vs &park, const vvi &owner, const vector<
     return 0.75L * average + 0.25L * minimum;
 }
 
-struct CleanupSpaceProfile {
-    array<int, FUTURE_FIT_SIDES.size()> square_anchors{};
-    array<int, FUTURE_FIT_SIDES.size()> component_slots{};
-};
-
-// Measure the board at one snapshot by both square-placement flexibility and
-// connected-component capacity.  A group with t < snapshot_time is treated as
-// free because it will have departed before an arrival at that time.
-CleanupSpaceProfile make_cleanup_space_profile(const vs &park, const vvi &owner, const vector<GroupState> &groups,
-                                               ll snapshot_time) {
-    int n = park.size();
-    vector<char> free_cell(n * n, false);
-    for (int x = 0; x < n; x++) {
-        for (int y = 0; y < n; y++) {
-            int occupied_by = owner[x][y];
-            free_cell[x * n + y] = park[x][y] == '.' && (occupied_by == -1 || groups[occupied_by].t < snapshot_time);
-        }
-    }
-
-    CleanupSpaceProfile result;
-    vector<int> histogram(n + 1);
-    vector<int> previous(n + 1), current(n + 1);
-    for (int x = 0; x < n; x++) {
-        fill(current.begin(), current.end(), 0);
-        for (int y = 0; y < n; y++) {
-            if (!free_cell[x * n + y]) continue;
-            current[y + 1] = 1 + min({previous[y + 1], current[y], previous[y]});
-            histogram[current[y + 1]]++;
-        }
-        swap(previous, current);
-    }
-    vector<int> at_least(n + 2);
-    for (int side = n; side >= 1; side--) {
-        at_least[side] = at_least[side + 1] + histogram[side];
-    }
-    for (int bucket = 0; bucket < (int)FUTURE_FIT_SIDES.size(); bucket++) {
-        int side = FUTURE_FIT_SIDES[bucket];
-        result.square_anchors[bucket] = at_least[side];
-    }
-
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-    vector<char> visited(n * n, false);
-    vector<int> component_sizes;
-    for (int start_x = 0; start_x < n; start_x++) {
-        for (int start_y = 0; start_y < n; start_y++) {
-            int start = start_x * n + start_y;
-            if (!free_cell[start] || visited[start]) continue;
-            int component_size = 0;
-            queue<Cell> que;
-            que.emplace(start_x, start_y);
-            visited[start] = true;
-            while (!que.empty()) {
-                auto [x, y] = que.front();
-                que.pop();
-                component_size++;
-                for (int dir = 0; dir < 4; dir++) {
-                    int nx = x + DX[dir];
-                    int ny = y + DY[dir];
-                    if (!inside(nx, ny, n, n)) continue;
-                    int next = nx * n + ny;
-                    if (!free_cell[next] || visited[next]) continue;
-                    visited[next] = true;
-                    que.emplace(nx, ny);
-                }
-            }
-            component_sizes.push_back(component_size);
-        }
-    }
-    for (int bucket = 0; bucket < (int)FUTURE_FIT_SIDES.size(); bucket++) {
-        int representative_size = FUTURE_FIT_SIDES[bucket] * FUTURE_FIT_SIDES[bucket];
-        int slots = 0;
-        for (int component_size : component_sizes) {
-            slots += component_size / representative_size;
-            if (slots >= 2) break;
-        }
-        result.component_slots[bucket] = min(slots, 2);
-    }
-    return result;
-}
-
-long double cleanup_space_availability(const CleanupSpaceProfile &profile, int bucket, int n) {
-    int side = FUTURE_FIT_SIDES[bucket];
-    int maximum_anchors = (n - side + 1) * (n - side + 1);
-    long double square_flexibility = maximum_anchors <= 0 ? 0.0L
-                                                          : log1pl((long double)profile.square_anchors[bucket]) /
-                                                                log1pl((long double)maximum_anchors);
-    long double component_capacity = 0.5L * profile.component_slots[bucket];
-    return 0.8L * square_flexibility + 0.2L * component_capacity;
-}
-
-long double cleanup_pre_arrival_space_score(const CleanupSpaceProfile &profile,
-                                            const FutureSpaceValueModel &space_value_model, int n) {
-    long double weighted_score = 0.0L;
-    long double weight_sum = 0.0L;
-    for (int bucket = 0; bucket < (int)FUTURE_FIT_SIDES.size(); bucket++) {
-        long double weight =
-            space_value_model.size_probability[bucket] * space_value_model.compact_fee_coefficient[bucket];
-        weighted_score += weight * cleanup_space_availability(profile, bucket, n);
-        weight_sum += weight;
-    }
-    return weight_sum <= 0.0L ? 0.0L : weighted_score / weight_sum;
-}
-
 optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park, const vvi &owner,
                                                                   const vector<GroupState> &groups, ll current_s,
                                                                   ll arrival_t, int p, long double theta,
                                                                   int remaining_groups, const vector<Shape> &shapes,
-                                                                  TemporalPlacementDiagnostics &diagnostics) {
+                                                                  TemporalPlacementDiagnostics &diagnostics,
+                                                                  vector<NormalPlacementChoice> *root_alternatives = nullptr) {
     // Prefer boundaries next to groups with similar release timing.  Only a
     // small spatial shortlist proceeds to the more expensive future-fit test.
+    if (root_alternatives) root_alternatives->clear();
     diagnostics.attempts++;
     int n = park.size();
     vector<vi> blocked_prefix = make_blocked_prefix(park, owner);
@@ -1404,11 +1327,16 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
     int best_index = incremental_best;
 
     long double future_mass = future_demand.future_start_cdf(arrival_t);
+    vector<long double> future_fit_values;
+    bool used_future_fit = false;
     if ((int)candidates.size() >= 2 && remaining_groups > 0 && arrival_t - current_s > 1 && future_mass > 1e-12L) {
+        used_future_fit = true;
+        if (root_alternatives) future_fit_values.resize(candidates.size());
         array<ll, FUTURE_FIT_SNAPSHOT_COUNT> snapshots = make_future_fit_snapshots(future_demand, current_s, arrival_t);
         long double best_fit = -numeric_limits<long double>::infinity();
         for (int index = 0; index < (int)candidates.size(); index++) {
             long double fit = evaluate_compact_fit(park, owner, groups, candidates[index].cells, snapshots);
+            if (root_alternatives) future_fit_values[index] = fit;
             diagnostics.future_fit_snapshots += FUTURE_FIT_SNAPSHOT_COUNT;
             if (fit > best_fit + 1e-15L || (fabsl(fit - best_fit) <= 1e-15L &&
                                             placement_increment_less(candidates[index], candidates[best_index]))) {
@@ -1425,6 +1353,33 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
     if (!same_region(candidates[best_index].cells, candidates[absolute_best].cells)) {
         diagnostics.final_changed_from_absolute++;
     }
+    // The real-arrival caller may compare a few ordinary runner-ups at the
+    // root.  Reuse the evaluated shortlist and apply the exact same ranking;
+    // synthetic rollout arrivals do not request this list.
+    if (root_alternatives && candidates.size() >= 2) {
+        vector<char> chosen(candidates.size(), false);
+        chosen[best_index] = true;
+        while ((int)root_alternatives->size() < ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT) {
+            int alternative_index = -1;
+            for (int index = 0; index < (int)candidates.size(); index++) {
+                if (chosen[index]) continue;
+                bool better = alternative_index == -1;
+                if (!better && used_future_fit) {
+                    better = future_fit_values[index] > future_fit_values[alternative_index] + 1e-15L ||
+                             (fabsl(future_fit_values[index] - future_fit_values[alternative_index]) <= 1e-15L &&
+                              placement_increment_less(candidates[index], candidates[alternative_index]));
+                } else if (!better) {
+                    better = placement_increment_less(candidates[index], candidates[alternative_index]);
+                }
+                if (better) alternative_index = index;
+            }
+            if (alternative_index == -1) break;
+            chosen[alternative_index] = true;
+            root_alternatives->push_back(
+                NormalPlacementChoice{candidates[alternative_index].cells, candidates[alternative_index].perimeter,
+                                      candidates[alternative_index].source});
+        }
+    }
     PlacementCandidate choice = std::move(candidates[best_index]);
     if (choice.source == PlacementSource::ConnectedGrowth) {
         diagnostics.fallback_successes++;
@@ -1434,7 +1389,7 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
             diagnostics.extended_template_successes++;
         }
     }
-    return NormalPlacementChoice{std::move(choice.cells), choice.perimeter};
+    return NormalPlacementChoice{std::move(choice.cells), choice.perimeter, choice.source};
 }
 
 struct ShadowDiagnostics {
@@ -1450,398 +1405,25 @@ struct ShadowDiagnostics {
     long long priced_buckets = 0;
 };
 
-struct FreeComponents {
-    vvi id;
-    vi size;
-};
+bool validate_connected_region(const vector<Cell> &cells, int n);
 
-FreeComponents label_free_components(const vs &park, const vvi &owner) {
-    int n = park.size();
-    FreeComponents result{vvi(n, vi(n, -1)), {}};
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-
-    for (int start_x = 0; start_x < n; start_x++) {
-        for (int start_y = 0; start_y < n; start_y++) {
-            if (park[start_x][start_y] == '#' || owner[start_x][start_y] != -1 || result.id[start_x][start_y] != -1) {
-                continue;
-            }
-
-            int component_id = result.size.size();
-            int component_size = 0;
-            queue<Cell> que;
-            result.id[start_x][start_y] = component_id;
-            que.emplace(start_x, start_y);
-
-            while (!que.empty()) {
-                auto [x, y] = que.front();
-                que.pop();
-                component_size++;
-
-                for (int dir = 0; dir < 4; dir++) {
-                    int nx = x + DX[dir];
-                    int ny = y + DY[dir];
-                    if (!inside(nx, ny, n, n) || result.id[nx][ny] != -1) continue;
-                    if (park[nx][ny] == '#' || owner[nx][ny] != -1) continue;
-                    result.id[nx][ny] = component_id;
-                    que.emplace(nx, ny);
-                }
-            }
-
-            result.size.push_back(component_size);
-        }
-    }
-    return result;
-}
-
-bool validate_connected_region(const vector<Cell> &cells, int n) {
-    if (cells.empty()) return false;
-    vector<char> in_region(n * n, false);
-    for (auto [x, y] : cells) {
-        if (!inside(x, y, n, n)) return false;
-        int cell = x * n + y;
-        if (in_region[cell]) return false;
-        in_region[cell] = true;
-    }
-    vector<char> visited(n * n, false);
-    queue<Cell> que;
-    que.push(cells.front());
-    visited[cells.front().first * n + cells.front().second] = true;
-    int reached = 0;
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-    while (!que.empty()) {
-        auto [x, y] = que.front();
-        que.pop();
-        reached++;
-        for (int dir = 0; dir < 4; dir++) {
-            int nx = x + DX[dir];
-            int ny = y + DY[dir];
-            if (!inside(nx, ny, n, n)) continue;
-            int next = nx * n + ny;
-            if (!in_region[next] || visited[next]) continue;
-            visited[next] = true;
-            que.emplace(nx, ny);
-        }
-    }
-    return reached == (int)cells.size();
-}
-
-struct CleanupDiagnostics {
-    int attempts = 0;
-    int successes = 0;
-    int successes_with_arrival = 0;
-    int successes_without_arrival = 0;
-    int search_budget_exhausted = 0;
-    int evaluation_budget_exhausted = 0;
-    int rollout_reuse_blocked = 0;
-    int rollout_generation_failures = 0;
-    int no_mover = 0;
-    int no_destination = 0;
-    int pre_arrival_worsened = 0;
-    int economic_rejections = 0;
-    int validation_failures = 0;
-    long long fresh_cells = 0;
-    long long movers_considered = 0;
-    long long destination_anchors = 0;
-    long long destination_candidates = 0;
-    long long candidate_evaluations = 0;
-    long long finalist_evaluations = 0;
-    int rollout_turns = 0;
-    bool rollout_used = false;
-    long long rollout_policy_steps = 0;
-    long long rollout_acceptances = 0;
-    long long rollout_candidates_compared = 0;
-    int rollout_multi_candidate_turns = 0;
-    int rollout_full_width_turns = 0;
-    int rollout_nonprimary_wins = 0;
-    long long rollout_winner_rank_sum = 0;
-    int rollout_max_winner_rank = 0;
-    ll move_cost_sum = 0;
-    ll fee_loss_sum = 0;
-    ll current_fee_gain_sum = 0;
-    long double pre_arrival_score_gain_sum = 0.0L;
-    long double rollout_future_gain_sum = 0.0L;
-    long double rollout_margin_sum = 0.0L;
-};
-
-struct CleanupMoverCandidate {
-    int id = -1;
-    int merged_gain = 0;
-    int unlocked_size = 0;
-    int perimeter_excess = 0;
-    ll movement_cost = 0;
-    ll space_time_gain = 0;
-};
-
-struct CleanupDestinationSeed {
-    int shape_index = -1;
-    int base_x = 0;
-    int base_y = 0;
-    int perimeter = 0;
-    int fresh_overlap = 0;
-    int quadrant = 0;
-    ll fee_loss = 0;
-    long long order = 0;
-};
-
-struct CleanupDestination {
-    vector<Cell> cells;
-    int perimeter = 0;
-    ll fee_loss = 0;
-};
-
-vector<vi> make_cleanup_mask_prefix(const vector<char> &mask, int n) {
-    vector<vi> prefix(n + 1, vi(n + 1));
-    for (int x = 0; x < n; x++) {
-        for (int y = 0; y < n; y++) {
-            prefix[x + 1][y + 1] = mask[x * n + y] + prefix[x][y + 1] + prefix[x + 1][y] - prefix[x][y];
-        }
-    }
-    return prefix;
-}
-
-bool cleanup_destination_economic_less(const CleanupDestinationSeed &lhs, const CleanupDestinationSeed &rhs) {
-    if (lhs.fee_loss != rhs.fee_loss) return lhs.fee_loss < rhs.fee_loss;
-    if (lhs.perimeter != rhs.perimeter) {
-        return lhs.perimeter < rhs.perimeter;
-    }
-    if (lhs.fresh_overlap != rhs.fresh_overlap) {
-        return lhs.fresh_overlap > rhs.fresh_overlap;
-    }
-    return lhs.order < rhs.order;
-}
-
-bool cleanup_destination_fresh_less(const CleanupDestinationSeed &lhs, const CleanupDestinationSeed &rhs) {
-    if (lhs.fresh_overlap != rhs.fresh_overlap) {
-        return lhs.fresh_overlap > rhs.fresh_overlap;
-    }
-    return cleanup_destination_economic_less(lhs, rhs);
-}
-
-vector<CleanupDestination> make_cleanup_destinations(const vs &park, const vvi &baseline_owner,
-                                                     const vector<GroupState> &groups, int mover_id,
-                                                     const vector<char> &fresh_mask,
-                                                     const vector<vector<Shape>> &compact_shapes,
-                                                     CleanupDiagnostics &diagnostics) {
-    // Cleanup means moving one existing group into space freed on this turn.
-    // Requiring at least 75% fresh overlap prevents an unrelated board-wide
-    // relocation search and focuses the move on consolidating the new hole.
-    int n = park.size();
-    const GroupState &group = groups[mover_id];
-    vvi scratch_owner = baseline_owner;
-    clear_cells(scratch_owner, group.cells);
-    vector<vi> blocked_prefix = make_blocked_prefix(park, scratch_owner);
-    vector<vi> fresh_prefix = make_cleanup_mask_prefix(fresh_mask, n);
-    vector<char> old_mask(n * n, false);
-    for (auto [x, y] : group.cells) old_mask[x * n + y] = true;
-    vector<vi> old_prefix = make_cleanup_mask_prefix(old_mask, n);
-
-    const vector<Shape> &shapes = compact_shapes[group.p];
-    vector<int> samples(shapes.size());
-    vector<int> anchor_counts(shapes.size());
-    vector<int> starts(shapes.size());
-    vector<int> strides(shapes.size());
-    for (int shape_index = 0; shape_index < (int)shapes.size(); shape_index++) {
-        const Shape &shape = shapes[shape_index];
-        int count = (n - shape.h + 1) * (n - shape.w + 1);
-        anchor_counts[shape_index] = count;
-        starts[shape_index] = (int)(((long long)(mover_id + 1) * 1009 + (long long)(shape_index + 1) * 9176) % count);
-        int stride = max(1, count / 2 + 1 + shape_index % 7);
-        while (std::gcd(stride, count) != 1) stride++;
-        strides[shape_index] = stride;
-    }
-
-    optional<CleanupDestinationSeed> economic_best;
-    optional<CleanupDestinationSeed> fresh_best;
-    optional<CleanupDestinationSeed> first_candidate;
-    array<optional<CleanupDestinationSeed>, 4> quadrant_best;
-    long long local_anchors = 0;
-    long long order = 0;
-    int minimum_fresh_overlap = (CLEANUP_FRESH_OVERLAP_NUMERATOR * group.p + CLEANUP_FRESH_OVERLAP_DENOMINATOR - 1) /
-                                CLEANUP_FRESH_OVERLAP_DENOMINATOR;
-    ll previous_fee = round_payment(group.v, group.p, group.max_perimeter);
-
-    bool exhausted = false;
-    while (!exhausted && local_anchors < CLEANUP_DESTINATION_ANCHOR_LIMIT) {
-        bool progressed = false;
-        for (int shape_index = 0; shape_index < (int)shapes.size(); shape_index++) {
-            if (local_anchors >= CLEANUP_DESTINATION_ANCHOR_LIMIT ||
-                diagnostics.destination_anchors >= CLEANUP_DESTINATION_ANCHOR_GLOBAL_LIMIT) {
-                exhausted = true;
-                break;
-            }
-            if (samples[shape_index] >= anchor_counts[shape_index]) {
-                continue;
-            }
-            progressed = true;
-            const Shape &shape = shapes[shape_index];
-            int columns = n - shape.w + 1;
-            int flat = (starts[shape_index] + (long long)samples[shape_index] * strides[shape_index]) %
-                       anchor_counts[shape_index];
-            samples[shape_index]++;
-            local_anchors++;
-            diagnostics.destination_anchors++;
-            int base_x = flat / columns;
-            int base_y = flat % columns;
-            const Rect &a = shape.main_rect;
-            const Rect &b = shape.extra_rect;
-            if (rectangle_sum(blocked_prefix, base_x + a.x, base_y + a.y, a.h, a.w) != 0 ||
-                rectangle_sum(blocked_prefix, base_x + b.x, base_y + b.y, b.h, b.w) != 0) {
-                continue;
-            }
-            int old_overlap = rectangle_sum(old_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
-                              rectangle_sum(old_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
-            if (old_overlap == group.p) continue;
-            int fresh_overlap = rectangle_sum(fresh_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
-                                rectangle_sum(fresh_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
-            if (fresh_overlap < minimum_fresh_overlap) continue;
-
-            ll next_fee = round_payment(group.v, group.p, max(group.max_perimeter, shape.perimeter));
-            int lower_half = 2 * base_x + shape.h >= n;
-            int right_half = 2 * base_y + shape.w >= n;
-            CleanupDestinationSeed seed{shape_index,
-                                        base_x,
-                                        base_y,
-                                        shape.perimeter,
-                                        fresh_overlap,
-                                        2 * lower_half + right_half,
-                                        previous_fee - next_fee,
-                                        order++};
-            diagnostics.destination_candidates++;
-            if (!first_candidate) first_candidate = seed;
-            if (!economic_best || cleanup_destination_economic_less(seed, *economic_best)) {
-                economic_best = seed;
-            }
-            if (!fresh_best || cleanup_destination_fresh_less(seed, *fresh_best)) {
-                fresh_best = seed;
-            }
-            if (!quadrant_best[seed.quadrant] ||
-                cleanup_destination_economic_less(seed, *quadrant_best[seed.quadrant])) {
-                quadrant_best[seed.quadrant] = seed;
-            }
-        }
-        if (!progressed) break;
-    }
-
-    vector<CleanupDestinationSeed> selected_seeds;
-    auto add_seed = [&](const optional<CleanupDestinationSeed> &seed) {
-        if (!seed) return;
-        for (const CleanupDestinationSeed &existing : selected_seeds) {
-            if (existing.shape_index == seed->shape_index && existing.base_x == seed->base_x &&
-                existing.base_y == seed->base_y) {
-                return;
-            }
-        }
-        selected_seeds.push_back(*seed);
-    };
-    add_seed(economic_best);
-    add_seed(fresh_best);
-
-    int primary_quadrant = economic_best ? economic_best->quadrant : -1;
-    optional<CleanupDestinationSeed> diverse;
-    for (int quadrant = 0; quadrant < 4; quadrant++) {
-        if (quadrant == primary_quadrant || !quadrant_best[quadrant]) {
-            continue;
-        }
-        if (!diverse || cleanup_destination_fresh_less(*quadrant_best[quadrant], *diverse)) {
-            diverse = quadrant_best[quadrant];
-        }
-    }
-    add_seed(diverse);
-    add_seed(first_candidate);
-    for (const auto &seed : quadrant_best) add_seed(seed);
-
-    vector<CleanupDestination> result;
-    for (const CleanupDestinationSeed &seed : selected_seeds) {
-        vector<Cell> cells = materialize_shape(shapes[seed.shape_index], seed.base_x, seed.base_y, group.p);
-        bool duplicate = false;
-        for (const CleanupDestination &existing : result) {
-            if (same_region(existing.cells, cells)) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (duplicate) continue;
-        result.push_back({std::move(cells), seed.perimeter, seed.fee_loss});
-        if ((int)result.size() == CLEANUP_DESTINATION_LIMIT) break;
-    }
-    return result;
-}
-
-bool validate_and_build_cleanup_owner(const TurnPlan &plan, const vs &park, const vvi &owner,
-                                      const vector<GroupState> &groups, int arrival_id, int r_milli, vvi &final_owner,
-                                      ll &fee_loss) {
-    if (plan.moves.size() != 1 || groups[arrival_id].active) return false;
-    int n = park.size();
-    const MovePlan &move = plan.moves.front();
-    if (move.id < 0 || move.id >= (int)groups.size() || !groups[move.id].active) {
-        return false;
-    }
-    const GroupState &group = groups[move.id];
-    if ((int)group.cells.size() != group.p) return false;
-
-    final_owner = owner;
-    for (auto [x, y] : group.cells) {
-        if (!inside(x, y, n, n) || final_owner[x][y] != move.id) {
-            return false;
-        }
-    }
-    clear_cells(final_owner, group.cells);
-
-    auto region_is_legal = [&](const vector<Cell> &cells, int expected_size) {
-        if ((int)cells.size() != expected_size) return false;
-        for (auto [x, y] : cells) {
-            if (!inside(x, y, n, n) || park[x][y] != '.' || final_owner[x][y] != -1) {
-                return false;
-            }
-        }
-        return validate_connected_region(cells, n);
-    };
-
-    if (!region_is_legal(move.cells, group.p) || same_region(move.cells, group.cells)) {
-        return false;
-    }
-    int move_perimeter = calc_perimeter(move.cells, n);
-    if (move_perimeter != move.perimeter) return false;
-    ll previous_fee = round_payment(group.v, group.p, group.max_perimeter);
-    ll next_fee = round_payment(group.v, group.p, max(group.max_perimeter, move_perimeter));
-    fee_loss = previous_fee - next_fee;
-    place_cells(final_owner, move.cells, move.id);
-
-    ll expected_gain = -move_cost(group.v, r_milli);
-    if (plan.arrival) {
-        if (!region_is_legal(*plan.arrival, groups[arrival_id].p)) {
-            return false;
-        }
-        if (calc_perimeter(*plan.arrival, n) != plan.arrival_perimeter) {
-            return false;
-        }
-        expected_gain += round_payment(groups[arrival_id].v, groups[arrival_id].p, plan.arrival_perimeter);
-        place_cells(final_owner, *plan.arrival, arrival_id);
-    } else if (plan.arrival_perimeter != 0) {
-        return false;
-    }
-    return expected_gain == plan.immediate_gain;
-}
-
-enum class CleanupArrivalStatus {
+enum class ArrivalStatus {
     UpperBoundRejected,
     NoRegion,
     ActualFeeRejected,
     Accepted,
 };
 
-struct CleanupArrivalDecision {
+struct ArrivalDecision {
     optional<vector<Cell>> cells;
     int perimeter = 0;
     ll fee = 0;
-    CleanupArrivalStatus status = CleanupArrivalStatus::NoRegion;
+    ArrivalStatus status = ArrivalStatus::NoRegion;
     TemporalPlacementDiagnostics diagnostics;
 };
 
-void merge_temporal_placement_diagnostics(TemporalPlacementDiagnostics &total,
-                                          const TemporalPlacementDiagnostics &part) {
+void accumulate_placement_diagnostics(TemporalPlacementDiagnostics &total,
+                                      const TemporalPlacementDiagnostics &part) {
     total.attempts += part.attempts;
     total.compact_successes += part.compact_successes;
     total.extended_template_successes += part.extended_template_successes;
@@ -1857,41 +1439,72 @@ void merge_temporal_placement_diagnostics(TemporalPlacementDiagnostics &total,
     total.future_fit_snapshots += part.future_fit_snapshots;
 }
 
-CleanupArrivalDecision evaluate_cleanup_arrival_decision(const vs &park, const vvi &decision_owner,
-                                                         const vector<GroupState> &groups, int arrival_id, ll current_s,
-                                                         int remaining_groups, long double theta,
-                                                         long double opportunity_cost,
-                                                         const vector<vector<Shape>> &compact_shapes) {
-    CleanupArrivalDecision result;
+void remove_selected_placement_success(TemporalPlacementDiagnostics &diagnostics) {
+    if (diagnostics.fallback_successes > 0) {
+        diagnostics.fallback_successes--;
+        return;
+    }
+    if (diagnostics.compact_successes > 0) diagnostics.compact_successes--;
+    if (diagnostics.extended_template_successes > 0) diagnostics.extended_template_successes--;
+}
+
+void replace_selected_placement_success(TemporalPlacementDiagnostics &diagnostics,
+                                        PlacementSource source) {
+    remove_selected_placement_success(diagnostics);
+    if (source == PlacementSource::ConnectedGrowth) {
+        diagnostics.fallback_successes++;
+    } else {
+        diagnostics.compact_successes++;
+        if (source == PlacementSource::ExtendedTemplate) diagnostics.extended_template_successes++;
+    }
+}
+
+ArrivalDecision evaluate_arrival_decision(const vs &park, const vvi &decision_owner,
+                                          const vector<GroupState> &groups, int arrival_id, ll current_s,
+                                          int remaining_groups, long double theta, long double opportunity_cost,
+                                          const vector<vector<Shape>> &compact_shapes,
+                                          vector<NormalPlacementChoice> *root_alternatives = nullptr) {
+    ArrivalDecision result;
+    if (root_alternatives) root_alternatives->clear();
     const GroupState &arrival = groups[arrival_id];
     int minimum_perimeter = compact_shapes[arrival.p].front().perimeter;
     ll upper_bound_fee = round_payment(arrival.v, arrival.p, minimum_perimeter);
     if ((long double)upper_bound_fee <= opportunity_cost) {
-        result.status = CleanupArrivalStatus::UpperBoundRejected;
+        result.status = ArrivalStatus::UpperBoundRejected;
         return result;
     }
 
     optional<NormalPlacementChoice> placement =
         choose_temporally_coherent_region(park, decision_owner, groups, current_s, arrival.t, arrival.p, theta,
-                                          remaining_groups, compact_shapes[arrival.p], result.diagnostics);
+                                          remaining_groups, compact_shapes[arrival.p], result.diagnostics,
+                                          root_alternatives);
     if (!placement) {
-        result.status = CleanupArrivalStatus::NoRegion;
+        result.status = ArrivalStatus::NoRegion;
         return result;
     }
 
     ll actual_fee = round_payment(arrival.v, arrival.p, placement->perimeter);
     if ((long double)actual_fee <= opportunity_cost) {
-        result.status = CleanupArrivalStatus::ActualFeeRejected;
+        if (root_alternatives) root_alternatives->clear();
+        result.status = ArrivalStatus::ActualFeeRejected;
         return result;
+    }
+    if (root_alternatives) {
+        root_alternatives->erase(
+            remove_if(root_alternatives->begin(), root_alternatives->end(), [&](const NormalPlacementChoice &choice) {
+                ll alternative_fee = round_payment(arrival.v, arrival.p, choice.perimeter);
+                return (long double)alternative_fee <= opportunity_cost;
+            }),
+            root_alternatives->end());
     }
     result.cells = std::move(placement->cells);
     result.perimeter = placement->perimeter;
     result.fee = actual_fee;
-    result.status = CleanupArrivalStatus::Accepted;
+    result.status = ArrivalStatus::Accepted;
     return result;
 }
 
-TurnPlan make_arrival_turn_plan(const CleanupArrivalDecision &decision) {
+TurnPlan make_arrival_plan(const ArrivalDecision &decision) {
     TurnPlan plan;
     if (decision.cells) {
         plan.arrival = *decision.cells;
@@ -1901,7 +1514,642 @@ TurnPlan make_arrival_turn_plan(const CleanupArrivalDecision &decision) {
     return plan;
 }
 
-struct CleanupSyntheticArrival {
+using BoardMask = array<uint64_t, BOARD_MASK_WORDS>;
+
+BoardMask make_board_mask(const vector<Cell> &cells, int n) {
+    BoardMask mask{};
+    for (auto [x, y] : cells) {
+        int index = x * n + y;
+        mask[index >> 6] |= 1ULL << (index & 63);
+    }
+    return mask;
+}
+
+BoardMask make_occupied_mask(const vvi &owner) {
+    int n = owner.size();
+    BoardMask mask{};
+    for (int x = 0; x < n; x++) {
+        for (int y = 0; y < n; y++) {
+            if (owner[x][y] == -1) continue;
+            int index = x * n + y;
+            mask[index >> 6] |= 1ULL << (index & 63);
+        }
+    }
+    return mask;
+}
+
+bool masks_overlap(const BoardMask &lhs, const BoardMask &rhs) {
+    for (int word = 0; word < BOARD_MASK_WORDS; word++) {
+        if (lhs[word] & rhs[word]) return true;
+    }
+    return false;
+}
+
+void merge_mask(BoardMask &destination, const BoardMask &source) {
+    for (int word = 0; word < BOARD_MASK_WORDS; word++) destination[word] |= source[word];
+}
+
+vector<vi> make_flag_prefix(const vector<char> &flag, int n) {
+    vector<vi> prefix(n + 1, vi(n + 1));
+    for (int x = 0; x < n; x++) {
+        for (int y = 0; y < n; y++) {
+            prefix[x + 1][y + 1] =
+                flag[x * n + y] + prefix[x][y + 1] + prefix[x + 1][y] - prefix[x][y];
+        }
+    }
+    return prefix;
+}
+
+struct RescueDiagnostics {
+    int eligible_fallbacks = 0;
+    int feasible_turns = 0;
+    int feasible_plans = 0;
+    int successes = 0;
+    int rollout_turns = 0;
+    int rollout_generation_failures = 0;
+    int rollout_adopted = 0;
+    int rollout_rescue_not_selected = 0;
+    int rollout_scenario_disagreements = 0;
+    int rollout_skipped_no_future = 0;
+    int rollout_one_candidate_turns = 0;
+    int rollout_two_candidate_turns = 0;
+    int rollout_selected_candidate_0 = 0;
+    int rollout_selected_candidate_1 = 0;
+    int rollout_candidate_0_disagreements = 0;
+    int rollout_candidate_1_disagreements = 0;
+    int rollout_same_blocker_sets = 0;
+    int root_alternative_available_turns = 0;
+    int root_selected_primary = 0;
+    int root_selected_alternative = 0;
+    int root_alternative_disagreements = 0;
+    int root_screen_v3_overrides = 0;
+    int root_screen_selected_alternative = 0;
+    int root_v3_winner_overridden = 0;
+    array<int, ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT> root_selected_alternative_rank{};
+    array<int, ROOT_ROLLOUT_MAX_ACTIONS + 1> root_turns_by_action_count{};
+    int normal_root_gate_turns = 0;
+    int normal_root_rollout_turns = 0;
+    int normal_root_generation_failures = 0;
+    int normal_root_screen_overrides = 0;
+    int normal_root_screen_selected_alternative = 0;
+    int normal_root_selected_primary = 0;
+    int normal_root_selected_alternative = 0;
+    array<int, ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT> normal_root_selected_alternative_rank{};
+    array<int, 1 + ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT + 1> normal_root_turns_by_action_count{};
+    int root_confirmation_attempts = 0;
+    int root_confirmation_approved = 0;
+    int root_confirmation_rejected = 0;
+    int root_confirmation_generation_failures = 0;
+    int root_confirmation_budget_skips = 0;
+    int root_confirmation_full_horizon = 0;
+    int root_confirmation_short_horizon = 0;
+    int root_confirmation_pair_disagreements = 0;
+    int no_economic_target = 0;
+    int no_repair = 0;
+    int target_limit_exhausted = 0;
+    int destination_limit_exhausted = 0;
+    int node_limit_exhausted = 0;
+    int validation_failures = 0;
+    int maximum_blockers = 0;
+    array<int, 4> feasible_by_blocker_count{};
+    array<int, 4> successes_by_blocker_count{};
+    long long target_anchors = 0;
+    long long target_shortlisted = 0;
+    long long exact_targets = 0;
+    long long economic_targets = 0;
+    long long repair_attempts = 0;
+    long long destination_anchors = 0;
+    long long destination_candidates = 0;
+    long long beam_nodes = 0;
+    long long rollout_policy_steps = 0;
+    long long rollout_candidates_compared = 0;
+    long long rollout_positive_candidates = 0;
+    long long rollout_nonpositive_candidates = 0;
+    long long rollout_unselected_positive_candidates = 0;
+    long long rollout_candidate_overlap_cells = 0;
+    long long rollout_baseline_acceptances = 0;
+    long long rollout_rescue_acceptances = 0;
+    long long root_actions_compared = 0;
+    long long root_alternatives_compared = 0;
+    long long root_alternative_acceptances = 0;
+    long long normal_root_actions_compared = 0;
+    long long normal_root_alternatives_compared = 0;
+    long long normal_root_policy_steps = 0;
+    long long root_confirmation_policy_steps = 0;
+    long long root_confirmation_scenarios = 0;
+    long long root_confirmation_positive_scenarios = 0;
+    long long moved_groups = 0;
+    ll feasible_direct_gain = 0;
+    ll arrival_fee_gain = 0;
+    ll movement_cost = 0;
+    ll immediate_gain = 0;
+    ll rollout_scenario_0_future_delta = 0;
+    ll rollout_scenario_1_future_delta = 0;
+    ll root_alternative_scenario_0_future_delta = 0;
+    ll root_alternative_scenario_1_future_delta = 0;
+    array<ll, RESCUE_ROLLOUT_CANDIDATE_LIMIT> rollout_slot_scenario_0_future_delta{};
+    array<ll, RESCUE_ROLLOUT_CANDIDATE_LIMIT> rollout_slot_scenario_1_future_delta{};
+    long double rollout_adopted_direct_gain = 0.0L;
+    long double rollout_adopted_future_mean = 0.0L;
+    long double rollout_adopted_margin = 0.0L;
+    long double rollout_not_selected_direct_gain = 0.0L;
+    long double rollout_not_selected_future_mean = 0.0L;
+    long double rollout_not_selected_margin = 0.0L;
+    array<long double, RESCUE_ROLLOUT_CANDIDATE_LIMIT> rollout_slot_margin{};
+    long double rollout_width_predicted_gain = 0.0L;
+    long double root_alternative_direct_gain = 0.0L;
+    long double root_alternative_future_mean = 0.0L;
+    long double root_alternative_margin = 0.0L;
+    long double root_expanded_predicted_gain = 0.0L;
+    long double root_confirmation_screen_gain = 0.0L;
+    long double root_confirmation_holdout_margin = 0.0L;
+    long double root_confirmation_approved_margin = 0.0L;
+    long double root_confirmation_rejected_margin = 0.0L;
+};
+
+struct RescueTargetSeed {
+    int shape_index = -1;
+    int base_x = 0;
+    int base_y = 0;
+    int occupied_cells = 0;
+    long double fractional_move_cost = 0.0L;
+    long long order = 0;
+};
+
+struct RescueTarget {
+    vector<Cell> cells;
+    uint64_t region_hash = 0;
+    vector<int> blockers;
+    int perimeter = 0;
+    ll movement_cost = 0;
+    ll immediate_improvement = 0;
+    long long order = 0;
+};
+
+vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
+                                         const vector<GroupState> &groups, int arrival_id, int r_milli,
+                                         const ArrivalDecision &baseline,
+                                         const vector<vector<Shape>> &compact_shapes,
+                                         RescueDiagnostics &diagnostics) {
+    int n = park.size();
+    const GroupState &arrival = groups[arrival_id];
+    const vector<Shape> &shapes = compact_shapes[arrival.p];
+    int minimum_perimeter = shapes.front().perimeter;
+    ll compact_fee = round_payment(arrival.v, arrival.p, minimum_perimeter);
+
+    vector<char> pond(n * n, false);
+    vector<vi> occupied_prefix(n + 1, vi(n + 1));
+    vector<vector<long double>> fractional_prefix(n + 1, vector<long double>(n + 1));
+    for (int x = 0; x < n; x++) {
+        for (int y = 0; y < n; y++) {
+            pond[x * n + y] = park[x][y] == '#';
+            int id = owner[x][y];
+            long double fractional =
+                id == -1 ? 0.0L : (long double)move_cost(groups[id].v, r_milli) / groups[id].p;
+            occupied_prefix[x + 1][y + 1] =
+                (id != -1) + occupied_prefix[x][y + 1] + occupied_prefix[x + 1][y] - occupied_prefix[x][y];
+            fractional_prefix[x + 1][y + 1] =
+                fractional + fractional_prefix[x][y + 1] + fractional_prefix[x + 1][y] -
+                fractional_prefix[x][y];
+        }
+    }
+    vector<vi> pond_prefix = make_flag_prefix(pond, n);
+
+    vector<RescueTargetSeed> seeds;
+    long long order = 0;
+    for (int shape_index = 0; shape_index < (int)shapes.size(); shape_index++) {
+        const Shape &shape = shapes[shape_index];
+        if (shape.perimeter != minimum_perimeter) break;
+        for (int base_x = 0; base_x + shape.h <= n; base_x++) {
+            for (int base_y = 0; base_y + shape.w <= n; base_y++) {
+                diagnostics.target_anchors++;
+                const Rect &a = shape.main_rect;
+                const Rect &b = shape.extra_rect;
+                if (rectangle_sum(pond_prefix, base_x + a.x, base_y + a.y, a.h, a.w) != 0 ||
+                    rectangle_sum(pond_prefix, base_x + b.x, base_y + b.y, b.h, b.w) != 0) {
+                    continue;
+                }
+                int occupied = rectangle_sum(occupied_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
+                               rectangle_sum(occupied_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
+                long double fractional =
+                    rectangle_sum(fractional_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
+                    rectangle_sum(fractional_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
+                seeds.push_back({shape_index, base_x, base_y, occupied, fractional, order++});
+            }
+        }
+    }
+
+    vector<int> shortlisted;
+    auto add_shortlist = [&](auto less) {
+        vector<int> indices(seeds.size());
+        iota(indices.begin(), indices.end(), 0);
+        int keep = min(RESCUE_TARGET_SHORTLIST_PER_METRIC, (int)indices.size());
+        partial_sort(indices.begin(), indices.begin() + keep, indices.end(),
+                     [&](int lhs, int rhs) { return less(seeds[lhs], seeds[rhs]); });
+        indices.resize(keep);
+        shortlisted.insert(shortlisted.end(), indices.begin(), indices.end());
+    };
+    add_shortlist([](const RescueTargetSeed &lhs, const RescueTargetSeed &rhs) {
+        return tie(lhs.occupied_cells, lhs.fractional_move_cost, lhs.order) <
+               tie(rhs.occupied_cells, rhs.fractional_move_cost, rhs.order);
+    });
+    add_shortlist([](const RescueTargetSeed &lhs, const RescueTargetSeed &rhs) {
+        return tie(lhs.fractional_move_cost, lhs.occupied_cells, lhs.order) <
+               tie(rhs.fractional_move_cost, rhs.occupied_cells, rhs.order);
+    });
+    sort(shortlisted.begin(), shortlisted.end());
+    shortlisted.erase(unique(shortlisted.begin(), shortlisted.end()), shortlisted.end());
+    diagnostics.target_shortlisted += shortlisted.size();
+
+    vector<RescueTarget> result;
+    vector<int> seen(groups.size(), -1);
+    int stamp = 0;
+    for (int seed_index : shortlisted) {
+        const RescueTargetSeed &seed = seeds[seed_index];
+        vector<Cell> cells =
+            materialize_shape(shapes[seed.shape_index], seed.base_x, seed.base_y, arrival.p);
+        vector<int> blockers;
+        stamp++;
+        for (auto [x, y] : cells) {
+            int id = owner[x][y];
+            if (id != -1 && seen[id] != stamp) {
+                seen[id] = stamp;
+                blockers.push_back(id);
+            }
+        }
+        // A no-blocker minimum template would have been found by the normal
+        // compact enumeration, so it is not a relocation action.
+        if (blockers.empty()) continue;
+        sort(blockers.begin(), blockers.end());
+        ll movement_cost_sum = 0;
+        for (int id : blockers) movement_cost_sum += move_cost(groups[id].v, r_milli);
+        diagnostics.exact_targets++;
+        ll improvement = compact_fee - baseline.fee - movement_cost_sum;
+        if (improvement <= 0) continue;
+        diagnostics.economic_targets++;
+
+        uint64_t region_hash = placement_region_hash(cells);
+        bool duplicate = false;
+        for (const RescueTarget &existing : result) {
+            if (existing.region_hash == region_hash && same_region(existing.cells, cells)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        result.push_back({std::move(cells), region_hash, std::move(blockers), minimum_perimeter,
+                          movement_cost_sum, improvement, seed.order});
+    }
+
+    sort(result.begin(), result.end(), [](const RescueTarget &lhs, const RescueTarget &rhs) {
+        if (lhs.immediate_improvement != rhs.immediate_improvement) {
+            return lhs.immediate_improvement > rhs.immediate_improvement;
+        }
+        if (lhs.blockers.size() != rhs.blockers.size()) return lhs.blockers.size() < rhs.blockers.size();
+        return lhs.order < rhs.order;
+    });
+    return result;
+}
+
+struct RescueDestination {
+    vector<Cell> cells;
+    BoardMask mask{};
+    int perimeter = 0;
+    int fallback_overlap = 0;
+    int cleared_overlap = 0;
+    int quadrant = 0;
+    long double temporal_cost = 0.0L;
+    long long order = 0;
+};
+
+long double rescue_destination_temporal_cost(const vector<Cell> &cells, const BoardMask &cell_mask,
+                                             const vs &park, const vvi &base_owner,
+                                             const vector<GroupState> &groups, int mover_id, int arrival_id,
+                                             ll current_s, long double theta) {
+    int n = park.size();
+    auto level = [&](int id) {
+        long double remaining = max(0LL, groups[id].t - current_s);
+        return -expm1l(-remaining / theta);
+    };
+    long double mover_level = level(mover_id);
+    long double result = 0.0L;
+    constexpr int DX[4] = {-1, 1, 0, 0};
+    constexpr int DY[4] = {0, 0, -1, 1};
+    for (auto [x, y] : cells) {
+        for (int dir = 0; dir < 4; dir++) {
+            int nx = x + DX[dir];
+            int ny = y + DY[dir];
+            if (!inside(nx, ny, n, n) || park[nx][ny] == '#') continue;
+            int index = nx * n + ny;
+            if ((cell_mask[index >> 6] >> (index & 63)) & 1ULL) continue;
+            int neighbor = base_owner[nx][ny];
+            long double neighbor_level = neighbor == -1 ? 0.0L : level(neighbor == arrival_id ? arrival_id : neighbor);
+            result += fabsl(mover_level - neighbor_level);
+        }
+    }
+    return result;
+}
+
+vector<RescueDestination> make_rescue_destinations(
+    const vs &park, const vvi &base_owner, const vector<GroupState> &groups, int mover_id, int arrival_id,
+    ll current_s, long double theta, const vector<Cell> &baseline_cells, const vector<char> &cleared_mask,
+    const vector<vector<Shape>> &all_shapes, int &remaining_destination_anchors,
+    RescueDiagnostics &diagnostics) {
+    int n = park.size();
+    const GroupState &group = groups[mover_id];
+    vector<vi> blocked_prefix = make_blocked_prefix(park, base_owner);
+    vector<char> fallback_mask(n * n, false);
+    for (auto [x, y] : baseline_cells) fallback_mask[x * n + y] = true;
+    vector<vi> fallback_prefix = make_flag_prefix(fallback_mask, n);
+    vector<vi> cleared_prefix = make_flag_prefix(cleared_mask, n);
+
+    const vector<Shape> &shapes = all_shapes[group.p];
+    ll previous_fee = round_payment(group.v, group.p, group.max_perimeter);
+    vector<int> eligible_shapes;
+    for (int shape_index = 0; shape_index < (int)shapes.size(); shape_index++) {
+        ll next_fee = round_payment(group.v, group.p, max(group.max_perimeter, shapes[shape_index].perimeter));
+        if (next_fee == previous_fee) eligible_shapes.push_back(shape_index);
+    }
+    if (eligible_shapes.empty()) return {};
+
+    vector<int> samples(eligible_shapes.size());
+    vector<int> anchor_counts(eligible_shapes.size());
+    vector<int> starts(eligible_shapes.size());
+    vector<int> strides(eligible_shapes.size());
+    for (int index = 0; index < (int)eligible_shapes.size(); index++) {
+        const Shape &shape = shapes[eligible_shapes[index]];
+        int count = (n - shape.h + 1) * (n - shape.w + 1);
+        anchor_counts[index] = count;
+        starts[index] = (int)(((long long)(arrival_id + 1) * 1009 + (long long)(mover_id + 1) * 9176 +
+                               (long long)(eligible_shapes[index] + 1) * 6113) %
+                              count);
+        int stride = max(1, count / 2 + 1 + index % 11);
+        while (gcd(stride, count) != 1) stride++;
+        strides[index] = stride;
+    }
+
+    vector<RescueDestination> legal;
+    long long local_order = 0;
+    int sampled_anchors = 0;
+    while (remaining_destination_anchors > 0 && sampled_anchors < RESCUE_DESTINATION_ANCHOR_LIMIT &&
+           (int)legal.size() < RESCUE_DESTINATION_LEGAL_LIMIT) {
+        bool progressed = false;
+        for (int index = 0; index < (int)eligible_shapes.size(); index++) {
+            if (remaining_destination_anchors == 0 ||
+                sampled_anchors >= RESCUE_DESTINATION_ANCHOR_LIMIT ||
+                (int)legal.size() >= RESCUE_DESTINATION_LEGAL_LIMIT) {
+                break;
+            }
+            if (samples[index] >= anchor_counts[index]) continue;
+            progressed = true;
+            const Shape &shape = shapes[eligible_shapes[index]];
+            int columns = n - shape.w + 1;
+            int flat = (starts[index] + (long long)samples[index] * strides[index]) % anchor_counts[index];
+            samples[index]++;
+            sampled_anchors++;
+            remaining_destination_anchors--;
+            if (remaining_destination_anchors == 0) diagnostics.destination_limit_exhausted++;
+            diagnostics.destination_anchors++;
+            int base_x = flat / columns;
+            int base_y = flat % columns;
+            const Rect &a = shape.main_rect;
+            const Rect &b = shape.extra_rect;
+            if (rectangle_sum(blocked_prefix, base_x + a.x, base_y + a.y, a.h, a.w) != 0 ||
+                rectangle_sum(blocked_prefix, base_x + b.x, base_y + b.y, b.h, b.w) != 0) {
+                continue;
+            }
+
+            vector<Cell> cells = materialize_shape(shape, base_x, base_y, group.p);
+            if (same_region(cells, group.cells)) continue;
+            uint64_t hash = placement_region_hash(cells);
+            bool duplicate = false;
+            for (const RescueDestination &existing : legal) {
+                if (placement_region_hash(existing.cells) == hash && same_region(existing.cells, cells)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+
+            int fallback_overlap = rectangle_sum(fallback_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
+                                   rectangle_sum(fallback_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
+            int cleared_overlap = rectangle_sum(cleared_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
+                                  rectangle_sum(cleared_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
+            int lower_half = 2 * base_x + shape.h >= n;
+            int right_half = 2 * base_y + shape.w >= n;
+            BoardMask mask = make_board_mask(cells, n);
+            long double temporal_cost = rescue_destination_temporal_cost(
+                cells, mask, park, base_owner, groups, mover_id, arrival_id, current_s, theta);
+            legal.push_back({std::move(cells), mask, shape.perimeter, fallback_overlap, cleared_overlap,
+                             2 * lower_half + right_half, temporal_cost, local_order++});
+            diagnostics.destination_candidates++;
+        }
+        if (!progressed) break;
+    }
+
+    auto better = [](const RescueDestination &lhs, const RescueDestination &rhs) {
+        if (lhs.fallback_overlap != rhs.fallback_overlap) return lhs.fallback_overlap > rhs.fallback_overlap;
+        if (lhs.cleared_overlap != rhs.cleared_overlap) return lhs.cleared_overlap > rhs.cleared_overlap;
+        if (lhs.temporal_cost != rhs.temporal_cost) return lhs.temporal_cost < rhs.temporal_cost;
+        if (lhs.perimeter != rhs.perimeter) return lhs.perimeter < rhs.perimeter;
+        return lhs.order < rhs.order;
+    };
+    sort(legal.begin(), legal.end(), better);
+
+    vector<RescueDestination> result;
+    auto add = [&](const RescueDestination &candidate) {
+        for (const RescueDestination &existing : result) {
+            if (same_region(existing.cells, candidate.cells)) return;
+        }
+        result.push_back(candidate);
+    };
+    for (int index = 0; index < min(4, (int)legal.size()); index++) add(legal[index]);
+    for (int quadrant = 0; quadrant < 4; quadrant++) {
+        auto it = find_if(legal.begin(), legal.end(),
+                          [&](const RescueDestination &candidate) { return candidate.quadrant == quadrant; });
+        if (it != legal.end()) add(*it);
+    }
+    for (const RescueDestination &candidate : legal) {
+        if ((int)result.size() == RESCUE_DESTINATION_LIMIT) break;
+        add(candidate);
+    }
+    if ((int)result.size() > RESCUE_DESTINATION_LIMIT) result.resize(RESCUE_DESTINATION_LIMIT);
+    return result;
+}
+
+struct RescueBeamState {
+    BoardMask occupied{};
+    vector<int> choice;
+    long double rank = 0.0L;
+    long long order = 0;
+};
+
+optional<vector<int>> repair_rescue_blockers(const vvi &base_owner, const vector<GroupState> &groups,
+                                             const vector<int> &blockers,
+                                             const vector<vector<RescueDestination>> &pools,
+                                             int &remaining_nodes, RescueDiagnostics &diagnostics) {
+    int blocker_count = blockers.size();
+    vector<vector<int>> orders;
+    auto add_order = [&](vector<int> order) {
+        for (const vector<int> &existing : orders) {
+            if (existing == order) return;
+        }
+        orders.push_back(std::move(order));
+    };
+    vector<int> indices(blocker_count);
+    iota(indices.begin(), indices.end(), 0);
+    sort(indices.begin(), indices.end(), [&](int lhs, int rhs) {
+        if (pools[lhs].size() != pools[rhs].size()) return pools[lhs].size() < pools[rhs].size();
+        if (groups[blockers[lhs]].p != groups[blockers[rhs]].p) {
+            return groups[blockers[lhs]].p > groups[blockers[rhs]].p;
+        }
+        return blockers[lhs] < blockers[rhs];
+    });
+    add_order(indices);
+    sort(indices.begin(), indices.end(), [&](int lhs, int rhs) {
+        if (groups[blockers[lhs]].p != groups[blockers[rhs]].p) {
+            return groups[blockers[lhs]].p > groups[blockers[rhs]].p;
+        }
+        return blockers[lhs] < blockers[rhs];
+    });
+    add_order(indices);
+    sort(indices.begin(), indices.end(),
+         [&](int lhs, int rhs) { return tie(groups[blockers[lhs]].t, blockers[lhs]) <
+                                        tie(groups[blockers[rhs]].t, blockers[rhs]); });
+    add_order(indices);
+    reverse(indices.begin(), indices.end());
+    add_order(indices);
+
+    BoardMask base_mask = make_occupied_mask(base_owner);
+    // Try every deterministic spine before spending any beam nodes.  Thus an
+    // exhausted first beam cannot hide an easy arbitrary-depth solution under
+    // a different insertion order.
+    for (const vector<int> &insertion_order : orders) {
+        BoardMask greedy_mask = base_mask;
+        vector<int> greedy_choice(blocker_count, -1);
+        bool greedy_complete = true;
+        for (int pool_index : insertion_order) {
+            bool placed = false;
+            for (int candidate_index = 0; candidate_index < (int)pools[pool_index].size(); candidate_index++) {
+                const RescueDestination &candidate = pools[pool_index][candidate_index];
+                if (masks_overlap(greedy_mask, candidate.mask)) continue;
+                merge_mask(greedy_mask, candidate.mask);
+                greedy_choice[pool_index] = candidate_index;
+                placed = true;
+                break;
+            }
+            if (!placed) {
+                greedy_complete = false;
+                break;
+            }
+        }
+        if (greedy_complete) return greedy_choice;
+    }
+
+    // The bounded beam only repairs greedy collisions; it is not the only path
+    // capable of reaching the full blocker depth.
+    long long state_order = 0;
+    for (const vector<int> &insertion_order : orders) {
+        vector<RescueBeamState> beam(1);
+        beam.front().occupied = base_mask;
+        beam.front().choice.assign(blocker_count, -1);
+        bool exhausted = false;
+        for (int position = 0; position < blocker_count; position++) {
+            int pool_index = insertion_order[position];
+            vector<RescueBeamState> next;
+            for (const RescueBeamState &state : beam) {
+                for (int candidate_index = 0; candidate_index < (int)pools[pool_index].size(); candidate_index++) {
+                    const RescueDestination &candidate = pools[pool_index][candidate_index];
+                    if (masks_overlap(state.occupied, candidate.mask)) continue;
+                    if (remaining_nodes == 0) {
+                        exhausted = true;
+                        break;
+                    }
+                    remaining_nodes--;
+                    diagnostics.beam_nodes++;
+                    RescueBeamState child = state;
+                    merge_mask(child.occupied, candidate.mask);
+                    child.choice[pool_index] = candidate_index;
+                    child.rank += 1000.0L * candidate.fallback_overlap + 10.0L * candidate.cleared_overlap -
+                                  candidate.temporal_cost - 0.01L * candidate.perimeter;
+                    child.order = state_order++;
+                    next.push_back(std::move(child));
+                }
+                if (exhausted) break;
+            }
+            if (next.empty()) {
+                beam.clear();
+                break;
+            }
+            sort(next.begin(), next.end(), [](const RescueBeamState &lhs, const RescueBeamState &rhs) {
+                if (lhs.rank != rhs.rank) return lhs.rank > rhs.rank;
+                return lhs.order < rhs.order;
+            });
+            if ((int)next.size() > RESCUE_BEAM_WIDTH) next.resize(RESCUE_BEAM_WIDTH);
+            beam = std::move(next);
+            if (exhausted) break;
+        }
+        if (!beam.empty() && count(beam.front().choice.begin(), beam.front().choice.end(), -1) == 0) {
+            return beam.front().choice;
+        }
+        if (exhausted) break;
+    }
+    return nullopt;
+}
+
+bool validate_and_build_rescue_owner(const TurnPlan &plan, const vs &park, const vvi &owner,
+                                     const vector<GroupState> &groups, int arrival_id, int r_milli,
+                                     vvi &final_owner, ll &fee_loss, ll &movement_cost_sum) {
+    if (plan.moves.empty() || !plan.arrival || groups[arrival_id].active) return false;
+    int n = park.size();
+    vector<char> moved(groups.size(), false);
+    final_owner = owner;
+    for (const MovePlan &move : plan.moves) {
+        if (move.id < 0 || move.id >= (int)groups.size() || moved[move.id] || !groups[move.id].active) {
+            return false;
+        }
+        moved[move.id] = true;
+        const GroupState &group = groups[move.id];
+        if ((int)group.cells.size() != group.p) return false;
+        for (auto [x, y] : group.cells) {
+            if (!inside(x, y, n, n) || final_owner[x][y] != move.id) return false;
+        }
+    }
+    for (const MovePlan &move : plan.moves) clear_cells(final_owner, groups[move.id].cells);
+
+    auto region_is_legal = [&](const vector<Cell> &cells, int expected_size) {
+        if ((int)cells.size() != expected_size || !validate_connected_region(cells, n)) return false;
+        for (auto [x, y] : cells) {
+            if (!inside(x, y, n, n) || park[x][y] != '.' || final_owner[x][y] != -1) return false;
+        }
+        return true;
+    };
+
+    fee_loss = 0;
+    movement_cost_sum = 0;
+    for (const MovePlan &move : plan.moves) {
+        const GroupState &group = groups[move.id];
+        if (!region_is_legal(move.cells, group.p) || same_region(move.cells, group.cells)) return false;
+        int perimeter = calc_perimeter(move.cells, n);
+        if (perimeter != move.perimeter) return false;
+        ll previous_fee = round_payment(group.v, group.p, group.max_perimeter);
+        ll next_fee = round_payment(group.v, group.p, max(group.max_perimeter, perimeter));
+        fee_loss += previous_fee - next_fee;
+        movement_cost_sum += move_cost(group.v, r_milli);
+        place_cells(final_owner, move.cells, move.id);
+    }
+
+    const GroupState &arrival = groups[arrival_id];
+    if (!region_is_legal(*plan.arrival, arrival.p) ||
+        calc_perimeter(*plan.arrival, n) != plan.arrival_perimeter) {
+        return false;
+    }
+    ll expected_gain = round_payment(arrival.v, arrival.p, plan.arrival_perimeter) - movement_cost_sum;
+    place_cells(final_owner, *plan.arrival, arrival_id);
+    return expected_gain == plan.immediate_gain;
+}
+
+struct RescueSyntheticArrival {
     ll s = 0;
     ll t = 0;
     int p = 0;
@@ -1910,7 +2158,7 @@ struct CleanupSyntheticArrival {
     int remaining_after = 0;
 };
 
-long double cleanup_radical_inverse(uint64_t index, int base) {
+long double rescue_radical_inverse(uint64_t index, int base) {
     long double inverse_base = 1.0L / base;
     long double place = inverse_base;
     long double result = 0.0L;
@@ -1922,22 +2170,31 @@ long double cleanup_radical_inverse(uint64_t index, int base) {
     return clamp(result, 1e-9L, 1.0L - 1e-9L);
 }
 
-uint64_t cleanup_sequence_offset(const vector<GroupState> &groups, int arrival_id, ll current_s) {
+uint64_t rescue_sequence_offset(const vector<GroupState> &groups, int arrival_id, ll current_s) {
     uint64_t value = (uint64_t)(arrival_id + 1) * 0x9e3779b97f4a7c15ULL;
     value ^= (uint64_t)current_s + 0xbf58476d1ce4e5b9ULL;
     value ^= (uint64_t)groups[arrival_id].v * 0x94d049bb133111ebULL;
     value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
     value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
-    return (value ^ (value >> 31)) % 1000003ULL;
+    return (value ^ (value >> 31)) % ROOT_ROLLOUT_SEQUENCE_BLOCK_SIZE;
 }
 
-array<vector<CleanupSyntheticArrival>, CLEANUP_ROLLOUT_SCENARIO_COUNT> make_cleanup_rollout_scenarios(
+struct RescueRolloutScenarios {
+    vector<vector<RescueSyntheticArrival>> arrivals;
+    bool complete = true;
+};
+
+RescueRolloutScenarios make_rescue_rollout_scenarios(
     const vector<GroupState> &groups, int arrival_id, ll current_s, int remaining_groups, long double theta,
-    const ThetaEstimator &theta_estimator) {
-    // Generate every remaining sample first, sort by start time, then take the
-    // first 48.  Stopping generation at 48 would bias the chronological prefix.
-    array<vector<CleanupSyntheticArrival>, CLEANUP_ROLLOUT_SCENARIO_COUNT> scenarios;
-    if (remaining_groups <= 0) return scenarios;
+    const ThetaEstimator &theta_estimator, int scenario_count = ROOT_SCREEN_SCENARIO_COUNT,
+    int rollout_horizon = ROOT_SCREEN_ROLLOUT_LENGTH, bool posterior_predictive = false, int batch = 0) {
+    RescueRolloutScenarios result;
+    if (scenario_count <= 0 || scenario_count % 2 != 0 || rollout_horizon < 0 || batch < 0) {
+        result.complete = false;
+        return result;
+    }
+    result.arrivals.resize(scenario_count);
+    if (remaining_groups <= 0 || rollout_horizon == 0) return result;
 
     struct RawArrival {
         ll s;
@@ -1947,11 +2204,27 @@ array<vector<CleanupSyntheticArrival>, CLEANUP_ROLLOUT_SCENARIO_COUNT> make_clea
         long long order;
     };
 
-    ConditionalFutureDemand future_demand(current_s, theta);
-    uint64_t sequence_offset = cleanup_sequence_offset(groups, arrival_id, current_s);
+    uint64_t sequence_offset = rescue_sequence_offset(groups, arrival_id, current_s);
     const long double size_width = sqrtl(150.0L) - 2.0L;
 
-    for (int scenario = 0; scenario < CLEANUP_ROLLOUT_SCENARIO_COUNT; scenario++) {
+    for (int scenario = 0; scenario < scenario_count; scenario++) {
+        int pair_index = scenario / 2;
+        bool antithetic = scenario % 2 == 1;
+        // A sampled latent theta controls only future-input generation.  The
+        // online policy's theta stored in each spec is still re-estimated below.
+        long double generation_theta = theta;
+        if (posterior_predictive) {
+            long double pair_quantile = (2.0L * pair_index + 1.0L) / scenario_count;
+            generation_theta =
+                theta_estimator.posterior_quantile(current_s, remaining_groups, pair_quantile);
+        }
+        ConditionalFutureDemand future_demand(current_s, generation_theta);
+        // Batch 0 / pair 0 is exactly the legacy screen sequence.  Confirmation
+        // uses batch 1 and four disjoint blocks, one per antithetic pair.
+        uint64_t sequence_block =
+            (uint64_t)batch * ROOT_ROLLOUT_SEQUENCE_BLOCKS_PER_BATCH + pair_index;
+        uint64_t sequence_block_offset = sequence_block * ROOT_ROLLOUT_SEQUENCE_BLOCK_SIZE;
+
         set<ll> used_times;
         for (int id = 0; id <= arrival_id; id++) {
             used_times.insert(groups[id].s);
@@ -1962,10 +2235,10 @@ array<vector<CleanupSyntheticArrival>, CLEANUP_ROLLOUT_SCENARIO_COUNT> make_clea
         generated.reserve(remaining_groups);
         int maximum_attempts = 8 * remaining_groups + 64;
         for (int attempt = 0; (int)generated.size() < remaining_groups && attempt < maximum_attempts; attempt++) {
-            uint64_t index = sequence_offset + attempt + 1;
+            uint64_t index = sequence_offset + sequence_block_offset + attempt + 1;
             auto quantile = [&](int base) {
-                long double value = cleanup_radical_inverse(index, base);
-                return scenario == 0 ? value : 1.0L - value;
+                long double value = rescue_radical_inverse(index, base);
+                return antithetic ? 1.0L - value : value;
             };
             long double duration_quantile = quantile(2);
             long double start_quantile = quantile(3);
@@ -2006,12 +2279,16 @@ array<vector<CleanupSyntheticArrival>, CLEANUP_ROLLOUT_SCENARIO_COUNT> make_clea
             long double noise = 0.8L * inverse_standard_normal(value_quantile);
             long double raw_v = p * powl((long double)duration, 0.9L) * exp2l(noise);
             ll v = clamp((ll)llroundl(raw_v), 1LL, 100000000LL);
-            if (used_times.count(start) || used_times.count(end)) {
-                continue;
-            }
+            if (used_times.count(start) || used_times.count(end)) continue;
             used_times.insert(start);
             used_times.insert(end);
             generated.push_back({start, end, p, v, attempt});
+        }
+        // The rollout needs the chronological prefix among all remaining
+        // groups.  A prefix of a partial sample would be biased toward later S.
+        if ((int)generated.size() != remaining_groups) {
+            result.complete = false;
+            return result;
         }
 
         sort(generated.begin(), generated.end(), [](const RawArrival &lhs, const RawArrival &rhs) {
@@ -2021,29 +2298,27 @@ array<vector<CleanupSyntheticArrival>, CLEANUP_ROLLOUT_SCENARIO_COUNT> make_clea
         });
 
         ThetaEstimator rollout_theta_estimator = theta_estimator;
-        int rollout_length = min(CLEANUP_ROLLOUT_LENGTH, remaining_groups);
+        int rollout_length = min(rollout_horizon, remaining_groups);
         for (const RawArrival &raw : generated) {
-            int remaining_after = remaining_groups - (int)scenarios[scenario].size() - 1;
+            int remaining_after = remaining_groups - (int)result.arrivals[scenario].size() - 1;
             rollout_theta_estimator.observe(raw.t - raw.s);
             long double rollout_theta = rollout_theta_estimator.estimate(raw.s, remaining_after);
-            scenarios[scenario].push_back({raw.s, raw.t, raw.p, raw.v, rollout_theta, remaining_after});
-            if ((int)scenarios[scenario].size() == rollout_length) {
-                break;
-            }
+            result.arrivals[scenario].push_back({raw.s, raw.t, raw.p, raw.v, rollout_theta, remaining_after});
+            if ((int)result.arrivals[scenario].size() == rollout_length) break;
         }
     }
-    return scenarios;
+    return result;
 }
 
-struct CleanupRolloutState {
+struct RescueRolloutState {
     vvi owner;
     vector<GroupState> groups;
     priority_queue<pair<ll, int>, vector<pair<ll, int>>, greater<pair<ll, int>>> departures;
 };
 
-CleanupRolloutState make_cleanup_rollout_state(const vvi &final_owner, const vector<GroupState> &groups, int arrival_id,
-                                               const TurnPlan &plan, int synthetic_count) {
-    CleanupRolloutState state;
+RescueRolloutState make_rescue_rollout_state(const vvi &final_owner, const vector<GroupState> &groups,
+                                             int arrival_id, const TurnPlan &plan, int synthetic_count) {
+    RescueRolloutState state;
     state.owner = final_owner;
     state.groups = groups;
     state.groups.reserve(state.groups.size() + synthetic_count);
@@ -2059,23 +2334,26 @@ CleanupRolloutState make_cleanup_rollout_state(const vvi &final_owner, const vec
         arrival.max_perimeter = plan.arrival_perimeter;
     }
     for (int id = 0; id < (int)state.groups.size(); id++) {
-        if (state.groups[id].active) {
-            state.departures.emplace(state.groups[id].t, id);
-        }
+        if (state.groups[id].active) state.departures.emplace(state.groups[id].t, id);
     }
     return state;
 }
 
-ll evaluate_cleanup_rollout_branch(const vs &park, const vvi &final_owner, const vector<GroupState> &groups,
-                                   int arrival_id, const TurnPlan &plan,
-                                   const vector<CleanupSyntheticArrival> &scenario, int grass_cells,
-                                   const DensityModel &density_model, const vector<vector<Shape>> &compact_shapes,
-                                   CleanupDiagnostics &diagnostics) {
-    // Rollout arrivals follow the ordinary shadow-price admission and placement
-    // policy.  They never trigger another relocation inside the simulation.
-    CleanupRolloutState state = make_cleanup_rollout_state(final_owner, groups, arrival_id, plan, scenario.size());
-    ll result = 0;
-    for (const CleanupSyntheticArrival &spec : scenario) {
+struct RescueRolloutOutcome {
+    ll fee = 0;
+    int acceptances = 0;
+};
+
+RescueRolloutOutcome evaluate_rescue_rollout_branch(
+    const vs &park, const vvi &final_owner, const vector<GroupState> &groups, int arrival_id,
+    const TurnPlan &plan, const vector<RescueSyntheticArrival> &scenario, int grass_cells,
+    const DensityModel &density_model, const vector<vector<Shape>> &compact_shapes) {
+    // Future arrivals use the ordinary online policy and never recurse into
+    // rescue.  Only their realized fees are compared between the two roots.
+    RescueRolloutState state =
+        make_rescue_rollout_state(final_owner, groups, arrival_id, plan, scenario.size());
+    RescueRolloutOutcome result;
+    for (const RescueSyntheticArrival &spec : scenario) {
         while (!state.departures.empty() && state.departures.top().first < spec.s) {
             int id = state.departures.top().second;
             state.departures.pop();
@@ -2093,12 +2371,12 @@ ll evaluate_cleanup_rollout_branch(const vs &park, const vvi &final_owner, const
         synthetic.v = spec.v;
         synthetic.p = spec.p;
 
-        ShadowEvaluation shadow = evaluate_shadow_cost(state.groups, spec.s, spec.t, spec.p, spec.remaining_after,
-                                                       grass_cells, spec.theta, density_model);
-        CleanupArrivalDecision decision = evaluate_cleanup_arrival_decision(
+        ShadowEvaluation shadow = evaluate_shadow_cost(state.groups, spec.s, spec.t, spec.p,
+                                                       spec.remaining_after, grass_cells, spec.theta,
+                                                       density_model);
+        ArrivalDecision decision = evaluate_arrival_decision(
             park, state.owner, state.groups, synthetic_id, spec.s, spec.remaining_after, spec.theta,
             shadow.opportunity_cost, compact_shapes);
-        diagnostics.rollout_policy_steps++;
         if (!decision.cells) continue;
 
         place_cells(state.owner, *decision.cells, synthetic_id);
@@ -2106,331 +2384,695 @@ ll evaluate_cleanup_rollout_branch(const vs &park, const vvi &final_owner, const
         synthetic.cells = *decision.cells;
         synthetic.max_perimeter = decision.perimeter;
         state.departures.emplace(spec.t, synthetic_id);
-        result += decision.fee;
-        diagnostics.rollout_acceptances++;
+        result.fee += decision.fee;
+        result.acceptances++;
     }
     return result;
 }
 
-struct PreparedCleanupCandidate {
-    MovePlan move;
-    vvi moved_owner;
-    ll movement_cost = 0;
-    ll fee_loss = 0;
-    long double pre_arrival_gain = 0.0L;
-    long long order = 0;
+struct RootBranchView {
+    const TurnPlan *plan = nullptr;
+    const vvi *final_owner = nullptr;
+    ll direct_vs_baseline = 0;
 };
 
-struct ProactiveCleanupResult {
-    TurnPlan plan;
-    CleanupArrivalDecision arrival_decision;
-};
+bool confirm_root_override(
+    const vs &park, const vector<GroupState> &groups, int arrival_id, ll current_s, int remaining_groups,
+    long double theta, const ThetaEstimator &theta_estimator, int grass_cells,
+    const DensityModel &density_model, const vector<vector<Shape>> &compact_shapes,
+    const RootBranchView &protected_branch, const RootBranchView &challenger_branch,
+    int &confirmations_used, RescueDiagnostics &diagnostics) {
+    assert(protected_branch.plan != nullptr && protected_branch.final_owner != nullptr);
+    assert(challenger_branch.plan != nullptr && challenger_branch.final_owner != nullptr);
+    if (confirmations_used >= ROOT_CONFIRMATION_TURN_LIMIT) {
+        diagnostics.root_confirmation_budget_skips++;
+        return false;
+    }
+    confirmations_used++;
+    diagnostics.root_confirmation_attempts++;
 
-optional<ProactiveCleanupResult> try_proactive_cleanup(
-    const vs &park, const vvi &owner, const vector<GroupState> &groups, int arrival_id, ll current_s,
-    int remaining_groups, int r_milli, long double theta, const ThetaEstimator &theta_estimator,
-    const DensityModel &density_model, int grass_cells, long double opportunity_cost,
-    const CleanupArrivalDecision &baseline_arrival, const vector<char> &fresh_mask,
-    const vector<vector<Shape>> &compact_shapes, const FutureSpaceValueModel &space_value_model,
-    CleanupDiagnostics &diagnostics) {
-    // Phase 1 cheaply ranks legal moves by the current pre-arrival board.
-    // Phase 2 compares the best two against the no-move branch using identical
-    // synthetic futures; the cheap score itself is not part of the final gain.
-    if (diagnostics.rollout_used) {
-        diagnostics.rollout_reuse_blocked++;
-        return nullopt;
-    }
-    if (diagnostics.attempts >= CLEANUP_SEARCH_LIMIT) {
-        diagnostics.search_budget_exhausted++;
-        return nullopt;
-    }
-    if (diagnostics.candidate_evaluations >= CLEANUP_CANDIDATE_EVALUATION_LIMIT) {
-        diagnostics.evaluation_budget_exhausted++;
-        return nullopt;
-    }
-    int n = park.size();
-    int fresh_available = 0;
-    for (int x = 0; x < n; x++) {
-        for (int y = 0; y < n; y++) {
-            if (fresh_mask[x * n + y] && owner[x][y] == -1) {
-                fresh_available++;
-            }
-        }
-    }
-    if (fresh_available < 4) return nullopt;
-    diagnostics.attempts++;
-
-    FreeComponents components = label_free_components(park, owner);
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-    vector<CleanupMoverCandidate> movers;
-    for (int id = 0; id < arrival_id; id++) {
-        const GroupState &group = groups[id];
-        if (!group.active || group.t <= current_s ||
-            fresh_available * CLEANUP_FRESH_OVERLAP_DENOMINATOR < group.p * CLEANUP_FRESH_OVERLAP_NUMERATOR) {
-            continue;
-        }
-        vector<int> adjacent_components;
-        for (auto [x, y] : group.cells) {
-            for (int dir = 0; dir < 4; dir++) {
-                int nx = x + DX[dir];
-                int ny = y + DY[dir];
-                if (!inside(nx, ny, n, n)) continue;
-                int component = components.id[nx][ny];
-                if (component == -1 || find(adjacent_components.begin(), adjacent_components.end(), component) !=
-                                           adjacent_components.end()) {
-                    continue;
-                }
-                adjacent_components.push_back(component);
-            }
-        }
-        int neighbor_sum = 0;
-        int largest_neighbor = 0;
-        for (int component : adjacent_components) {
-            neighbor_sum += components.size[component];
-            chmax(largest_neighbor, components.size[component]);
-        }
-        int unlocked_size = group.p + neighbor_sum;
-        int merged_gain = unlocked_size - largest_neighbor;
-        int current_perimeter = calc_perimeter(group.cells, n);
-        int minimum_perimeter = compact_shapes[group.p].front().perimeter;
-        movers.push_back({id, merged_gain, unlocked_size, max(0, current_perimeter - minimum_perimeter),
-                          move_cost(group.v, r_milli), (ll)merged_gain * (group.t - current_s)});
-    }
-    sort(movers.begin(), movers.end(), [&](const CleanupMoverCandidate &lhs, const CleanupMoverCandidate &rhs) {
-        __int128 left_priority = (__int128)lhs.space_time_gain * rhs.movement_cost;
-        __int128 right_priority = (__int128)rhs.space_time_gain * lhs.movement_cost;
-        if (left_priority != right_priority) {
-            return left_priority > right_priority;
-        }
-        if (lhs.merged_gain != rhs.merged_gain) {
-            return lhs.merged_gain > rhs.merged_gain;
-        }
-        if (lhs.perimeter_excess != rhs.perimeter_excess) {
-            return lhs.perimeter_excess > rhs.perimeter_excess;
-        }
-        if (lhs.unlocked_size != rhs.unlocked_size) {
-            return lhs.unlocked_size > rhs.unlocked_size;
-        }
-        const GroupState &left_group = groups[lhs.id];
-        const GroupState &right_group = groups[rhs.id];
-        __int128 left_ratio = (__int128)lhs.movement_cost * right_group.p;
-        __int128 right_ratio = (__int128)rhs.movement_cost * left_group.p;
-        if (left_ratio != right_ratio) return left_ratio < right_ratio;
-        if (left_group.t != right_group.t) {
-            return left_group.t > right_group.t;
-        }
-        return lhs.id < rhs.id;
-    });
-    if ((int)movers.size() > CLEANUP_MOVER_LIMIT) {
-        movers.resize(CLEANUP_MOVER_LIMIT);
-    }
-    if (movers.empty()) {
-        diagnostics.no_mover++;
-        return nullopt;
-    }
-
-    CleanupSpaceProfile baseline_pre_profile = make_cleanup_space_profile(park, owner, groups, current_s);
-    long double baseline_pre_score = cleanup_pre_arrival_space_score(baseline_pre_profile, space_value_model, n);
-    vector<PreparedCleanupCandidate> prepared;
-    long long candidate_order = 0;
-
-    auto prepared_less = [](const PreparedCleanupCandidate &lhs, const PreparedCleanupCandidate &rhs) {
-        ll lhs_cost = lhs.movement_cost + lhs.fee_loss;
-        ll rhs_cost = rhs.movement_cost + rhs.fee_loss;
-        long double lhs_efficiency = lhs.pre_arrival_gain * rhs_cost;
-        long double rhs_efficiency = rhs.pre_arrival_gain * lhs_cost;
-        if (lhs_efficiency != rhs_efficiency) {
-            return lhs_efficiency > rhs_efficiency;
-        }
-        if (lhs.pre_arrival_gain != rhs.pre_arrival_gain) {
-            return lhs.pre_arrival_gain > rhs.pre_arrival_gain;
-        }
-        if (lhs_cost != rhs_cost) return lhs_cost < rhs_cost;
-        return lhs.order < rhs.order;
-    };
-
-    for (const CleanupMoverCandidate &mover : movers) {
-        if (diagnostics.candidate_evaluations >= CLEANUP_CANDIDATE_EVALUATION_LIMIT) {
-            diagnostics.evaluation_budget_exhausted++;
-            break;
-        }
-        diagnostics.movers_considered++;
-        vector<CleanupDestination> destinations =
-            make_cleanup_destinations(park, owner, groups, mover.id, fresh_mask, compact_shapes, diagnostics);
-        if (destinations.empty()) continue;
-
-        for (const CleanupDestination &destination : destinations) {
-            if (diagnostics.candidate_evaluations >= CLEANUP_CANDIDATE_EVALUATION_LIMIT) {
-                diagnostics.evaluation_budget_exhausted++;
+    RescueRolloutScenarios scenarios = make_rescue_rollout_scenarios(
+        groups, arrival_id, current_s, remaining_groups, theta, theta_estimator,
+        ROOT_CONFIRM_SCENARIO_COUNT, ROOT_CONFIRM_ROLLOUT_LENGTH, true, 1);
+    int expected_length = min(ROOT_CONFIRM_ROLLOUT_LENGTH, remaining_groups);
+    bool generation_ok = scenarios.complete &&
+                         (int)scenarios.arrivals.size() == ROOT_CONFIRM_SCENARIO_COUNT;
+    if (generation_ok) {
+        for (const auto &scenario : scenarios.arrivals) {
+            if ((int)scenario.size() != expected_length) {
+                generation_ok = false;
                 break;
             }
-            long long this_candidate_order = candidate_order++;
-            TurnPlan move_only;
-            move_only.moves.push_back({mover.id, destination.cells, destination.perimeter});
-            move_only.immediate_gain = -mover.movement_cost;
-
-            vvi moved_owner;
-            ll fee_loss = 0;
-            if (!validate_and_build_cleanup_owner(move_only, park, owner, groups, arrival_id, r_milli, moved_owner,
-                                                  fee_loss) ||
-                fee_loss != destination.fee_loss) {
-                diagnostics.validation_failures++;
-                continue;
-            }
-            diagnostics.candidate_evaluations++;
-            CleanupSpaceProfile candidate_pre_profile =
-                make_cleanup_space_profile(park, moved_owner, groups, current_s);
-            long double candidate_pre_score =
-                cleanup_pre_arrival_space_score(candidate_pre_profile, space_value_model, n);
-            long double pre_arrival_gain = candidate_pre_score - baseline_pre_score;
-            if (pre_arrival_gain < -1e-15L) {
-                diagnostics.pre_arrival_worsened++;
-                continue;
-            }
-
-            prepared.push_back({move_only.moves.front(), std::move(moved_owner), mover.movement_cost, fee_loss,
-                                pre_arrival_gain, this_candidate_order});
-            sort(prepared.begin(), prepared.end(), prepared_less);
-            if ((int)prepared.size() > CLEANUP_FINALIST_LIMIT) {
-                prepared.resize(CLEANUP_FINALIST_LIMIT);
-            }
         }
     }
-    if (prepared.empty()) {
-        diagnostics.no_destination++;
+    if (!generation_ok) {
+        diagnostics.root_confirmation_generation_failures++;
+        return false;
+    }
+    if (expected_length == ROOT_CONFIRM_ROLLOUT_LENGTH) {
+        diagnostics.root_confirmation_full_horizon++;
+    } else {
+        diagnostics.root_confirmation_short_horizon++;
+    }
+
+    i128 future_delta_sum = 0;
+    array<bool, ROOT_CONFIRM_SCENARIO_COUNT> positive_scenario{};
+    ll direct_delta =
+        challenger_branch.direct_vs_baseline - protected_branch.direct_vs_baseline;
+    for (int scenario_index = 0; scenario_index < ROOT_CONFIRM_SCENARIO_COUNT; scenario_index++) {
+        const auto &scenario = scenarios.arrivals[scenario_index];
+        RescueRolloutOutcome protected_outcome = evaluate_rescue_rollout_branch(
+            park, *protected_branch.final_owner, groups, arrival_id, *protected_branch.plan,
+            scenario, grass_cells, density_model, compact_shapes);
+        RescueRolloutOutcome challenger_outcome = evaluate_rescue_rollout_branch(
+            park, *challenger_branch.final_owner, groups, arrival_id, *challenger_branch.plan,
+            scenario, grass_cells, density_model, compact_shapes);
+        diagnostics.root_confirmation_policy_steps += 2LL * scenario.size();
+        ll future_delta = challenger_outcome.fee - protected_outcome.fee;
+        future_delta_sum += future_delta;
+        positive_scenario[scenario_index] = (i128)direct_delta + future_delta > 0;
+        diagnostics.root_confirmation_positive_scenarios += positive_scenario[scenario_index];
+    }
+    diagnostics.root_confirmation_scenarios += ROOT_CONFIRM_SCENARIO_COUNT;
+    for (int pair = 0; pair < ROOT_CONFIRM_SCENARIO_COUNT / 2; pair++) {
+        diagnostics.root_confirmation_pair_disagreements +=
+            positive_scenario[2 * pair] != positive_scenario[2 * pair + 1];
+    }
+
+    i128 margin_times_scenarios =
+        (i128)ROOT_CONFIRM_SCENARIO_COUNT * direct_delta +
+        future_delta_sum;
+    long double holdout_margin =
+        (long double)margin_times_scenarios / ROOT_CONFIRM_SCENARIO_COUNT;
+    diagnostics.root_confirmation_holdout_margin += holdout_margin;
+    if (margin_times_scenarios > 0) {
+        diagnostics.root_confirmation_approved++;
+        diagnostics.root_confirmation_approved_margin += holdout_margin;
+        return true;
+    }
+    diagnostics.root_confirmation_rejected++;
+    diagnostics.root_confirmation_rejected_margin += holdout_margin;
+    return false;
+}
+
+struct RootActionResult {
+    TurnPlan plan;
+    ArrivalDecision arrival_decision;
+};
+
+enum class RootActionKind {
+    Baseline,
+    Rescue,
+    NormalAlternative,
+};
+
+struct PreparedRescueCandidate {
+    TurnPlan plan;
+    vvi final_owner;
+    vector<int> blockers;
+    ll compact_fee = 0;
+    ll direct_gain = 0;
+    ll movement_cost = 0;
+};
+
+optional<RootActionResult> choose_root_action_with_rescue(
+    const vs &park, const vvi &owner, const vector<GroupState> &groups, int arrival_id, ll current_s,
+    int remaining_groups, int r_milli, long double theta, const ThetaEstimator &theta_estimator,
+    const DensityModel &density_model, int grass_cells, const ArrivalDecision &baseline,
+    const vector<NormalPlacementChoice> &normal_alternatives,
+    const vector<vector<Shape>> &compact_shapes, const vector<vector<Shape>> &all_shapes,
+    int &confirmations_used, bool &root_screen_evaluated, RescueDiagnostics &diagnostics) {
+    root_screen_evaluated = false;
+    const GroupState &arrival = groups[arrival_id];
+    int minimum_perimeter = compact_shapes[arrival.p].front().perimeter;
+    if (baseline.status != ArrivalStatus::Accepted || !baseline.cells ||
+        baseline.perimeter <= minimum_perimeter + COMPACT_PERIMETER_MARGIN) {
+        return nullopt;
+    }
+    diagnostics.eligible_fallbacks++;
+    vector<RescueTarget> targets = make_rescue_targets(park, owner, groups, arrival_id, r_milli, baseline,
+                                                       compact_shapes, diagnostics);
+    if (targets.empty()) {
+        diagnostics.no_economic_target++;
         return nullopt;
     }
 
-    auto rollout_scenarios =
-        make_cleanup_rollout_scenarios(groups, arrival_id, current_s, remaining_groups, theta, theta_estimator);
-    int expected_rollout_length = min(CLEANUP_ROLLOUT_LENGTH, remaining_groups);
-    if (expected_rollout_length == 0) return nullopt;
-    for (const auto &scenario : rollout_scenarios) {
-        if ((int)scenario.size() != expected_rollout_length) {
-            diagnostics.rollout_generation_failures++;
-            return nullopt;
+    int remaining_nodes = RESCUE_REPAIR_NODE_LIMIT;
+    int remaining_destination_anchors = RESCUE_DESTINATION_ANCHOR_GLOBAL_LIMIT;
+    int attempted_targets = 0;
+    vector<PreparedRescueCandidate> candidates;
+    RescueRolloutScenarios rollout_scenarios;
+    bool rollout_ready = false;
+    bool stop_after_primary = false;
+    for (const RescueTarget &target : targets) {
+        if (attempted_targets == RESCUE_TARGET_REPAIR_LIMIT || remaining_nodes == 0 ||
+            (int)candidates.size() == RESCUE_ROLLOUT_CANDIDATE_LIMIT) {
+            break;
         }
-    }
-    // A case gets exactly one rollout comparison opportunity, regardless of
-    // how many finalists are available or how deep the rollout is.
-    diagnostics.rollout_used = true;
-    diagnostics.rollout_turns++;
+        attempted_targets++;
+        diagnostics.repair_attempts++;
+        chmax(diagnostics.maximum_blockers, (int)target.blockers.size());
 
-    vvi baseline_final_owner = owner;
-    if (baseline_arrival.cells) {
-        place_cells(baseline_final_owner, *baseline_arrival.cells, arrival_id);
-    }
-    TurnPlan baseline_plan = make_arrival_turn_plan(baseline_arrival);
-    array<ll, CLEANUP_ROLLOUT_SCENARIO_COUNT> baseline_rollout{};
-    for (int scenario = 0; scenario < CLEANUP_ROLLOUT_SCENARIO_COUNT; scenario++) {
-        baseline_rollout[scenario] = evaluate_cleanup_rollout_branch(
-            park, baseline_final_owner, groups, arrival_id, baseline_plan, rollout_scenarios[scenario], grass_cells,
-            density_model, compact_shapes, diagnostics);
-    }
-
-    optional<ProactiveCleanupResult> best_result;
-    ll best_movement_cost = 0;
-    ll best_fee_loss = 0;
-    ll best_current_gain = 0;
-    long double best_pre_arrival_gain = 0.0L;
-    long double best_future_gain = 0.0L;
-    long double best_margin = -numeric_limits<long double>::infinity();
-    long long best_order = numeric_limits<long long>::max();
-    int best_candidate_rank = -1;
-    int compared_candidates = 0;
-
-    for (int candidate_rank = 0; candidate_rank < (int)prepared.size(); candidate_rank++) {
-        const PreparedCleanupCandidate &candidate = prepared[candidate_rank];
-        diagnostics.finalist_evaluations++;
-
-        CleanupArrivalDecision candidate_arrival =
-            evaluate_cleanup_arrival_decision(park, candidate.moved_owner, groups, arrival_id, current_s,
-                                              remaining_groups, theta, opportunity_cost, compact_shapes);
-        TurnPlan candidate_plan = make_arrival_turn_plan(candidate_arrival);
-        candidate_plan.moves.push_back(candidate.move);
-        candidate_plan.immediate_gain = candidate_arrival.fee - candidate.movement_cost;
-
-        vvi candidate_final_owner;
-        ll fee_loss = 0;
-        if (!validate_and_build_cleanup_owner(candidate_plan, park, owner, groups, arrival_id, r_milli,
-                                              candidate_final_owner, fee_loss) ||
-            fee_loss != candidate.fee_loss) {
+        vvi base_owner = owner;
+        vector<char> cleared_mask(park.size() * park.size(), false);
+        for (int id : target.blockers) {
+            for (auto [x, y] : groups[id].cells) cleared_mask[x * park.size() + y] = true;
+            clear_cells(base_owner, groups[id].cells);
+        }
+        bool target_legal = true;
+        for (auto [x, y] : target.cells) {
+            if (park[x][y] != '.' || base_owner[x][y] != -1) {
+                target_legal = false;
+                break;
+            }
+            base_owner[x][y] = arrival_id;
+        }
+        if (!target_legal) {
             diagnostics.validation_failures++;
             continue;
         }
 
-        ll current_gain = candidate_arrival.fee - baseline_arrival.fee;
-        ll economic_cost = candidate.movement_cost + fee_loss;
-        long double margin = numeric_limits<long double>::infinity();
-        long double minimum_future_gain = numeric_limits<long double>::infinity();
-        compared_candidates++;
-        diagnostics.rollout_candidates_compared++;
-        for (int scenario = 0; scenario < CLEANUP_ROLLOUT_SCENARIO_COUNT; scenario++) {
-            ll candidate_rollout = evaluate_cleanup_rollout_branch(
-                park, candidate_final_owner, groups, arrival_id, candidate_plan, rollout_scenarios[scenario],
-                grass_cells, density_model, compact_shapes, diagnostics);
-            long double future_gain = candidate_rollout - baseline_rollout[scenario];
-            chmin(minimum_future_gain, future_gain);
-            chmin(margin, current_gain + future_gain - economic_cost);
+        vector<vector<RescueDestination>> pools;
+        pools.reserve(target.blockers.size());
+        bool missing_destination = false;
+        for (int id : target.blockers) {
+            vector<RescueDestination> pool = make_rescue_destinations(
+                park, base_owner, groups, id, arrival_id, current_s, theta, *baseline.cells, cleared_mask,
+                all_shapes, remaining_destination_anchors, diagnostics);
+            if (pool.empty()) {
+                missing_destination = true;
+                break;
+            }
+            pools.push_back(std::move(pool));
         }
-        // Be conservative across the mirrored futures.  A move must repay its
-        // movement cost and any permanent fee loss even in the worse scenario.
-        if (margin <= 0.0L) {
-            diagnostics.economic_rejections++;
+        if (missing_destination) continue;
+
+        optional<vector<int>> choices = repair_rescue_blockers(base_owner, groups, target.blockers, pools,
+                                                                remaining_nodes, diagnostics);
+        if (!choices) continue;
+
+        TurnPlan plan;
+        for (int index = 0; index < (int)target.blockers.size(); index++) {
+            const RescueDestination &destination = pools[index][(*choices)[index]];
+            plan.moves.push_back({target.blockers[index], destination.cells, destination.perimeter});
+        }
+        plan.arrival = target.cells;
+        plan.arrival_perimeter = target.perimeter;
+        ll compact_fee = round_payment(arrival.v, arrival.p, target.perimeter);
+        plan.immediate_gain = compact_fee - target.movement_cost;
+
+        vvi final_owner;
+        ll fee_loss = 0;
+        ll checked_movement_cost = 0;
+        if (!validate_and_build_rescue_owner(plan, park, owner, groups, arrival_id, r_milli, final_owner,
+                                             fee_loss, checked_movement_cost) ||
+            fee_loss != 0 || checked_movement_cost != target.movement_cost ||
+            plan.immediate_gain - baseline.fee <= 0) {
+            diagnostics.validation_failures++;
             continue;
         }
 
-        bool better = !best_result || margin > best_margin + 1e-12L;
-        if (best_result && fabsl(margin - best_margin) <= 1e-12L) {
-            ll best_economic_cost = best_movement_cost + best_fee_loss;
-            if (economic_cost != best_economic_cost) {
-                better = economic_cost < best_economic_cost;
-            } else if (minimum_future_gain != best_future_gain) {
-                better = minimum_future_gain > best_future_gain;
-            } else {
-                better = candidate.order < best_order;
+        ll direct_gain = plan.immediate_gain - baseline.fee;
+        int blocker_bucket = min((int)target.blockers.size(), 4) - 1;
+        diagnostics.feasible_plans++;
+        diagnostics.feasible_by_blocker_count[blocker_bucket]++;
+        diagnostics.feasible_direct_gain += direct_gain;
+        candidates.push_back({std::move(plan), std::move(final_owner), target.blockers, compact_fee,
+                              direct_gain, target.movement_cost});
+
+        if (candidates.size() == 1) {
+            diagnostics.feasible_turns++;
+            if (remaining_groups == 0) {
+                diagnostics.rollout_skipped_no_future++;
+                stop_after_primary = true;
+                break;
+            }
+
+            rollout_scenarios = make_rescue_rollout_scenarios(
+                groups, arrival_id, current_s, remaining_groups, theta, theta_estimator);
+            int expected_length = min(RESCUE_ROLLOUT_LENGTH, remaining_groups);
+            bool generation_ok = rollout_scenarios.complete;
+            for (const auto &scenario : rollout_scenarios.arrivals) {
+                if ((int)scenario.size() != expected_length) {
+                    generation_ok = false;
+                    break;
+                }
+            }
+            if (!generation_ok) {
+                // Scenario construction is only a filter.  Preserve the legal,
+                // positive-immediate v1 action if that filter cannot be built.
+                diagnostics.rollout_generation_failures++;
+                stop_after_primary = true;
+                break;
+            }
+            rollout_ready = true;
+        }
+    }
+
+    if (candidates.empty()) {
+        if (attempted_targets == RESCUE_TARGET_REPAIR_LIMIT && (int)targets.size() > attempted_targets) {
+            diagnostics.target_limit_exhausted++;
+        }
+        if (remaining_nodes == 0) diagnostics.node_limit_exhausted++;
+        diagnostics.no_repair++;
+        return nullopt;
+    }
+    if (!stop_after_primary && (int)candidates.size() < RESCUE_ROLLOUT_CANDIDATE_LIMIT &&
+        attempted_targets == RESCUE_TARGET_REPAIR_LIMIT && (int)targets.size() > attempted_targets) {
+        diagnostics.target_limit_exhausted++;
+    }
+    if (remaining_nodes == 0) diagnostics.node_limit_exhausted++;
+
+    RootActionKind selected_kind = RootActionKind::Rescue;
+    int selected_candidate = 0;
+    int selected_alternative = -1;
+    if (rollout_ready) {
+        root_screen_evaluated = true;
+        diagnostics.rollout_turns++;
+        diagnostics.rollout_candidates_compared += candidates.size();
+        vector<int> available_alternatives;
+        if constexpr (!ROOT_PROTECTED_ONLY) {
+            for (int index = 0; index < (int)normal_alternatives.size(); index++) {
+                if (!same_region(normal_alternatives[index].cells, *baseline.cells)) {
+                    available_alternatives.push_back(index);
+                }
             }
         }
-        if (!better) continue;
+        if (!available_alternatives.empty()) diagnostics.root_alternative_available_turns++;
+        diagnostics.root_alternatives_compared += available_alternatives.size();
+        int root_action_count = 1 + (int)candidates.size() + (int)available_alternatives.size();
+        diagnostics.root_actions_compared += root_action_count;
+        diagnostics.root_turns_by_action_count[root_action_count]++;
+        if (candidates.size() == 1) {
+            diagnostics.rollout_one_candidate_turns++;
+        } else {
+            diagnostics.rollout_two_candidate_turns++;
+            if (candidates[0].blockers == candidates[1].blockers) diagnostics.rollout_same_blocker_sets++;
+            vector<char> first_target(park.size() * park.size(), false);
+            for (auto [x, y] : *candidates[0].plan.arrival) first_target[x * park.size() + y] = true;
+            for (auto [x, y] : *candidates[1].plan.arrival) {
+                diagnostics.rollout_candidate_overlap_cells += first_target[x * park.size() + y];
+            }
+        }
 
-        best_result = ProactiveCleanupResult{std::move(candidate_plan), std::move(candidate_arrival)};
-        best_movement_cost = candidate.movement_cost;
-        best_fee_loss = fee_loss;
-        best_current_gain = current_gain;
-        best_pre_arrival_gain = candidate.pre_arrival_gain;
-        best_future_gain = minimum_future_gain;
-        best_margin = margin;
-        best_order = candidate.order;
-        best_candidate_rank = candidate_rank;
+        vvi baseline_final_owner = owner;
+        place_cells(baseline_final_owner, *baseline.cells, arrival_id);
+        TurnPlan baseline_plan = make_arrival_plan(baseline);
+        array<RescueRolloutOutcome, RESCUE_ROLLOUT_SCENARIO_COUNT> baseline_outcomes;
+        for (int scenario = 0; scenario < RESCUE_ROLLOUT_SCENARIO_COUNT; scenario++) {
+            baseline_outcomes[scenario] = evaluate_rescue_rollout_branch(
+                park, baseline_final_owner, groups, arrival_id, baseline_plan,
+                rollout_scenarios.arrivals[scenario], grass_cells, density_model, compact_shapes);
+            diagnostics.rollout_policy_steps += rollout_scenarios.arrivals[scenario].size();
+            diagnostics.rollout_baseline_acceptances += baseline_outcomes[scenario].acceptances;
+        }
+
+        struct CandidateRolloutEvaluation {
+            array<ll, RESCUE_ROLLOUT_SCENARIO_COUNT> future_delta{};
+            ll margin_twice = 0;
+        };
+        vector<CandidateRolloutEvaluation> evaluations(candidates.size());
+        for (int candidate_index = 0; candidate_index < (int)candidates.size(); candidate_index++) {
+            const PreparedRescueCandidate &candidate = candidates[candidate_index];
+            CandidateRolloutEvaluation &evaluation = evaluations[candidate_index];
+            for (int scenario = 0; scenario < RESCUE_ROLLOUT_SCENARIO_COUNT; scenario++) {
+                RescueRolloutOutcome rescue_outcome = evaluate_rescue_rollout_branch(
+                    park, candidate.final_owner, groups, arrival_id, candidate.plan,
+                    rollout_scenarios.arrivals[scenario], grass_cells, density_model, compact_shapes);
+                diagnostics.rollout_policy_steps += rollout_scenarios.arrivals[scenario].size();
+                diagnostics.rollout_rescue_acceptances += rescue_outcome.acceptances;
+                evaluation.future_delta[scenario] = rescue_outcome.fee - baseline_outcomes[scenario].fee;
+            }
+            evaluation.margin_twice = 2 * candidate.direct_gain + evaluation.future_delta[0] +
+                                      evaluation.future_delta[1];
+            diagnostics.rollout_slot_scenario_0_future_delta[candidate_index] +=
+                evaluation.future_delta[0];
+            diagnostics.rollout_slot_scenario_1_future_delta[candidate_index] +=
+                evaluation.future_delta[1];
+            diagnostics.rollout_slot_margin[candidate_index] += 0.5L * evaluation.margin_twice;
+            bool first_accepts = candidate.direct_gain + evaluation.future_delta[0] > 0;
+            bool second_accepts = candidate.direct_gain + evaluation.future_delta[1] > 0;
+            if (first_accepts != second_accepts) {
+                if (candidate_index == 0) {
+                    diagnostics.rollout_candidate_0_disagreements++;
+                } else {
+                    diagnostics.rollout_candidate_1_disagreements++;
+                }
+            }
+            if (evaluation.margin_twice > 0) {
+                diagnostics.rollout_positive_candidates++;
+            } else {
+                diagnostics.rollout_nonpositive_candidates++;
+            }
+        }
+
+        int best_rescue = 0;
+        for (int candidate_index = 1; candidate_index < (int)candidates.size(); candidate_index++) {
+            if (evaluations[candidate_index].margin_twice > evaluations[best_rescue].margin_twice) {
+                best_rescue = candidate_index;
+            }
+        }
+        const PreparedRescueCandidate &best_candidate = candidates[best_rescue];
+        const CandidateRolloutEvaluation &best_evaluation = evaluations[best_rescue];
+        diagnostics.rollout_scenario_0_future_delta += best_evaluation.future_delta[0];
+        diagnostics.rollout_scenario_1_future_delta += best_evaluation.future_delta[1];
+        long double future_mean =
+            0.5L * (best_evaluation.future_delta[0] + best_evaluation.future_delta[1]);
+        long double rollout_margin = 0.5L * best_evaluation.margin_twice;
+        bool first_accepts = best_candidate.direct_gain + best_evaluation.future_delta[0] > 0;
+        bool second_accepts = best_candidate.direct_gain + best_evaluation.future_delta[1] > 0;
+        if (first_accepts != second_accepts) diagnostics.rollout_scenario_disagreements++;
+
+        if (candidates.size() == 2) {
+            ll width_one_margin = max(0LL, evaluations[0].margin_twice);
+            ll width_two_margin = max(width_one_margin, evaluations[1].margin_twice);
+            diagnostics.rollout_width_predicted_gain += 0.5L * (width_two_margin - width_one_margin);
+        }
+
+        ll best_root_margin_twice = 0;
+        selected_kind = RootActionKind::Baseline;
+        // Establish the exact v3 winner first.  Every new action must beat
+        // this protected branch both on the cheap screen and on an independent
+        // posterior-predictive holdout.
+        for (int candidate_index = 0; candidate_index < (int)candidates.size(); candidate_index++) {
+            if (evaluations[candidate_index].margin_twice > best_root_margin_twice) {
+                best_root_margin_twice = evaluations[candidate_index].margin_twice;
+                selected_kind = RootActionKind::Rescue;
+                selected_candidate = candidate_index;
+            }
+        }
+        RootActionKind protected_kind = selected_kind;
+        int protected_candidate = selected_candidate;
+        ll protected_margin_twice = best_root_margin_twice;
+
+        vector<TurnPlan> alternative_plans;
+        vector<ArrivalDecision> alternative_decisions;
+        vector<vvi> alternative_owners;
+        alternative_plans.reserve(available_alternatives.size());
+        alternative_decisions.reserve(available_alternatives.size());
+        alternative_owners.reserve(available_alternatives.size());
+        if constexpr (!ROOT_PROTECTED_ONLY) {
+            for (int source_index : available_alternatives) {
+                const NormalPlacementChoice &choice = normal_alternatives[source_index];
+                ArrivalDecision alternative_decision = baseline;
+                alternative_decision.cells = choice.cells;
+                alternative_decision.perimeter = choice.perimeter;
+                alternative_decision.fee = round_payment(arrival.v, arrival.p, choice.perimeter);
+                replace_selected_placement_success(alternative_decision.diagnostics, choice.source);
+                TurnPlan alternative_plan = make_arrival_plan(alternative_decision);
+                vvi alternative_owner = owner;
+                place_cells(alternative_owner, *alternative_decision.cells, arrival_id);
+
+                CandidateRolloutEvaluation alternative_evaluation;
+                ll alternative_direct_gain = alternative_decision.fee - baseline.fee;
+                for (int scenario = 0; scenario < RESCUE_ROLLOUT_SCENARIO_COUNT; scenario++) {
+                    RescueRolloutOutcome alternative_outcome = evaluate_rescue_rollout_branch(
+                        park, alternative_owner, groups, arrival_id, alternative_plan,
+                        rollout_scenarios.arrivals[scenario], grass_cells, density_model, compact_shapes);
+                    diagnostics.rollout_policy_steps += rollout_scenarios.arrivals[scenario].size();
+                    diagnostics.root_alternative_acceptances += alternative_outcome.acceptances;
+                    alternative_evaluation.future_delta[scenario] =
+                        alternative_outcome.fee - baseline_outcomes[scenario].fee;
+                }
+                alternative_evaluation.margin_twice =
+                    2 * alternative_direct_gain + alternative_evaluation.future_delta[0] +
+                    alternative_evaluation.future_delta[1];
+                diagnostics.root_alternative_direct_gain += alternative_direct_gain;
+                diagnostics.root_alternative_scenario_0_future_delta +=
+                    alternative_evaluation.future_delta[0];
+                diagnostics.root_alternative_scenario_1_future_delta +=
+                    alternative_evaluation.future_delta[1];
+                long double alternative_future_mean =
+                    0.5L * (alternative_evaluation.future_delta[0] + alternative_evaluation.future_delta[1]);
+                diagnostics.root_alternative_future_mean += alternative_future_mean;
+                diagnostics.root_alternative_margin += 0.5L * alternative_evaluation.margin_twice;
+                bool alternative_first_accepts =
+                    alternative_direct_gain + alternative_evaluation.future_delta[0] > 0;
+                bool alternative_second_accepts =
+                    alternative_direct_gain + alternative_evaluation.future_delta[1] > 0;
+                if (alternative_first_accepts != alternative_second_accepts) {
+                    diagnostics.root_alternative_disagreements++;
+                }
+
+                int alternative_index = alternative_plans.size();
+                alternative_plans.push_back(std::move(alternative_plan));
+                alternative_decisions.push_back(std::move(alternative_decision));
+                alternative_owners.push_back(std::move(alternative_owner));
+                if (alternative_evaluation.margin_twice > best_root_margin_twice) {
+                    best_root_margin_twice = alternative_evaluation.margin_twice;
+                    selected_kind = RootActionKind::NormalAlternative;
+                    selected_alternative = alternative_index;
+                }
+            }
+
+            long double screen_gain =
+                0.5L * (best_root_margin_twice - protected_margin_twice);
+            diagnostics.root_expanded_predicted_gain += screen_gain;
+            if (selected_kind == RootActionKind::NormalAlternative) {
+                diagnostics.root_screen_v3_overrides++;
+                diagnostics.root_screen_selected_alternative++;
+                diagnostics.root_confirmation_screen_gain += screen_gain;
+                RootBranchView protected_branch;
+                if (protected_kind == RootActionKind::Baseline) {
+                    protected_branch = RootBranchView{&baseline_plan, &baseline_final_owner, 0};
+                } else {
+                    const PreparedRescueCandidate &candidate = candidates[protected_candidate];
+                    protected_branch = RootBranchView{&candidate.plan, &candidate.final_owner,
+                                                      candidate.direct_gain};
+                }
+                RootBranchView challenger_branch{
+                    &alternative_plans[selected_alternative], &alternative_owners[selected_alternative],
+                    alternative_decisions[selected_alternative].fee - baseline.fee};
+                bool confirmed = confirm_root_override(
+                    park, groups, arrival_id, current_s, remaining_groups, theta, theta_estimator,
+                    grass_cells, density_model, compact_shapes, protected_branch, challenger_branch,
+                    confirmations_used, diagnostics);
+                if (!confirmed) {
+                    selected_kind = protected_kind;
+                    selected_candidate = protected_candidate;
+                    selected_alternative = -1;
+                } else {
+                    diagnostics.root_v3_winner_overridden++;
+                }
+            }
+        }
+
+        int positive_count = 0;
+        for (const CandidateRolloutEvaluation &evaluation : evaluations) {
+            positive_count += evaluation.margin_twice > 0;
+        }
+        diagnostics.rollout_unselected_positive_candidates +=
+            positive_count - (selected_kind == RootActionKind::Rescue);
+
+        if (selected_kind != RootActionKind::Rescue) {
+            diagnostics.rollout_rescue_not_selected++;
+            diagnostics.rollout_not_selected_direct_gain += best_candidate.direct_gain;
+            diagnostics.rollout_not_selected_future_mean += future_mean;
+            diagnostics.rollout_not_selected_margin += rollout_margin;
+            if (selected_kind == RootActionKind::Baseline) {
+                diagnostics.root_selected_primary++;
+                return nullopt;
+            }
+            assert(selected_kind == RootActionKind::NormalAlternative);
+            diagnostics.root_selected_alternative++;
+            diagnostics.root_selected_alternative_rank[selected_alternative]++;
+            return RootActionResult{std::move(alternative_plans[selected_alternative]),
+                                    std::move(alternative_decisions[selected_alternative])};
+        }
+        diagnostics.rollout_adopted++;
+        if (selected_candidate == 0) {
+            diagnostics.rollout_selected_candidate_0++;
+        } else {
+            diagnostics.rollout_selected_candidate_1++;
+        }
+        diagnostics.rollout_adopted_direct_gain += best_candidate.direct_gain;
+        diagnostics.rollout_adopted_future_mean += future_mean;
+        diagnostics.rollout_adopted_margin += rollout_margin;
     }
 
-    if (compared_candidates >= 2) {
-        diagnostics.rollout_multi_candidate_turns++;
-    }
-    if (compared_candidates == CLEANUP_FINALIST_LIMIT) {
-        diagnostics.rollout_full_width_turns++;
-    }
-    if (!best_result) return nullopt;
-    if (best_candidate_rank > 0) {
-        diagnostics.rollout_nonprimary_wins++;
-    }
-    int winner_rank = best_candidate_rank + 1;
-    diagnostics.rollout_winner_rank_sum += winner_rank;
-    chmax(diagnostics.rollout_max_winner_rank, winner_rank);
+    PreparedRescueCandidate &chosen = candidates[selected_candidate];
+    int blocker_bucket = min((int)chosen.blockers.size(), 4) - 1;
+    ArrivalDecision selected = baseline;
+    selected.cells = *chosen.plan.arrival;
+    selected.perimeter = chosen.plan.arrival_perimeter;
+    selected.fee = chosen.compact_fee;
+    // The counterfactual used connected growth, but the selected arrival is
+    // now a minimum-perimeter template.  Keep diagnostics factual.
+    replace_selected_placement_success(selected.diagnostics, PlacementSource::MinimumTemplate);
     diagnostics.successes++;
-    if (best_result->plan.arrival) {
-        diagnostics.successes_with_arrival++;
-    } else {
-        diagnostics.successes_without_arrival++;
+    diagnostics.successes_by_blocker_count[blocker_bucket]++;
+    diagnostics.moved_groups += chosen.blockers.size();
+    diagnostics.arrival_fee_gain += chosen.compact_fee - baseline.fee;
+    diagnostics.movement_cost += chosen.movement_cost;
+    diagnostics.immediate_gain += chosen.direct_gain;
+    return RootActionResult{std::move(chosen.plan), std::move(selected)};
+}
+
+optional<RootActionResult> choose_normal_root_action(
+    const vs &park, const vvi &owner, const vector<GroupState> &groups, int arrival_id,
+    ll current_s, int remaining_groups, long double theta, const ThetaEstimator &theta_estimator,
+    const DensityModel &density_model, int grass_cells, const ArrivalDecision &baseline,
+    const vector<NormalPlacementChoice> &normal_alternatives,
+    const vector<vector<Shape>> &compact_shapes, int &confirmations_used,
+    RescueDiagnostics &diagnostics) {
+    if (baseline.status != ArrivalStatus::Accepted || !baseline.cells ||
+        normal_alternatives.empty() || remaining_groups <= 0) {
+        return nullopt;
     }
-    diagnostics.move_cost_sum += best_movement_cost;
-    diagnostics.fee_loss_sum += best_fee_loss;
-    diagnostics.current_fee_gain_sum += best_current_gain;
-    diagnostics.pre_arrival_score_gain_sum += best_pre_arrival_gain;
-    diagnostics.rollout_future_gain_sum += best_future_gain;
-    diagnostics.rollout_margin_sum += best_margin;
-    return best_result;
+
+    RescueRolloutScenarios scenarios = make_rescue_rollout_scenarios(
+        groups, arrival_id, current_s, remaining_groups, theta, theta_estimator);
+    int expected_length = min(ROOT_SCREEN_ROLLOUT_LENGTH, remaining_groups);
+    bool generation_ok = scenarios.complete &&
+                         (int)scenarios.arrivals.size() == ROOT_SCREEN_SCENARIO_COUNT;
+    if (generation_ok) {
+        for (const auto &scenario : scenarios.arrivals) {
+            if ((int)scenario.size() != expected_length) {
+                generation_ok = false;
+                break;
+            }
+        }
+    }
+    if (!generation_ok) {
+        diagnostics.normal_root_generation_failures++;
+        return nullopt;
+    }
+
+    const GroupState &arrival = groups[arrival_id];
+    vector<int> available_alternatives;
+    for (int index = 0; index < (int)normal_alternatives.size(); index++) {
+        if (!same_region(normal_alternatives[index].cells, *baseline.cells)) {
+            available_alternatives.push_back(index);
+        }
+    }
+    if (available_alternatives.empty()) return nullopt;
+
+    diagnostics.normal_root_rollout_turns++;
+    diagnostics.normal_root_alternatives_compared += available_alternatives.size();
+    int action_count = 1 + (int)available_alternatives.size();
+    diagnostics.normal_root_actions_compared += action_count;
+    diagnostics.normal_root_turns_by_action_count[action_count]++;
+
+    vvi baseline_owner = owner;
+    place_cells(baseline_owner, *baseline.cells, arrival_id);
+    TurnPlan baseline_plan = make_arrival_plan(baseline);
+    array<RescueRolloutOutcome, ROOT_SCREEN_SCENARIO_COUNT> baseline_outcomes;
+    for (int scenario = 0; scenario < ROOT_SCREEN_SCENARIO_COUNT; scenario++) {
+        baseline_outcomes[scenario] = evaluate_rescue_rollout_branch(
+            park, baseline_owner, groups, arrival_id, baseline_plan,
+            scenarios.arrivals[scenario], grass_cells, density_model, compact_shapes);
+        diagnostics.normal_root_policy_steps += scenarios.arrivals[scenario].size();
+    }
+
+    struct NormalEvaluation {
+        array<ll, ROOT_SCREEN_SCENARIO_COUNT> future_delta{};
+        ll margin_twice = 0;
+    };
+    vector<TurnPlan> alternative_plans;
+    vector<ArrivalDecision> alternative_decisions;
+    vector<vvi> alternative_owners;
+    alternative_plans.reserve(available_alternatives.size());
+    alternative_decisions.reserve(available_alternatives.size());
+    alternative_owners.reserve(available_alternatives.size());
+
+    RootActionKind selected_kind = RootActionKind::Baseline;
+    int selected_alternative = -1;
+    ll best_margin_twice = 0;
+    for (int source_index : available_alternatives) {
+        const NormalPlacementChoice &choice = normal_alternatives[source_index];
+        ArrivalDecision decision = baseline;
+        decision.cells = choice.cells;
+        decision.perimeter = choice.perimeter;
+        decision.fee = round_payment(arrival.v, arrival.p, choice.perimeter);
+        replace_selected_placement_success(decision.diagnostics, choice.source);
+        TurnPlan plan = make_arrival_plan(decision);
+        vvi final_owner = owner;
+        place_cells(final_owner, *decision.cells, arrival_id);
+
+        NormalEvaluation evaluation;
+        ll direct_gain = decision.fee - baseline.fee;
+        for (int scenario = 0; scenario < ROOT_SCREEN_SCENARIO_COUNT; scenario++) {
+            RescueRolloutOutcome outcome = evaluate_rescue_rollout_branch(
+                park, final_owner, groups, arrival_id, plan, scenarios.arrivals[scenario],
+                grass_cells, density_model, compact_shapes);
+            diagnostics.normal_root_policy_steps += scenarios.arrivals[scenario].size();
+            evaluation.future_delta[scenario] = outcome.fee - baseline_outcomes[scenario].fee;
+        }
+        evaluation.margin_twice =
+            ROOT_SCREEN_SCENARIO_COUNT * direct_gain +
+            accumulate(evaluation.future_delta.begin(), evaluation.future_delta.end(), 0LL);
+
+        int alternative_index = alternative_plans.size();
+        alternative_plans.push_back(std::move(plan));
+        alternative_decisions.push_back(std::move(decision));
+        alternative_owners.push_back(std::move(final_owner));
+        if (evaluation.margin_twice > best_margin_twice) {
+            best_margin_twice = evaluation.margin_twice;
+            selected_kind = RootActionKind::NormalAlternative;
+            selected_alternative = alternative_index;
+        }
+    }
+
+    if (selected_kind == RootActionKind::Baseline) {
+        diagnostics.normal_root_selected_primary++;
+        return nullopt;
+    }
+    assert(selected_kind == RootActionKind::NormalAlternative);
+    diagnostics.normal_root_screen_overrides++;
+    diagnostics.normal_root_screen_selected_alternative++;
+    long double screen_gain =
+        (long double)best_margin_twice / ROOT_SCREEN_SCENARIO_COUNT;
+    diagnostics.root_confirmation_screen_gain += screen_gain;
+    RootBranchView baseline_branch{&baseline_plan, &baseline_owner, 0};
+    RootBranchView challenger_branch{
+        &alternative_plans[selected_alternative], &alternative_owners[selected_alternative],
+        alternative_decisions[selected_alternative].fee - baseline.fee};
+    bool confirmed = confirm_root_override(
+        park, groups, arrival_id, current_s, remaining_groups, theta, theta_estimator,
+        grass_cells, density_model, compact_shapes, baseline_branch, challenger_branch,
+        confirmations_used, diagnostics);
+    if (!confirmed) {
+        diagnostics.normal_root_selected_primary++;
+        return nullopt;
+    }
+
+    diagnostics.normal_root_selected_alternative++;
+    diagnostics.normal_root_selected_alternative_rank[selected_alternative]++;
+    return RootActionResult{std::move(alternative_plans[selected_alternative]),
+                            std::move(alternative_decisions[selected_alternative])};
+}
+
+bool validate_connected_region(const vector<Cell> &cells, int n) {
+    if (cells.empty()) return false;
+    vector<char> in_region(n * n, false);
+    for (auto [x, y] : cells) {
+        if (!inside(x, y, n, n)) return false;
+        int cell = x * n + y;
+        if (in_region[cell]) return false;
+        in_region[cell] = true;
+    }
+    vector<char> visited(n * n, false);
+    queue<Cell> que;
+    que.push(cells.front());
+    visited[cells.front().first * n + cells.front().second] = true;
+    int reached = 0;
+    constexpr int DX[4] = {-1, 1, 0, 0};
+    constexpr int DY[4] = {0, 0, -1, 1};
+    while (!que.empty()) {
+        auto [x, y] = que.front();
+        que.pop();
+        reached++;
+        for (int dir = 0; dir < 4; dir++) {
+            int nx = x + DX[dir];
+            int ny = y + DY[dir];
+            if (!inside(nx, ny, n, n)) continue;
+            int next = nx * n + ny;
+            if (!in_region[next] || visited[next]) continue;
+            visited[next] = true;
+            que.emplace(nx, ny);
+        }
+    }
+    return reached == (int)cells.size();
 }
 
 void apply_plan(int arrival_id, TurnPlan &plan, vvi &owner, vector<GroupState> &groups) {
@@ -2486,11 +3128,18 @@ int main() {
     for (string &row : park) cin >> row;
 
     vector<vector<Shape>> compact_shapes(151);
+    vector<vector<Shape>> all_shapes(151);
     for (int p = 4; p <= 150; p++) {
-        compact_shapes[p] = make_compact_shapes(p, N);
+        all_shapes[p] = make_template_shapes(p, N);
+        compact_shapes[p] = all_shapes[p];
+        int minimum_perimeter = compact_shapes[p].front().perimeter;
+        compact_shapes[p].erase(
+            remove_if(compact_shapes[p].begin(), compact_shapes[p].end(), [&](const Shape &shape) {
+                return shape.perimeter > minimum_perimeter + COMPACT_PERIMETER_MARGIN;
+            }),
+            compact_shapes[p].end());
     }
     DensityModel density_model(compact_shapes);
-    FutureSpaceValueModel space_value_model(compact_shapes);
     ThetaEstimator theta_estimator;
     int grass_cells = 0;
     for (const string &row : park) {
@@ -2504,7 +3153,9 @@ int main() {
     int rejected_count = 0;
     ShadowDiagnostics shadow_diagnostics;
     TemporalPlacementDiagnostics placement_diagnostics;
-    CleanupDiagnostics cleanup_diagnostics;
+    RescueDiagnostics rescue_diagnostics;
+    int root_confirmations_used = 0;
+    array<bool, 4> normal_root_window_used{};
 
     for (int turn = 0; turn < M; turn++) {
         int i, P;
@@ -2519,17 +3170,12 @@ int main() {
         int remaining_groups = M - i - 1;
         long double theta = theta_estimator.estimate(S, remaining_groups);
 
-        vector<char> fresh_mask(N * N, false);
         // A departure at exactly S is still present by the problem's ordering;
-        // only t < S is removed.  The released cells seed this turn's cleanup.
+        // only t < S is removed before this arrival is handled.
         while (!departures.empty() && departures.top().first < S) {
             int j = departures.top().second;
             departures.pop();
             if (!groups[j].active) continue;
-            for (auto [x, y] : groups[j].cells) {
-                fresh_mask[x * N + y] = true;
-                cleanup_diagnostics.fresh_cells++;
-            }
             clear_cells(owner, groups[j].cells);
             groups[j].cells.clear();
             groups[j].active = false;
@@ -2544,37 +3190,56 @@ int main() {
         chmax(shadow_diagnostics.maximum_rejected_fraction, shadow.maximum_rejected_fraction);
         shadow_diagnostics.priced_buckets += shadow.priced_buckets;
 
-        // First compute the no-move branch as a counterfactual.  Cleanup is
-        // still judged on the pre-arrival board, and the chosen branch emits
-        // its move before the arrival decision.
-        CleanupArrivalDecision baseline_arrival = evaluate_cleanup_arrival_decision(
-            park, owner, groups, i, S, remaining_groups, theta, shadow.opportunity_cost, compact_shapes);
-        optional<ProactiveCleanupResult> cleanup =
-            try_proactive_cleanup(park, owner, groups, i, S, remaining_groups, r_milli, theta, theta_estimator,
-                                  density_model, grass_cells, shadow.opportunity_cost, baseline_arrival, fresh_mask,
-                                  compact_shapes, space_value_model, cleanup_diagnostics);
+        // The ordinary primary remains the protected counterfactual.  Rescue
+        // roots are screened first; a small deterministic set of non-compact
+        // normal turns may use the same root machinery without relocation.
+        vector<NormalPlacementChoice> baseline_alternatives;
+        ArrivalDecision baseline_arrival = evaluate_arrival_decision(
+            park, owner, groups, i, S, remaining_groups, theta, shadow.opportunity_cost, compact_shapes,
+            &baseline_alternatives);
+        bool rescue_root_screen_evaluated = false;
+        optional<RootActionResult> expanded_action = choose_root_action_with_rescue(
+            park, owner, groups, i, S, remaining_groups, r_milli, theta, theta_estimator, density_model,
+            grass_cells, baseline_arrival, baseline_alternatives, compact_shapes, all_shapes,
+            root_confirmations_used, rescue_root_screen_evaluated, rescue_diagnostics);
+
+        int minimum_perimeter = compact_shapes[P].front().perimeter;
+        int normal_root_window = min(3, turn * 4 / M);
+        bool normal_root_gate =
+            !ROOT_PROTECTED_ONLY && !expanded_action && !rescue_root_screen_evaluated && remaining_groups > 0 &&
+            baseline_arrival.status == ArrivalStatus::Accepted && baseline_arrival.cells &&
+            baseline_arrival.perimeter > minimum_perimeter && !baseline_alternatives.empty() &&
+            !normal_root_window_used[normal_root_window];
+        if (normal_root_gate) {
+            normal_root_window_used[normal_root_window] = true;
+            rescue_diagnostics.normal_root_gate_turns++;
+            expanded_action = choose_normal_root_action(
+                park, owner, groups, i, S, remaining_groups, theta, theta_estimator, density_model,
+                grass_cells, baseline_arrival, baseline_alternatives, compact_shapes,
+                root_confirmations_used, rescue_diagnostics);
+        }
 
         TurnPlan plan;
-        CleanupArrivalDecision selected_arrival;
-        if (cleanup) {
-            plan = std::move(cleanup->plan);
-            selected_arrival = std::move(cleanup->arrival_decision);
+        ArrivalDecision selected_arrival;
+        if (expanded_action) {
+            plan = std::move(expanded_action->plan);
+            selected_arrival = std::move(expanded_action->arrival_decision);
         } else {
-            plan = make_arrival_turn_plan(baseline_arrival);
+            plan = make_arrival_plan(baseline_arrival);
             selected_arrival = std::move(baseline_arrival);
         }
-        merge_temporal_placement_diagnostics(placement_diagnostics, selected_arrival.diagnostics);
+        accumulate_placement_diagnostics(placement_diagnostics, selected_arrival.diagnostics);
         switch (selected_arrival.status) {
-            case CleanupArrivalStatus::UpperBoundRejected:
+            case ArrivalStatus::UpperBoundRejected:
                 shadow_diagnostics.upper_bound_rejected++;
                 break;
-            case CleanupArrivalStatus::NoRegion:
+            case ArrivalStatus::NoRegion:
                 shadow_diagnostics.no_region_rejected++;
                 break;
-            case CleanupArrivalStatus::ActualFeeRejected:
+            case ArrivalStatus::ActualFeeRejected:
                 shadow_diagnostics.actual_fee_rejected++;
                 break;
-            case CleanupArrivalStatus::Accepted:
+            case ArrivalStatus::Accepted:
                 shadow_diagnostics.accepted++;
                 break;
         }
@@ -2599,37 +3264,127 @@ int main() {
                                              ? 0.0L
                                              : shadow_diagnostics.rejected_fraction_sum / shadow_diagnostics.considered;
     cerr << "accepted=" << accepted_count << " rejected=" << rejected_count
-         << " cleanup_attempts=" << cleanup_diagnostics.attempts
-         << " cleanup_successes=" << cleanup_diagnostics.successes
-         << " cleanup_with_arrival=" << cleanup_diagnostics.successes_with_arrival
-         << " cleanup_without_arrival=" << cleanup_diagnostics.successes_without_arrival
-         << " cleanup_search_budget_exhausted=" << cleanup_diagnostics.search_budget_exhausted
-         << " cleanup_evaluation_budget_exhausted=" << cleanup_diagnostics.evaluation_budget_exhausted
-         << " cleanup_rollout_reuse_blocked=" << cleanup_diagnostics.rollout_reuse_blocked
-         << " cleanup_rollout_generation_failures=" << cleanup_diagnostics.rollout_generation_failures
-         << " cleanup_no_mover=" << cleanup_diagnostics.no_mover
-         << " cleanup_no_destination=" << cleanup_diagnostics.no_destination
-         << " cleanup_pre_arrival_worsened=" << cleanup_diagnostics.pre_arrival_worsened
-         << " cleanup_economic_rejections=" << cleanup_diagnostics.economic_rejections
-         << " cleanup_validation_failures=" << cleanup_diagnostics.validation_failures
-         << " cleanup_fresh_cells=" << cleanup_diagnostics.fresh_cells
-         << " cleanup_movers_considered=" << cleanup_diagnostics.movers_considered
-         << " cleanup_destination_anchors=" << cleanup_diagnostics.destination_anchors
-         << " cleanup_destination_candidates=" << cleanup_diagnostics.destination_candidates
-         << " cleanup_candidate_evaluations=" << cleanup_diagnostics.candidate_evaluations
-         << " cleanup_finalist_evaluations=" << cleanup_diagnostics.finalist_evaluations
-         << " cleanup_rollout_policy_steps=" << cleanup_diagnostics.rollout_policy_steps
-         << " cleanup_rollout_turns=" << cleanup_diagnostics.rollout_turns
-         << " cleanup_rollout_acceptances=" << cleanup_diagnostics.rollout_acceptances
-         << " cleanup_rollout_candidates_compared=" << cleanup_diagnostics.rollout_candidates_compared
-         << " cleanup_rollout_multi_candidate_turns=" << cleanup_diagnostics.rollout_multi_candidate_turns
-         << " cleanup_rollout_full_width_turns=" << cleanup_diagnostics.rollout_full_width_turns
-         << " cleanup_rollout_nonprimary_wins=" << cleanup_diagnostics.rollout_nonprimary_wins
-         << " cleanup_rollout_winner_rank_sum=" << cleanup_diagnostics.rollout_winner_rank_sum
-         << " cleanup_rollout_max_winner_rank=" << cleanup_diagnostics.rollout_max_winner_rank
-         << " cleanup_move_cost=" << cleanup_diagnostics.move_cost_sum
-         << " cleanup_fee_loss=" << cleanup_diagnostics.fee_loss_sum
-         << " cleanup_current_fee_gain=" << cleanup_diagnostics.current_fee_gain_sum
+         << " rescue_eligible_fallbacks=" << rescue_diagnostics.eligible_fallbacks
+         << " rescue_feasible_turns=" << rescue_diagnostics.feasible_turns
+         << " rescue_feasible_plans=" << rescue_diagnostics.feasible_plans
+         << " rescue_successes=" << rescue_diagnostics.successes
+         << " rescue_feasible_1_blocker=" << rescue_diagnostics.feasible_by_blocker_count[0]
+         << " rescue_feasible_2_blockers=" << rescue_diagnostics.feasible_by_blocker_count[1]
+         << " rescue_feasible_3_blockers=" << rescue_diagnostics.feasible_by_blocker_count[2]
+         << " rescue_feasible_4plus_blockers=" << rescue_diagnostics.feasible_by_blocker_count[3]
+         << " rescue_successes_1_blocker=" << rescue_diagnostics.successes_by_blocker_count[0]
+         << " rescue_successes_2_blockers=" << rescue_diagnostics.successes_by_blocker_count[1]
+         << " rescue_successes_3_blockers=" << rescue_diagnostics.successes_by_blocker_count[2]
+         << " rescue_successes_4plus_blockers=" << rescue_diagnostics.successes_by_blocker_count[3]
+         << " rescue_no_economic_target=" << rescue_diagnostics.no_economic_target
+         << " rescue_no_repair=" << rescue_diagnostics.no_repair
+         << " rescue_target_limit_exhausted=" << rescue_diagnostics.target_limit_exhausted
+         << " rescue_destination_limit_exhausted=" << rescue_diagnostics.destination_limit_exhausted
+         << " rescue_node_limit_exhausted=" << rescue_diagnostics.node_limit_exhausted
+         << " rescue_validation_failures=" << rescue_diagnostics.validation_failures
+         << " rescue_maximum_blockers=" << rescue_diagnostics.maximum_blockers
+         << " rescue_target_anchors=" << rescue_diagnostics.target_anchors
+         << " rescue_target_shortlisted=" << rescue_diagnostics.target_shortlisted
+         << " rescue_exact_targets=" << rescue_diagnostics.exact_targets
+         << " rescue_economic_targets=" << rescue_diagnostics.economic_targets
+         << " rescue_repair_attempts=" << rescue_diagnostics.repair_attempts
+         << " rescue_destination_anchors=" << rescue_diagnostics.destination_anchors
+         << " rescue_destination_candidates=" << rescue_diagnostics.destination_candidates
+         << " rescue_beam_nodes=" << rescue_diagnostics.beam_nodes
+         << " rescue_rollout_turns=" << rescue_diagnostics.rollout_turns
+         << " rescue_rollout_generation_failures=" << rescue_diagnostics.rollout_generation_failures
+         << " rescue_rollout_skipped_no_future=" << rescue_diagnostics.rollout_skipped_no_future
+         << " rescue_rollout_adopted=" << rescue_diagnostics.rollout_adopted
+         << " rescue_rollout_not_selected=" << rescue_diagnostics.rollout_rescue_not_selected
+         << " rescue_rollout_one_candidate_turns=" << rescue_diagnostics.rollout_one_candidate_turns
+         << " rescue_rollout_two_candidate_turns=" << rescue_diagnostics.rollout_two_candidate_turns
+         << " rescue_rollout_selected_candidate_0=" << rescue_diagnostics.rollout_selected_candidate_0
+         << " rescue_rollout_selected_candidate_1=" << rescue_diagnostics.rollout_selected_candidate_1
+         << " rescue_rollout_scenario_disagreements=" << rescue_diagnostics.rollout_scenario_disagreements
+         << " rescue_rollout_candidate_0_disagreements="
+         << rescue_diagnostics.rollout_candidate_0_disagreements
+         << " rescue_rollout_candidate_1_disagreements="
+         << rescue_diagnostics.rollout_candidate_1_disagreements
+         << " rescue_rollout_same_blocker_sets=" << rescue_diagnostics.rollout_same_blocker_sets
+         << " rescue_rollout_policy_steps=" << rescue_diagnostics.rollout_policy_steps
+         << " rescue_rollout_candidates_compared=" << rescue_diagnostics.rollout_candidates_compared
+         << " rescue_rollout_positive_candidates=" << rescue_diagnostics.rollout_positive_candidates
+         << " rescue_rollout_nonpositive_candidates=" << rescue_diagnostics.rollout_nonpositive_candidates
+         << " rescue_rollout_unselected_positive_candidates="
+         << rescue_diagnostics.rollout_unselected_positive_candidates
+         << " rescue_rollout_candidate_overlap_cells=" << rescue_diagnostics.rollout_candidate_overlap_cells
+         << " rescue_rollout_baseline_acceptances=" << rescue_diagnostics.rollout_baseline_acceptances
+         << " rescue_rollout_rescue_acceptances=" << rescue_diagnostics.rollout_rescue_acceptances
+         << " root_alternative_available_turns=" << rescue_diagnostics.root_alternative_available_turns
+         << " root_selected_primary=" << rescue_diagnostics.root_selected_primary
+         << " root_selected_alternative=" << rescue_diagnostics.root_selected_alternative
+         << " root_alternative_disagreements=" << rescue_diagnostics.root_alternative_disagreements
+         << " root_screen_v3_overrides=" << rescue_diagnostics.root_screen_v3_overrides
+         << " root_screen_selected_alternative="
+         << rescue_diagnostics.root_screen_selected_alternative
+         << " root_v3_winner_overridden=" << rescue_diagnostics.root_v3_winner_overridden
+         << " root_selected_alternative_rank_0="
+         << rescue_diagnostics.root_selected_alternative_rank[0]
+         << " root_selected_alternative_rank_1="
+         << rescue_diagnostics.root_selected_alternative_rank[1]
+         << " root_2_action_turns=" << rescue_diagnostics.root_turns_by_action_count[2]
+         << " root_3_action_turns=" << rescue_diagnostics.root_turns_by_action_count[3]
+         << " root_4_action_turns=" << rescue_diagnostics.root_turns_by_action_count[4]
+         << " root_5_action_turns=" << rescue_diagnostics.root_turns_by_action_count[5]
+         << " root_actions_compared=" << rescue_diagnostics.root_actions_compared
+         << " root_alternatives_compared=" << rescue_diagnostics.root_alternatives_compared
+         << " root_alternative_acceptances=" << rescue_diagnostics.root_alternative_acceptances
+         << " normal_root_gate_turns=" << rescue_diagnostics.normal_root_gate_turns
+         << " normal_root_rollout_turns=" << rescue_diagnostics.normal_root_rollout_turns
+         << " normal_root_generation_failures=" << rescue_diagnostics.normal_root_generation_failures
+         << " normal_root_screen_overrides=" << rescue_diagnostics.normal_root_screen_overrides
+         << " normal_root_screen_selected_alternative="
+         << rescue_diagnostics.normal_root_screen_selected_alternative
+         << " normal_root_selected_primary=" << rescue_diagnostics.normal_root_selected_primary
+         << " normal_root_selected_alternative=" << rescue_diagnostics.normal_root_selected_alternative
+         << " normal_root_selected_alternative_rank_0="
+         << rescue_diagnostics.normal_root_selected_alternative_rank[0]
+         << " normal_root_selected_alternative_rank_1="
+         << rescue_diagnostics.normal_root_selected_alternative_rank[1]
+         << " normal_root_2_action_turns=" << rescue_diagnostics.normal_root_turns_by_action_count[2]
+         << " normal_root_3_action_turns=" << rescue_diagnostics.normal_root_turns_by_action_count[3]
+         << " normal_root_actions_compared=" << rescue_diagnostics.normal_root_actions_compared
+         << " normal_root_alternatives_compared=" << rescue_diagnostics.normal_root_alternatives_compared
+         << " normal_root_policy_steps=" << rescue_diagnostics.normal_root_policy_steps
+         << " root_confirmation_used=" << root_confirmations_used
+         << " root_confirmation_attempts=" << rescue_diagnostics.root_confirmation_attempts
+         << " root_confirmation_approved=" << rescue_diagnostics.root_confirmation_approved
+         << " root_confirmation_rejected=" << rescue_diagnostics.root_confirmation_rejected
+         << " root_confirmation_generation_failures="
+         << rescue_diagnostics.root_confirmation_generation_failures
+         << " root_confirmation_budget_skips=" << rescue_diagnostics.root_confirmation_budget_skips
+         << " root_confirmation_full_horizon=" << rescue_diagnostics.root_confirmation_full_horizon
+         << " root_confirmation_short_horizon=" << rescue_diagnostics.root_confirmation_short_horizon
+         << " root_confirmation_pair_disagreements="
+         << rescue_diagnostics.root_confirmation_pair_disagreements
+         << " root_confirmation_policy_steps=" << rescue_diagnostics.root_confirmation_policy_steps
+         << " root_confirmation_scenarios=" << rescue_diagnostics.root_confirmation_scenarios
+         << " root_confirmation_positive_scenarios="
+         << rescue_diagnostics.root_confirmation_positive_scenarios
+         << " rescue_moved_groups=" << rescue_diagnostics.moved_groups
+         << " rescue_feasible_direct_gain=" << rescue_diagnostics.feasible_direct_gain
+         << " rescue_arrival_fee_gain=" << rescue_diagnostics.arrival_fee_gain
+         << " rescue_movement_cost=" << rescue_diagnostics.movement_cost
+         << " rescue_immediate_gain=" << rescue_diagnostics.immediate_gain
+         << " rescue_rollout_scenario_0_future_delta=" << rescue_diagnostics.rollout_scenario_0_future_delta
+         << " rescue_rollout_scenario_1_future_delta=" << rescue_diagnostics.rollout_scenario_1_future_delta
+         << " rescue_rollout_slot_0_scenario_0_future_delta="
+         << rescue_diagnostics.rollout_slot_scenario_0_future_delta[0]
+         << " rescue_rollout_slot_0_scenario_1_future_delta="
+         << rescue_diagnostics.rollout_slot_scenario_1_future_delta[0]
+         << " rescue_rollout_slot_1_scenario_0_future_delta="
+         << rescue_diagnostics.rollout_slot_scenario_0_future_delta[1]
+         << " rescue_rollout_slot_1_scenario_1_future_delta="
+         << rescue_diagnostics.rollout_slot_scenario_1_future_delta[1]
+         << " root_alternative_scenario_0_future_delta="
+         << rescue_diagnostics.root_alternative_scenario_0_future_delta
+         << " root_alternative_scenario_1_future_delta="
+         << rescue_diagnostics.root_alternative_scenario_1_future_delta
          << " shadow_considered=" << shadow_diagnostics.considered
          << " shadow_upper_rejected=" << shadow_diagnostics.upper_bound_rejected
          << " shadow_actual_rejected=" << shadow_diagnostics.actual_fee_rejected
@@ -2648,15 +3403,34 @@ int main() {
          << " placement_growth_candidates=" << placement_diagnostics.connected_growth_candidates
          << " placement_shortlisted_candidates=" << placement_diagnostics.shortlisted_candidates
          << " placement_future_fit_snapshots=" << placement_diagnostics.future_fit_snapshots << fixed << setprecision(6)
+         << " rescue_rollout_adopted_direct_gain=" << rescue_diagnostics.rollout_adopted_direct_gain
+         << " rescue_rollout_adopted_future_mean=" << rescue_diagnostics.rollout_adopted_future_mean
+         << " rescue_rollout_adopted_margin=" << rescue_diagnostics.rollout_adopted_margin
+         << " rescue_rollout_not_selected_direct_gain="
+         << rescue_diagnostics.rollout_not_selected_direct_gain
+         << " rescue_rollout_not_selected_future_mean="
+         << rescue_diagnostics.rollout_not_selected_future_mean
+         << " rescue_rollout_not_selected_margin=" << rescue_diagnostics.rollout_not_selected_margin
+         << " rescue_rollout_slot_0_margin=" << rescue_diagnostics.rollout_slot_margin[0]
+         << " rescue_rollout_slot_1_margin=" << rescue_diagnostics.rollout_slot_margin[1]
+         << " rescue_rollout_width_predicted_gain=" << rescue_diagnostics.rollout_width_predicted_gain
+         << " root_alternative_direct_gain=" << rescue_diagnostics.root_alternative_direct_gain
+         << " root_alternative_future_mean=" << rescue_diagnostics.root_alternative_future_mean
+         << " root_alternative_margin=" << rescue_diagnostics.root_alternative_margin
+         << " root_expanded_predicted_gain=" << rescue_diagnostics.root_expanded_predicted_gain
+         << " root_confirmation_screen_gain=" << rescue_diagnostics.root_confirmation_screen_gain
+         << " root_confirmation_holdout_margin="
+         << rescue_diagnostics.root_confirmation_holdout_margin
+         << " root_confirmation_approved_margin="
+         << rescue_diagnostics.root_confirmation_approved_margin
+         << " root_confirmation_rejected_margin="
+         << rescue_diagnostics.root_confirmation_rejected_margin
          << " theta_mean=" << mean_theta << " shadow_mean_opportunity=" << mean_opportunity_cost
          << " shadow_mean_rejected_fraction=" << mean_rejected_fraction
          << " shadow_max_rejected_fraction=" << shadow_diagnostics.maximum_rejected_fraction
          << " shadow_priced_buckets=" << shadow_diagnostics.priced_buckets
          << " model_expected_p=" << density_model.expected_group_size
-         << " cleanup_rollout_future_gain=" << cleanup_diagnostics.rollout_future_gain_sum
-         << " cleanup_pre_arrival_score_gain=" << cleanup_diagnostics.pre_arrival_score_gain_sum
-         << " cleanup_rollout_margin=" << cleanup_diagnostics.rollout_margin_sum << " elapsed=" << setprecision(3)
-         << timer.elapsed() << '\n';
+         << " elapsed=" << setprecision(3) << timer.elapsed() << '\n';
 
     return 0;
 }
