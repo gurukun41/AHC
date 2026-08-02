@@ -4142,3 +4142,106 @@ one-helper v15/v16の実装と結果はcommit `8ae2217`（`AHC069: archive stage
 Clang C++17/C++20とGCC C++17の警告付きsyntax検査、3 binaryのbuild、Clang Static Analyzer、`git diff --check`はすべてpassし、標準警告・指摘0件。hard gateは全100 seedのscore一致、stdout byte一致、100/100 AC、共通するnon-timing診断値の一致、全error/identity field 0、ログ上`deadline=0 / pushout=1 / grow-and-trim=1 / sampled-DLP=1`とする。
 
 ここまで固定した復元binaryはまだ一度も実行していない。以降はsanitizer probe、100 seed互換検証、seed 0決定性probeを行い、最初の解答実行後はユーザーの次の明示指示までsource・config・memoを変更しない。
+
+## 2026-08-02: predictive sparse DP v17（実行前固定）
+
+sampled DLPが将来需要を連続量として価格付けするのに対し、将来の組を丸ごと受理・拒否する組合せを予測するDPへ将来価値評価を置換した。通常配置、grow-and-trim、admissionの比較式、future-fit、rollout、compact rescue、既存NoRegion Push-outには手を加えていない。比較は厳密には「16 bucketのfluid LP」と「同じ16境界を8帯へ集約し、量子化と幅制限を加えた0/1 sparse DP」のpackage A/Bであり、DP化だけの効果とは解釈しない。
+
+### 共通の予測snapshot
+
+posterior、256件の代表request、Halton型のsample座標、16本の元境界、rebuild trigger、request hashは旧sampled DLPと共通である。DPだけが16区間を次のindexで8帯へ集約する。
+
+    {0, 1, 2, 3, 4, 6, 8, 12, 16}
+
+終盤に元bucketが8以下なら1対1、それより多く16未満なら上のcutをstrict-increasingになるよう比例縮約する。近い将来を細かくし、遠方だけをまとめる構成である。
+
+rebuild時の残り組数を`m`とし、256代表の共通重みを`w=m/256`とする。各帯の容量は、芝生セル数×帯時間から現在activeな全組の既知のcell-timeを引いた値である。未来代表requestは理想料金を報酬、全滞在区間が各帯で消費する`w`倍cell-timeを8次元負荷として、take/skipを同時に決める。これにより、長く滞在する1組が複数時刻の容量を同時に使う相関を残す。
+
+容量は各帯のfull cell-timeを65,535段階へfloor、未来item負荷はnearest、現在候補のquery負荷はceilで量子化する。積と除算は`i128`、状態使用量は`uint16_t[8]`、item負荷は`uint32_t[8]`、報酬は重みを掛けない`long long`の理想料金和で保持する。
+
+### sparse frontierと機会費用
+
+frontier上限は512状態。各itemについてskipとfeasible takeを作り、exact usageが同じ状態は報酬最大だけを残す。512を超えた場合は各次元を同じbit数だけ右shiftするepsilon boxを作り、zero-usage状態と全box winnerが512以内になる最小shiftを選ぶ。box winnerは報酬降順、同値なら総使用量昇順、さらにexact usage辞書順で一意に決め、空き枠は同じ全順序の上位状態で埋める。同じbox内の低報酬・低使用量な非支配状態を落とし得るため、縮小容量で将来価値を過小、機会費用を過大評価する近似誤差は残る。これは初回幅512版の既知の制約として固定する。
+
+初期実装の複数sortは静的計算量が大きかったため、解答実行前に次へ最適化した。
+
+- exact usage順のskip列と、固定loadを加えたtake列を線形mergeする。
+- 最大1,024 keyを2,048 slotのgeneration付きopen-address tableへ入れてbox数とwinnerを求める。
+- 空き枠だけ`nth_element`で選び、最後は元のexact usage順の部分列としてfrontierを作る。
+
+これにより、約75 rebuildならtake判定の上限は`75×256×512=9,830,400`回で、各itemに数回の最大1,024-state hash scanを加える程度になる。線形mergeの順序帰納、hash tableの空slot保証、collision処理、generation wrap、`nth_element`の全順序と決定性は独立監査済みである。
+
+rebuild時の元容量に対する最大報酬を`V(C)`、現在候補の量子化負荷を引いた容量で同じfrontierを走査した最大報酬を`V(C-q)`とし、
+
+    opportunity cost = m * (V(C) - V(C-q)) / 256
+
+を既存の全admission・placement・Push-out・rollout評価へ渡す。rebuildしない実turnとsynthetic rolloutでも、rebuild時の`m`、容量、frontierを凍結して使う。候補ごとに未来を再推定せず、旧sampled DLPと同じ因果境界を守る。
+
+### A/B境界と診断
+
+既定のTreatmentは予測DPだけをsolve/queryする。`AHC069_DISABLE_PREDICTIVE_DP`付きControlは旧sampled DLPだけをsolveし、旧価格内積を使う。両方を同時に解く処理やblendはない。静的binary symbolでもTreatmentにはDP solve/queryだけ、Controlには旧dual solveだけが残ることを確認した。
+
+DP診断にはsolve/query/item数、transition可否、prune入出力、exact duplicate、width prune、frontier、epsilon shift histogram、zero-load item、容量/item/query load、base/reduced value、frontier hash、rebuild/query CPUを記録する。次を全caseで0とする。
+
+    predictive_dp_frontier_cap_errors
+    predictive_dp_duplicate_errors
+    predictive_dp_capacity_errors
+    predictive_dp_query_order_errors
+    predictive_dp_nonfinite_errors
+    predictive_dp_zero_state_errors
+    predictive_dp_frontier_order_errors
+    predictive_dp_query_upper_bound_errors
+    predictive_dp_solve_count_error
+    predictive_dp_query_count_error
+    predictive_dp_query_partition_error
+    predictive_dp_transition_partition_error
+    predictive_dp_item_count_error
+    predictive_dp_generation_error
+    predictive_dp_prune_accounting_error
+    predictive_dp_shift_histogram_error
+    predictive_dp_maximum_shift_error
+    predictive_dp_internal_errors
+    predictive_dp_disabled_activity_error
+    predictive_dp_disabled_cpu_error
+    predictive_dp_opportunity_identity_error
+
+既存のsampled DLP、Push-out、grow-and-trim、score decomposition、status/plan/source等の全error/identity fieldも0を要求する。ControlとTreatmentで一致を要求するのはrebuild回数・trigger内訳・generated request数・sample hashである。採否後の盤面に依存する容量、rollout call数、zero-future call数、frontier hashは一致gateにしない。
+
+### 実験順と事前判定基準
+
+1. Treatment sanitizerをseed 0、7、37で実行する。
+2. Controlをseed 0〜99、threads=1で実行する。
+3. Controlが凍結v14と全score・stdoutで完全一致した場合だけTreatmentをseed 0〜99で実行する。
+4. seed 0、7、37を再実行し、Treatmentの決定性を確認する。
+5. 固定best scoreから相対値を再計算し、読み取り専用でpaired分析する。
+
+sanitizer異常またはControl互換失敗なら、その時点でsourceを変更せず停止して報告する。hard gateは100/100 AC、全error/identity 0、Control total `6,515,194,836`、Control全stdout byte一致、Treatment/Controlの共通sample・rebuild因果一致である。
+
+採用の強い基準は絶対score合計+0.20%以上、seed比の幾何平均>1、paired bootstrap 95%下限>=0.998、seed比p05>=0.98、worst>=0.94、低・中・高R層の各合計比>=0.99とする。solver内部CPUは同batch Control比で平均1.20倍以内、p95 1.25倍以内を要求する。0〜+0.20%は弱い正信号として即採用せず、負またはtail/runtime gate違反なら棄却寄りとする。
+
+### 実行前固定物
+
+- baseline commit: `9506343`
+- baseline source SHA-256: `6f763500e0d5c0c851ce26971be88129f87666d9659d6463ded4f9f29280e997`
+- baseline binary: `/private/tmp/ahc069_v14_restored`
+- baseline result: `pahcer/json/result_20260802_192918.json`
+- baseline absolute score: `6,515,194,836`（100/100 AC）
+- baseline stdout: `tools/out-v14-restored/{0000..0099}.txt`
+- `main.cpp` SHA-256: `ee024fb71356c494720882408a779269a47bb598b66550a9658a564ce39a36ff`
+- Treatment binary: `/private/tmp/ahc069_predictive_dp_v17`
+- Treatment binary SHA-256: `039bdd5926c69d30412389384fbfcf16568739efe423d5adfbb2fd33b5f3f5f7`
+- Control binary: `/private/tmp/ahc069_predictive_dp_v17_control`
+- Control binary SHA-256: `526245c8a6f660f0ad6e15382c2f339ddd0eb31ec14c0e6f2abfc9e837c194b9`
+- sanitizer binary: `/private/tmp/ahc069_predictive_dp_v17_san`
+- sanitizer binary SHA-256: `725d78e37a41b4025f7fac095404b3559f8a92f39aeecd6d1a691e7fc44d2179`
+- Treatment config: `pahcer/bench_predictive_dp_v17.toml`
+- Treatment config SHA-256: `c922c336a3da14a8cbe3790b96c617fb103c01639e6a47177325ba919f5e2c34`
+- Control config: `pahcer/bench_predictive_dp_v17_control.toml`
+- Control config SHA-256: `dbc4037943b95020a75cd0a0e9d8971fac9d53bce7b7bae0aa7335f403d5e076`
+- tester SHA-256: `3702067f731de62b30a395f99eee04a4a9e247a1f421e2c42556a9e45b62ec92`
+- `pahcer/best_scores.json` SHA-256: `b4c70ce5bb84ec557353d33d6c41f96e857a6d74d5f3213c685a1f602c5d1fa6`
+- seed 0 / 99 SHA-256: `61857f9adeb56546a876f9f54eec3e95be617d4a1135d987ae790a2248304754` / `cfb3c1678be95ff9ff760cafed7a36c99a769c4c75c679b4a0bdef7d8edf2ad8`
+
+Clang C++17 Treatment/Control、Clang C++20、GCC C++17のbuild・syntax検査、`-Wall -Wextra -Wpedantic`、ASan/UBSan build、Clang Static Analyzer、`git diff --check`はpassし、標準警告・解析指摘0件。数理、A/B isolation、hook、順序不変条件、hash安全性、決定性、計算量、診断保存則を3系統で独立監査し、blocking issue 0を確認した。
+
+ここまで固定した3 binaryはまだ一度も実行していない。以降は上のsanitizer、Control互換、Treatment 100 seed、決定性probeを一つのbatchとして行う。最初の解答実行後は結果にかかわらずsource、方針、診断、config、memo、binaryを変更せず、読み取りと結果報告だけを行う。

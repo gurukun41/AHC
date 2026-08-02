@@ -121,6 +121,19 @@ constexpr int SAMPLED_DLP_BUCKET_COUNT = 16;
 constexpr int SAMPLED_DLP_REQUEST_COUNT = 256;
 constexpr int SAMPLED_DLP_COORDINATE_SWEEPS = 8;
 constexpr long double SAMPLED_DLP_PRICE_QUANTIZATION = 1000000000.0L;
+constexpr int PREDICTIVE_DP_BUCKET_COUNT = 8;
+constexpr int PREDICTIVE_DP_CAPACITY_LEVELS = 65535;
+constexpr int PREDICTIVE_DP_FRONTIER_LIMIT = 512;
+constexpr int PREDICTIVE_DP_BOX_TABLE_SIZE = 2048;
+constexpr array<int, PREDICTIVE_DP_BUCKET_COUNT + 1> PREDICTIVE_DP_REFERENCE_CUTS = {
+    0, 1, 2, 3, 4, 6, 8, 12, 16,
+};
+static_assert(PREDICTIVE_DP_CAPACITY_LEVELS == numeric_limits<uint16_t>::max());
+static_assert(PREDICTIVE_DP_BUCKET_COUNT == 8);
+static_assert((PREDICTIVE_DP_BOX_TABLE_SIZE &
+               (PREDICTIVE_DP_BOX_TABLE_SIZE - 1)) == 0);
+static_assert(PREDICTIVE_DP_BOX_TABLE_SIZE >=
+              4 * PREDICTIVE_DP_FRONTIER_LIMIT);
 constexpr int THETA_MIN = 2000;
 constexpr int THETA_MAX = 8000;
 constexpr int THETA_STEP = 100;
@@ -202,6 +215,11 @@ constexpr bool ENABLE_GROW_AND_TRIM = true;
 constexpr bool ENABLE_SAMPLED_DLP = false;
 #else
 constexpr bool ENABLE_SAMPLED_DLP = true;
+#endif
+#ifdef AHC069_DISABLE_PREDICTIVE_DP
+constexpr bool ENABLE_PREDICTIVE_DP = false;
+#else
+constexpr bool ENABLE_PREDICTIVE_DP = ENABLE_SAMPLED_DLP;
 #endif
 #ifdef AHC069_PROTECTED_ONLY
 constexpr bool ROOT_PROTECTED_ONLY = true;
@@ -849,6 +867,44 @@ struct SampledDlpDiagnostics {
     double rebuild_cpu_ms = 0.0;
     double maximum_rebuild_cpu_ms = 0.0;
     uint64_t sample_hash = 1469598103934665603ULL;
+
+    int predictive_dp_solves = 0;
+    int predictive_dp_prune_steps = 0;
+    int predictive_dp_maximum_frontier = 0;
+    int predictive_dp_maximum_shift = 0;
+    int predictive_dp_positive_queries = 0;
+    int predictive_dp_zero_queries = 0;
+    int predictive_dp_frontier_cap_errors = 0;
+    int predictive_dp_duplicate_errors = 0;
+    int predictive_dp_capacity_errors = 0;
+    int predictive_dp_query_order_errors = 0;
+    int predictive_dp_nonfinite_errors = 0;
+    int predictive_dp_zero_state_errors = 0;
+    int predictive_dp_frontier_order_errors = 0;
+    int predictive_dp_query_upper_bound_errors = 0;
+    long long predictive_dp_transitions = 0;
+    long long predictive_dp_feasible_transitions = 0;
+    long long predictive_dp_infeasible_transitions = 0;
+    long long predictive_dp_items_processed = 0;
+    long long predictive_dp_prune_input_states = 0;
+    long long predictive_dp_frontier_output_states = 0;
+    long long predictive_dp_exact_duplicates = 0;
+    long long predictive_dp_width_pruned = 0;
+    long long predictive_dp_terminal_states = 0;
+    long long predictive_dp_zero_load_items = 0;
+    long long predictive_dp_capacity_level_sum = 0;
+    long long predictive_dp_item_load_level_sum = 0;
+    long long predictive_dp_query_load_level_sum = 0;
+    long long predictive_dp_query_calls = 0;
+    long long predictive_dp_base_value_sum = 0;
+    long long predictive_dp_reduced_value_sum = 0;
+    long double predictive_dp_opportunity_cost_sum = 0.0L;
+    array<long long, 17> predictive_dp_shift_histogram{};
+    double predictive_dp_rebuild_cpu_ms = 0.0;
+    double predictive_dp_maximum_rebuild_cpu_ms = 0.0;
+    double predictive_dp_query_cpu_ms = 0.0;
+    double predictive_dp_maximum_query_cpu_ms = 0.0;
+    uint64_t predictive_dp_frontier_hash = 1469598103934665603ULL;
 };
 
 long double sampled_dlp_radical_inverse(uint64_t index, int base) {
@@ -863,9 +919,9 @@ long double sampled_dlp_radical_inverse(uint64_t index, int base) {
     return clamp(result, 1e-12L, 1.0L - 1e-12L);
 }
 
-// A periodically re-solved deterministic linear program replaces the
-// independent 64-bucket tail approximation when sampled DLP is enabled.  It
-// prices pooled cell-time only; geometry remains the responsibility of the
+// A common deterministic future sample feeds two interchangeable valuations:
+// the old linear-program dual and an eight-dimensional sparse knapsack DP.
+// Both price pooled cell-time only; geometry remains the responsibility of the
 // unchanged placement and Push-out layers.
 struct SampledDlpShadowModel {
     struct Request {
@@ -874,6 +930,23 @@ struct SampledDlpShadowModel {
         int p = 0;
         ll ideal_fee = 0;
         array<long double, SAMPLED_DLP_BUCKET_COUNT> load{};
+    };
+
+    struct PredictiveDpItem {
+        array<uint32_t, PREDICTIVE_DP_BUCKET_COUNT> load{};
+        ll reward = 0;
+    };
+
+    struct PredictiveDpState {
+        array<uint16_t, PREDICTIVE_DP_BUCKET_COUNT> used{};
+        ll reward = 0;
+    };
+
+    struct PredictiveDpBoxSlot {
+        uint64_t low_key = 0;
+        uint64_t high_key = 0;
+        int best_index = -1;
+        int generation = 0;
     };
 
     enum class RebuildTrigger {
@@ -887,6 +960,17 @@ struct SampledDlpShadowModel {
     vector<float> exact_future_survival;
     array<ll, SAMPLED_DLP_BUCKET_COUNT + 1> boundaries{};
     array<long double, SAMPLED_DLP_BUCKET_COUNT> prices{};
+    array<int, PREDICTIVE_DP_BUCKET_COUNT + 1> predictive_dp_cuts{};
+    array<ll, PREDICTIVE_DP_BUCKET_COUNT> predictive_dp_full_cell_time{};
+    array<uint16_t, PREDICTIVE_DP_BUCKET_COUNT> predictive_dp_capacity{};
+    vector<PredictiveDpState> predictive_dp_frontier;
+    array<PredictiveDpBoxSlot, PREDICTIVE_DP_BOX_TABLE_SIZE>
+        predictive_dp_box_table{};
+    int predictive_dp_box_generation = 0;
+    ll predictive_dp_base_reward = 0;
+    int predictive_dp_bucket_count = 0;
+    int predictive_dp_snapshot_remaining_groups = 0;
+    bool predictive_dp_ready = false;
     int bucket_count = 0;
     bool ready = false;
     SampledDlpDiagnostics diagnostics;
@@ -1193,6 +1277,491 @@ struct SampledDlpShadowModel {
         diagnostics.dual_objective_sum += dual_objective;
     }
 
+    static bool same_predictive_dp_usage(const PredictiveDpState &lhs,
+                                         const PredictiveDpState &rhs) {
+        return lhs.used == rhs.used;
+    }
+
+    static int predictive_dp_total_usage(const PredictiveDpState &state) {
+        return accumulate(state.used.begin(), state.used.end(), 0);
+    }
+
+    static bool better_predictive_dp_state(const PredictiveDpState &lhs,
+                                           const PredictiveDpState &rhs) {
+        if (lhs.reward != rhs.reward) return lhs.reward > rhs.reward;
+        int lhs_total = predictive_dp_total_usage(lhs);
+        int rhs_total = predictive_dp_total_usage(rhs);
+        if (lhs_total != rhs_total) return lhs_total < rhs_total;
+        return lhs.used < rhs.used;
+    }
+
+    static pair<uint64_t, uint64_t> predictive_dp_usage_key(
+        const PredictiveDpState &state) {
+        pair<uint64_t, uint64_t> result{};
+        for (int d = 0; d < 4; d++) {
+            result.first |= (uint64_t)state.used[d] << (16 * d);
+            result.second |= (uint64_t)state.used[d + 4] << (16 * d);
+        }
+        return result;
+    }
+
+    static pair<uint64_t, uint64_t> predictive_dp_box_key(
+        const PredictiveDpState &state, int shift) {
+        pair<uint64_t, uint64_t> result{};
+        for (int d = 0; d < 4; d++) {
+            result.first |= (uint64_t)(state.used[d] >> shift) << (16 * d);
+            result.second |=
+                (uint64_t)(state.used[d + 4] >> shift) << (16 * d);
+        }
+        return result;
+    }
+
+    void build_predictive_dp_cuts() {
+        predictive_dp_cuts.fill(0);
+        if (bucket_count <= PREDICTIVE_DP_BUCKET_COUNT) {
+            predictive_dp_bucket_count = bucket_count;
+            for (int d = 0; d <= predictive_dp_bucket_count; d++) {
+                predictive_dp_cuts[d] = d;
+            }
+            return;
+        }
+
+        predictive_dp_bucket_count = PREDICTIVE_DP_BUCKET_COUNT;
+        predictive_dp_cuts[0] = 0;
+        predictive_dp_cuts[predictive_dp_bucket_count] = bucket_count;
+        for (int d = 1; d < predictive_dp_bucket_count; d++) {
+            int proposed =
+                (PREDICTIVE_DP_REFERENCE_CUTS[d] * bucket_count +
+                 SAMPLED_DLP_BUCKET_COUNT / 2) /
+                SAMPLED_DLP_BUCKET_COUNT;
+            int lower = predictive_dp_cuts[d - 1] + 1;
+            int upper = bucket_count - (predictive_dp_bucket_count - d);
+            predictive_dp_cuts[d] = clamp(proposed, lower, upper);
+        }
+    }
+
+    vector<PredictiveDpItem> build_predictive_dp_items(
+        const vector<Request> &requests, int remaining_groups,
+        const vector<GroupState> &groups, int grass_cells) {
+        build_predictive_dp_cuts();
+        predictive_dp_full_cell_time.fill(0);
+        predictive_dp_capacity.fill(0);
+
+        for (int d = 0; d < predictive_dp_bucket_count; d++) {
+            ll begin = boundaries[predictive_dp_cuts[d]];
+            ll end = boundaries[predictive_dp_cuts[d + 1]];
+            ll full_cell_time = (ll)grass_cells * (end - begin);
+            predictive_dp_full_cell_time[d] = full_cell_time;
+            if (full_cell_time <= 0) {
+                diagnostics.predictive_dp_capacity_errors++;
+                continue;
+            }
+
+            ll committed_cell_time = 0;
+            for (const GroupState &group : groups) {
+                if (!group.active) continue;
+                ll overlap = max(0LL, min(group.t, end) - max(group.s, begin));
+                committed_cell_time += (ll)group.p * overlap;
+            }
+            ll available_cell_time = clamp(full_cell_time - committed_cell_time,
+                                           0LL, full_cell_time);
+            int capacity = (int)((i128)available_cell_time *
+                                 PREDICTIVE_DP_CAPACITY_LEVELS /
+                                 full_cell_time);
+            if (capacity < 0 || capacity > PREDICTIVE_DP_CAPACITY_LEVELS) {
+                diagnostics.predictive_dp_capacity_errors++;
+                capacity = clamp(capacity, 0, PREDICTIVE_DP_CAPACITY_LEVELS);
+            }
+            predictive_dp_capacity[d] = capacity;
+            diagnostics.predictive_dp_capacity_level_sum += capacity;
+        }
+
+        vector<PredictiveDpItem> items;
+        items.reserve(requests.size());
+        for (const Request &request : requests) {
+            PredictiveDpItem item;
+            item.reward = request.ideal_fee;
+            bool has_load = false;
+            for (int d = 0; d < predictive_dp_bucket_count; d++) {
+                ll begin = boundaries[predictive_dp_cuts[d]];
+                ll end = boundaries[predictive_dp_cuts[d + 1]];
+                ll overlap = max(0LL, min(request.t, end) - max(request.s, begin));
+                ll cell_time = (ll)request.p * overlap;
+                ll full_cell_time = predictive_dp_full_cell_time[d];
+                if (cell_time == 0 || full_cell_time <= 0) continue;
+                i128 numerator = (i128)remaining_groups * cell_time *
+                                 PREDICTIVE_DP_CAPACITY_LEVELS;
+                i128 denominator = (i128)SAMPLED_DLP_REQUEST_COUNT * full_cell_time;
+                i128 rounded = (numerator + denominator / 2) / denominator;
+                uint32_t load =
+                    rounded > numeric_limits<uint32_t>::max()
+                        ? numeric_limits<uint32_t>::max()
+                        : (uint32_t)rounded;
+                item.load[d] = load;
+                diagnostics.predictive_dp_item_load_level_sum += load;
+                has_load |= load != 0;
+            }
+            if (!has_load && item.reward > 0) diagnostics.predictive_dp_zero_load_items++;
+            items.push_back(std::move(item));
+        }
+        return items;
+    }
+
+    vector<PredictiveDpState> prune_predictive_dp_frontier(
+        vector<PredictiveDpState> skipped,
+        vector<PredictiveDpState> taken) {
+        diagnostics.predictive_dp_prune_input_states +=
+            skipped.size() + taken.size();
+
+        // Both inputs are already in exact usage order: adding one item's
+        // fixed load preserves the order of every feasible parent state.
+        // Merge them directly instead of sorting up to 1024 states per item.
+        vector<PredictiveDpState> unique_states;
+        unique_states.reserve(skipped.size() + taken.size());
+        int skipped_index = 0;
+        int taken_index = 0;
+        while (skipped_index < (int)skipped.size() ||
+               taken_index < (int)taken.size()) {
+            if (taken_index == (int)taken.size() ||
+                (skipped_index < (int)skipped.size() &&
+                 skipped[skipped_index].used < taken[taken_index].used)) {
+                unique_states.push_back(std::move(skipped[skipped_index++]));
+            } else if (skipped_index == (int)skipped.size() ||
+                       taken[taken_index].used < skipped[skipped_index].used) {
+                unique_states.push_back(std::move(taken[taken_index++]));
+            } else {
+                diagnostics.predictive_dp_exact_duplicates++;
+                if (better_predictive_dp_state(taken[taken_index],
+                                               skipped[skipped_index])) {
+                    unique_states.push_back(std::move(taken[taken_index]));
+                } else {
+                    unique_states.push_back(std::move(skipped[skipped_index]));
+                }
+                skipped_index++;
+                taken_index++;
+            }
+        }
+        if ((int)unique_states.size() <= PREDICTIVE_DP_FRONTIER_LIMIT) {
+            diagnostics.predictive_dp_frontier_output_states +=
+                unique_states.size();
+            chmax(diagnostics.predictive_dp_maximum_frontier,
+                  (int)unique_states.size());
+            return unique_states;
+        }
+
+        int zero_index = -1;
+        for (int index = 0; index < (int)unique_states.size(); index++) {
+            if (all_of(unique_states[index].used.begin(),
+                       unique_states[index].used.end(),
+                       [](uint16_t value) { return value == 0; })) {
+                zero_index = index;
+                break;
+            }
+        }
+
+        array<vector<int>, 17> cached_box_winners;
+        array<char, 17> box_winners_ready{};
+        auto box_winners = [&](int shift) -> const vector<int> & {
+            vector<int> &winners = cached_box_winners[shift];
+            if (box_winners_ready[shift]) return winners;
+            box_winners_ready[shift] = true;
+
+            if (predictive_dp_box_generation == numeric_limits<int>::max()) {
+                for (PredictiveDpBoxSlot &slot : predictive_dp_box_table) {
+                    slot.generation = 0;
+                }
+                predictive_dp_box_generation = 1;
+            } else {
+                predictive_dp_box_generation++;
+            }
+            int generation = predictive_dp_box_generation;
+            vector<int> occupied_slots;
+            occupied_slots.reserve(unique_states.size());
+            for (int index = 0; index < (int)unique_states.size(); index++) {
+                auto [low_key, high_key] =
+                    predictive_dp_box_key(unique_states[index], shift);
+                uint64_t hash = mix_hash(1469598103934665603ULL, low_key);
+                hash = mix_hash(hash, high_key);
+                int slot_index = hash & (PREDICTIVE_DP_BOX_TABLE_SIZE - 1);
+                while (true) {
+                    PredictiveDpBoxSlot &slot =
+                        predictive_dp_box_table[slot_index];
+                    if (slot.generation != generation) {
+                        slot.low_key = low_key;
+                        slot.high_key = high_key;
+                        slot.best_index = index;
+                        slot.generation = generation;
+                        occupied_slots.push_back(slot_index);
+                        break;
+                    }
+                    if (slot.low_key == low_key && slot.high_key == high_key) {
+                        if (better_predictive_dp_state(
+                                unique_states[index],
+                                unique_states[slot.best_index])) {
+                            slot.best_index = index;
+                        }
+                        break;
+                    }
+                    slot_index =
+                        (slot_index + 1) & (PREDICTIVE_DP_BOX_TABLE_SIZE - 1);
+                }
+            }
+            winners.reserve(occupied_slots.size());
+            for (int slot_index : occupied_slots) {
+                winners.push_back(
+                    predictive_dp_box_table[slot_index].best_index);
+            }
+            return winners;
+        };
+
+        int low = 0;
+        int high = 16;
+        while (low < high) {
+            int middle = (low + high) / 2;
+            if ((int)box_winners(middle).size() <=
+                PREDICTIVE_DP_FRONTIER_LIMIT) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        int shift = low;
+        vector<int> winners;
+        while (true) {
+            winners = box_winners(shift);
+            bool zero_is_winner =
+                zero_index == -1 ||
+                find(winners.begin(), winners.end(), zero_index) != winners.end();
+            int required_states = winners.size() + (zero_is_winner ? 0 : 1);
+            if (required_states <= PREDICTIVE_DP_FRONTIER_LIMIT) {
+                break;
+            }
+            shift++;
+        }
+        diagnostics.predictive_dp_prune_steps++;
+        diagnostics.predictive_dp_shift_histogram[shift]++;
+        chmax(diagnostics.predictive_dp_maximum_shift, shift);
+
+        auto better_index = [&](int lhs, int rhs) {
+            return better_predictive_dp_state(unique_states[lhs], unique_states[rhs]);
+        };
+
+        vector<char> selected(unique_states.size(), false);
+        int retained_count = 0;
+        auto add = [&](int index) {
+            if (selected[index] ||
+                retained_count == PREDICTIVE_DP_FRONTIER_LIMIT) {
+                return;
+            }
+            selected[index] = true;
+            retained_count++;
+        };
+
+        if (zero_index != -1) add(zero_index);
+        for (int index : winners) add(index);
+
+        int needed = PREDICTIVE_DP_FRONTIER_LIMIT - retained_count;
+        if (needed > 0) {
+            vector<int> fillers;
+            fillers.reserve(unique_states.size() - retained_count);
+            for (int index = 0; index < (int)unique_states.size(); index++) {
+                if (!selected[index]) fillers.push_back(index);
+            }
+            if (needed < (int)fillers.size()) {
+                nth_element(fillers.begin(), fillers.begin() + needed,
+                            fillers.end(), better_index);
+                fillers.resize(needed);
+            }
+            for (int index : fillers) add(index);
+        }
+
+        vector<PredictiveDpState> result;
+        result.reserve(retained_count);
+        for (int index = 0; index < (int)unique_states.size(); index++) {
+            if (selected[index]) {
+                result.push_back(std::move(unique_states[index]));
+            }
+        }
+        diagnostics.predictive_dp_width_pruned +=
+            unique_states.size() - result.size();
+        diagnostics.predictive_dp_frontier_output_states += result.size();
+        chmax(diagnostics.predictive_dp_maximum_frontier, (int)result.size());
+        return result;
+    }
+
+    void solve_predictive_dp(const vector<Request> &requests, int remaining_groups,
+                             const vector<GroupState> &groups, int grass_cells) {
+        clock_t cpu_begin = clock();
+        predictive_dp_ready = false;
+        predictive_dp_snapshot_remaining_groups = remaining_groups;
+        vector<PredictiveDpItem> items = build_predictive_dp_items(
+            requests, remaining_groups, groups, grass_cells);
+
+        predictive_dp_frontier.assign(1, PredictiveDpState{});
+        for (const PredictiveDpItem &item : items) {
+            diagnostics.predictive_dp_items_processed++;
+            vector<PredictiveDpState> taken;
+            taken.reserve(predictive_dp_frontier.size());
+            for (const PredictiveDpState &state : predictive_dp_frontier) {
+                diagnostics.predictive_dp_transitions++;
+                bool feasible = true;
+                PredictiveDpState child = state;
+                for (int d = 0; d < predictive_dp_bucket_count; d++) {
+                    uint32_t used = (uint32_t)state.used[d] + item.load[d];
+                    if (used > predictive_dp_capacity[d]) {
+                        feasible = false;
+                        break;
+                    }
+                    child.used[d] = used;
+                }
+                if (!feasible) {
+                    diagnostics.predictive_dp_infeasible_transitions++;
+                    continue;
+                }
+                diagnostics.predictive_dp_feasible_transitions++;
+                child.reward += item.reward;
+                taken.push_back(std::move(child));
+            }
+            predictive_dp_frontier = prune_predictive_dp_frontier(
+                std::move(predictive_dp_frontier), std::move(taken));
+            if ((int)predictive_dp_frontier.size() > PREDICTIVE_DP_FRONTIER_LIMIT) {
+                diagnostics.predictive_dp_frontier_cap_errors++;
+            }
+        }
+
+        predictive_dp_base_reward = 0;
+        bool has_zero_usage_state = false;
+        for (int index = 0; index < (int)predictive_dp_frontier.size(); index++) {
+            const PredictiveDpState &state = predictive_dp_frontier[index];
+            chmax(predictive_dp_base_reward, state.reward);
+            has_zero_usage_state |=
+                all_of(state.used.begin(), state.used.end(),
+                       [](uint16_t value) { return value == 0; });
+            for (int d = 0; d < predictive_dp_bucket_count; d++) {
+                if (state.used[d] > predictive_dp_capacity[d]) {
+                    diagnostics.predictive_dp_capacity_errors++;
+                }
+            }
+            if (index > 0 &&
+                same_predictive_dp_usage(predictive_dp_frontier[index - 1], state)) {
+                diagnostics.predictive_dp_duplicate_errors++;
+            }
+            if (index > 0 &&
+                state.used < predictive_dp_frontier[index - 1].used) {
+                diagnostics.predictive_dp_frontier_order_errors++;
+            }
+        }
+        if (!has_zero_usage_state) diagnostics.predictive_dp_zero_state_errors++;
+        diagnostics.predictive_dp_solves++;
+        diagnostics.predictive_dp_terminal_states += predictive_dp_frontier.size();
+        chmax(diagnostics.predictive_dp_maximum_frontier,
+              (int)predictive_dp_frontier.size());
+
+        uint64_t frontier_hash = mix_hash(1469598103934665603ULL,
+                                          predictive_dp_bucket_count);
+        frontier_hash = mix_hash(frontier_hash, remaining_groups);
+        for (int d = 0; d < predictive_dp_bucket_count; d++) {
+            frontier_hash = mix_hash(frontier_hash, predictive_dp_cuts[d]);
+            frontier_hash = mix_hash(frontier_hash, predictive_dp_capacity[d]);
+        }
+        frontier_hash = mix_hash(frontier_hash,
+                                 predictive_dp_cuts[predictive_dp_bucket_count]);
+        for (const PredictiveDpState &state : predictive_dp_frontier) {
+            auto [low_key, high_key] = predictive_dp_usage_key(state);
+            frontier_hash = mix_hash(frontier_hash, low_key);
+            frontier_hash = mix_hash(frontier_hash, high_key);
+            frontier_hash = mix_hash(frontier_hash, state.reward);
+        }
+        diagnostics.predictive_dp_frontier_hash =
+            mix_hash(diagnostics.predictive_dp_frontier_hash, frontier_hash);
+        predictive_dp_ready = true;
+
+        double cpu_ms = 1000.0 * (double)(clock() - cpu_begin) / CLOCKS_PER_SEC;
+        diagnostics.predictive_dp_rebuild_cpu_ms += cpu_ms;
+        chmax(diagnostics.predictive_dp_maximum_rebuild_cpu_ms, cpu_ms);
+    }
+
+    ShadowEvaluation evaluate_predictive_dp(ll current_s, ll arrival_t, int p) {
+        clock_t cpu_begin = clock();
+        auto record_query_cpu = [&]() {
+            double cpu_ms =
+                1000.0 * (double)(clock() - cpu_begin) / CLOCKS_PER_SEC;
+            diagnostics.predictive_dp_query_cpu_ms += cpu_ms;
+            chmax(diagnostics.predictive_dp_maximum_query_cpu_ms, cpu_ms);
+        };
+        ShadowEvaluation result;
+        diagnostics.predictive_dp_query_calls++;
+        if (!predictive_dp_ready || predictive_dp_frontier.empty() ||
+            predictive_dp_snapshot_remaining_groups <= 0) {
+            diagnostics.invalid_model_errors++;
+            record_query_cpu();
+            return result;
+        }
+
+        array<uint16_t, PREDICTIVE_DP_BUCKET_COUNT> reduced_capacity =
+            predictive_dp_capacity;
+        int occupied_buckets = 0;
+        for (int d = 0; d < predictive_dp_bucket_count; d++) {
+            ll begin = boundaries[predictive_dp_cuts[d]];
+            ll end = boundaries[predictive_dp_cuts[d + 1]];
+            ll overlap = max(0LL, min(arrival_t, end) - max(current_s, begin));
+            ll cell_time = (ll)p * overlap;
+            ll full_cell_time = predictive_dp_full_cell_time[d];
+            if (cell_time == 0 || full_cell_time <= 0) continue;
+            i128 numerator = (i128)cell_time * PREDICTIVE_DP_CAPACITY_LEVELS;
+            uint32_t query_load =
+                (uint32_t)((numerator + full_cell_time - 1) / full_cell_time);
+            diagnostics.predictive_dp_query_load_level_sum += query_load;
+            reduced_capacity[d] =
+                query_load >= reduced_capacity[d]
+                    ? 0
+                    : (uint16_t)(reduced_capacity[d] - query_load);
+            occupied_buckets++;
+        }
+
+        ll reduced_reward = 0;
+        for (const PredictiveDpState &state : predictive_dp_frontier) {
+            bool feasible = true;
+            for (int d = 0; d < predictive_dp_bucket_count; d++) {
+                if (state.used[d] > reduced_capacity[d]) {
+                    feasible = false;
+                    break;
+                }
+            }
+            if (feasible) chmax(reduced_reward, state.reward);
+        }
+        if (reduced_reward > predictive_dp_base_reward) {
+            diagnostics.predictive_dp_query_order_errors++;
+            reduced_reward = predictive_dp_base_reward;
+        }
+
+        ll value_delta = predictive_dp_base_reward - reduced_reward;
+        result.opportunity_cost =
+            (long double)predictive_dp_snapshot_remaining_groups * value_delta /
+            SAMPLED_DLP_REQUEST_COUNT;
+        long double upper_bound =
+            (long double)predictive_dp_snapshot_remaining_groups *
+            predictive_dp_base_reward / SAMPLED_DLP_REQUEST_COUNT;
+        if (result.opportunity_cost > upper_bound) {
+            diagnostics.predictive_dp_query_upper_bound_errors++;
+        }
+        if (!isfinite(result.opportunity_cost) || result.opportunity_cost < 0.0L) {
+            diagnostics.predictive_dp_nonfinite_errors++;
+            diagnostics.nonfinite_errors++;
+            result = ShadowEvaluation{};
+        } else if (result.opportunity_cost > 0.0L) {
+            diagnostics.predictive_dp_positive_queries++;
+            result.priced_buckets = occupied_buckets;
+        } else {
+            diagnostics.predictive_dp_zero_queries++;
+        }
+        diagnostics.predictive_dp_base_value_sum += predictive_dp_base_reward;
+        diagnostics.predictive_dp_reduced_value_sum += reduced_reward;
+        diagnostics.predictive_dp_opportunity_cost_sum += result.opportunity_cost;
+        record_query_cpu();
+        return result;
+    }
+
     void rebuild(int turn, ll current_s, int remaining_groups,
                  const vector<GroupState> &groups, int grass_cells,
                  const ThetaEstimator &theta_estimator, RebuildTrigger trigger) {
@@ -1219,8 +1788,17 @@ struct SampledDlpShadowModel {
         if ((int)requests.size() != SAMPLED_DLP_REQUEST_COUNT) {
             diagnostics.invalid_model_errors++;
             prices.fill(0.0L);
+            predictive_dp_ready = false;
+            predictive_dp_frontier.clear();
         } else {
-            solve_dual(requests, remaining_groups, groups, grass_cells);
+            if constexpr (ENABLE_PREDICTIVE_DP) {
+                solve_predictive_dp(requests, remaining_groups, groups,
+                                    grass_cells);
+            } else {
+                solve_dual(requests, remaining_groups, groups, grass_cells);
+                predictive_dp_ready = false;
+                predictive_dp_frontier.clear();
+            }
         }
         ready = true;
         double cpu_ms = 1000.0 * (double)(clock() - cpu_begin) / CLOCKS_PER_SEC;
@@ -1244,12 +1822,16 @@ struct SampledDlpShadowModel {
             diagnostics.invalid_model_errors++;
             return result;
         }
-        for (int b = 0; b < bucket_count; b++) {
-            ll overlap = max(0LL, min(arrival_t, boundaries[b + 1]) -
-                                      max(current_s, boundaries[b]));
-            if (overlap <= 0) continue;
-            result.opportunity_cost += (long double)p * overlap * prices[b];
-            if (prices[b] > 0.0L) result.priced_buckets++;
+        if constexpr (ENABLE_PREDICTIVE_DP) {
+            result = evaluate_predictive_dp(current_s, arrival_t, p);
+        } else {
+            for (int b = 0; b < bucket_count; b++) {
+                ll overlap = max(0LL, min(arrival_t, boundaries[b + 1]) -
+                                          max(current_s, boundaries[b]));
+                if (overlap <= 0) continue;
+                result.opportunity_cost += (long double)p * overlap * prices[b];
+                if (prices[b] > 0.0L) result.priced_buckets++;
+            }
         }
         if (!isfinite(result.opportunity_cost) || result.opportunity_cost < 0.0L) {
             diagnostics.nonfinite_errors++;
@@ -6410,6 +6992,98 @@ int main() {
         ENABLE_SAMPLED_DLP
             ? dlp_diagnostics.rollout_price_calls - sampled_dlp_expected_rollout_calls
             : dlp_diagnostics.rollout_price_calls;
+    int predictive_dp_solve_count_error =
+        ENABLE_PREDICTIVE_DP
+            ? dlp_diagnostics.rebuilds - dlp_diagnostics.predictive_dp_solves
+            : dlp_diagnostics.predictive_dp_solves;
+    long long predictive_dp_expected_queries =
+        dlp_diagnostics.real_price_calls + dlp_diagnostics.rollout_price_calls -
+        dlp_diagnostics.zero_future_calls;
+    long long predictive_dp_query_count_error =
+        ENABLE_PREDICTIVE_DP
+            ? predictive_dp_expected_queries -
+                  dlp_diagnostics.predictive_dp_query_calls
+            : dlp_diagnostics.predictive_dp_query_calls;
+    long long predictive_dp_query_partition_error =
+        dlp_diagnostics.predictive_dp_query_calls -
+        dlp_diagnostics.predictive_dp_positive_queries -
+        dlp_diagnostics.predictive_dp_zero_queries;
+    long long predictive_dp_transition_partition_error =
+        dlp_diagnostics.predictive_dp_transitions -
+        dlp_diagnostics.predictive_dp_feasible_transitions -
+        dlp_diagnostics.predictive_dp_infeasible_transitions;
+    long long predictive_dp_item_count_error =
+        ENABLE_PREDICTIVE_DP
+            ? (long long)dlp_diagnostics.predictive_dp_solves *
+                      SAMPLED_DLP_REQUEST_COUNT -
+                  dlp_diagnostics.predictive_dp_items_processed
+            : dlp_diagnostics.predictive_dp_items_processed;
+    long long predictive_dp_generation_error =
+        dlp_diagnostics.predictive_dp_prune_input_states -
+        dlp_diagnostics.predictive_dp_transitions -
+        dlp_diagnostics.predictive_dp_feasible_transitions;
+    long long predictive_dp_prune_accounting_error =
+        dlp_diagnostics.predictive_dp_prune_input_states -
+        dlp_diagnostics.predictive_dp_exact_duplicates -
+        dlp_diagnostics.predictive_dp_width_pruned -
+        dlp_diagnostics.predictive_dp_frontier_output_states;
+    long long predictive_dp_shift_histogram_sum = accumulate(
+        dlp_diagnostics.predictive_dp_shift_histogram.begin(),
+        dlp_diagnostics.predictive_dp_shift_histogram.end(), 0LL);
+    int predictive_dp_observed_maximum_shift = 0;
+    for (int shift = 0; shift <= 16; shift++) {
+        if (dlp_diagnostics.predictive_dp_shift_histogram[shift] > 0) {
+            predictive_dp_observed_maximum_shift = shift;
+        }
+    }
+    long long predictive_dp_shift_histogram_error =
+        predictive_dp_shift_histogram_sum -
+        dlp_diagnostics.predictive_dp_prune_steps;
+    int predictive_dp_maximum_shift_error =
+        dlp_diagnostics.predictive_dp_maximum_shift -
+        predictive_dp_observed_maximum_shift;
+    long long predictive_dp_internal_errors =
+        dlp_diagnostics.predictive_dp_frontier_cap_errors +
+        dlp_diagnostics.predictive_dp_duplicate_errors +
+        dlp_diagnostics.predictive_dp_capacity_errors +
+        dlp_diagnostics.predictive_dp_query_order_errors +
+        dlp_diagnostics.predictive_dp_nonfinite_errors +
+        dlp_diagnostics.predictive_dp_zero_state_errors +
+        dlp_diagnostics.predictive_dp_frontier_order_errors +
+        dlp_diagnostics.predictive_dp_query_upper_bound_errors;
+    long long predictive_dp_disabled_activity_error = 0;
+    int predictive_dp_disabled_cpu_error = 0;
+    if constexpr (!ENABLE_PREDICTIVE_DP) {
+        predictive_dp_disabled_activity_error =
+            dlp_diagnostics.predictive_dp_solves +
+            dlp_diagnostics.predictive_dp_prune_steps +
+            dlp_diagnostics.predictive_dp_positive_queries +
+            dlp_diagnostics.predictive_dp_zero_queries +
+            dlp_diagnostics.predictive_dp_transitions +
+            dlp_diagnostics.predictive_dp_items_processed +
+            dlp_diagnostics.predictive_dp_prune_input_states +
+            dlp_diagnostics.predictive_dp_frontier_output_states +
+            dlp_diagnostics.predictive_dp_exact_duplicates +
+            dlp_diagnostics.predictive_dp_width_pruned +
+            dlp_diagnostics.predictive_dp_terminal_states +
+            dlp_diagnostics.predictive_dp_zero_load_items +
+            dlp_diagnostics.predictive_dp_capacity_level_sum +
+            dlp_diagnostics.predictive_dp_item_load_level_sum +
+            dlp_diagnostics.predictive_dp_query_load_level_sum +
+            dlp_diagnostics.predictive_dp_query_calls +
+            dlp_diagnostics.predictive_dp_base_value_sum +
+            dlp_diagnostics.predictive_dp_reduced_value_sum;
+        predictive_dp_disabled_cpu_error =
+            dlp_diagnostics.predictive_dp_rebuild_cpu_ms != 0.0 ||
+            dlp_diagnostics.predictive_dp_maximum_rebuild_cpu_ms != 0.0 ||
+            dlp_diagnostics.predictive_dp_query_cpu_ms != 0.0 ||
+            dlp_diagnostics.predictive_dp_maximum_query_cpu_ms != 0.0;
+    }
+    long double predictive_dp_opportunity_identity_error =
+        ENABLE_PREDICTIVE_DP
+            ? dlp_diagnostics.opportunity_cost_sum -
+                  dlp_diagnostics.predictive_dp_opportunity_cost_sum
+            : dlp_diagnostics.predictive_dp_opportunity_cost_sum;
     runtime_diagnostics.add_diagnostic(final_loss_wall_begin, final_loss_cpu_begin);
     RuntimeSnapshot runtime = snapshot_runtime(runtime_diagnostics);
     cerr << "accepted=" << accepted_count << " rejected=" << rejected_count
@@ -6720,6 +7394,127 @@ int main() {
          << " sampled_dlp_trigger_partition_error=" << sampled_dlp_trigger_partition_error
          << " sampled_dlp_real_call_error=" << sampled_dlp_real_call_error
          << " sampled_dlp_rollout_call_error=" << sampled_dlp_rollout_call_error
+         << " predictive_dp_enabled=" << ENABLE_PREDICTIVE_DP
+         << " predictive_dp_solves=" << dlp_diagnostics.predictive_dp_solves
+         << " predictive_dp_prune_steps="
+         << dlp_diagnostics.predictive_dp_prune_steps
+         << " predictive_dp_maximum_frontier="
+         << dlp_diagnostics.predictive_dp_maximum_frontier
+         << " predictive_dp_maximum_shift="
+         << dlp_diagnostics.predictive_dp_maximum_shift
+         << " predictive_dp_positive_queries="
+         << dlp_diagnostics.predictive_dp_positive_queries
+         << " predictive_dp_zero_queries="
+         << dlp_diagnostics.predictive_dp_zero_queries
+         << " predictive_dp_query_calls="
+         << dlp_diagnostics.predictive_dp_query_calls
+         << " predictive_dp_transitions="
+         << dlp_diagnostics.predictive_dp_transitions
+         << " predictive_dp_feasible_transitions="
+         << dlp_diagnostics.predictive_dp_feasible_transitions
+         << " predictive_dp_infeasible_transitions="
+         << dlp_diagnostics.predictive_dp_infeasible_transitions
+         << " predictive_dp_items_processed="
+         << dlp_diagnostics.predictive_dp_items_processed
+         << " predictive_dp_prune_input_states="
+         << dlp_diagnostics.predictive_dp_prune_input_states
+         << " predictive_dp_frontier_output_states="
+         << dlp_diagnostics.predictive_dp_frontier_output_states
+         << " predictive_dp_exact_duplicates="
+         << dlp_diagnostics.predictive_dp_exact_duplicates
+         << " predictive_dp_width_pruned="
+         << dlp_diagnostics.predictive_dp_width_pruned
+         << " predictive_dp_terminal_states="
+         << dlp_diagnostics.predictive_dp_terminal_states
+         << " predictive_dp_zero_load_items="
+         << dlp_diagnostics.predictive_dp_zero_load_items
+         << " predictive_dp_capacity_level_sum="
+         << dlp_diagnostics.predictive_dp_capacity_level_sum
+         << " predictive_dp_item_load_level_sum="
+         << dlp_diagnostics.predictive_dp_item_load_level_sum
+         << " predictive_dp_query_load_level_sum="
+         << dlp_diagnostics.predictive_dp_query_load_level_sum
+         << " predictive_dp_base_value_sum="
+         << dlp_diagnostics.predictive_dp_base_value_sum
+         << " predictive_dp_reduced_value_sum="
+         << dlp_diagnostics.predictive_dp_reduced_value_sum
+         << " predictive_dp_frontier_hash="
+         << (dlp_diagnostics.predictive_dp_solves == 0
+                 ? 0ULL
+                 : dlp_diagnostics.predictive_dp_frontier_hash)
+         << " predictive_dp_frontier_cap_errors="
+         << dlp_diagnostics.predictive_dp_frontier_cap_errors
+         << " predictive_dp_duplicate_errors="
+         << dlp_diagnostics.predictive_dp_duplicate_errors
+         << " predictive_dp_capacity_errors="
+         << dlp_diagnostics.predictive_dp_capacity_errors
+         << " predictive_dp_query_order_errors="
+         << dlp_diagnostics.predictive_dp_query_order_errors
+         << " predictive_dp_nonfinite_errors="
+         << dlp_diagnostics.predictive_dp_nonfinite_errors
+         << " predictive_dp_zero_state_errors="
+         << dlp_diagnostics.predictive_dp_zero_state_errors
+         << " predictive_dp_frontier_order_errors="
+         << dlp_diagnostics.predictive_dp_frontier_order_errors
+         << " predictive_dp_query_upper_bound_errors="
+         << dlp_diagnostics.predictive_dp_query_upper_bound_errors
+         << " predictive_dp_solve_count_error="
+         << predictive_dp_solve_count_error
+         << " predictive_dp_query_count_error="
+         << predictive_dp_query_count_error
+         << " predictive_dp_query_partition_error="
+         << predictive_dp_query_partition_error
+         << " predictive_dp_transition_partition_error="
+         << predictive_dp_transition_partition_error
+         << " predictive_dp_item_count_error="
+         << predictive_dp_item_count_error
+         << " predictive_dp_generation_error="
+         << predictive_dp_generation_error
+         << " predictive_dp_prune_accounting_error="
+         << predictive_dp_prune_accounting_error
+         << " predictive_dp_shift_histogram_error="
+         << predictive_dp_shift_histogram_error
+         << " predictive_dp_maximum_shift_error="
+         << predictive_dp_maximum_shift_error
+         << " predictive_dp_internal_errors=" << predictive_dp_internal_errors
+         << " predictive_dp_disabled_activity_error="
+         << predictive_dp_disabled_activity_error
+         << " predictive_dp_disabled_cpu_error="
+         << predictive_dp_disabled_cpu_error
+         << " predictive_dp_shift_0="
+         << dlp_diagnostics.predictive_dp_shift_histogram[0]
+         << " predictive_dp_shift_1="
+         << dlp_diagnostics.predictive_dp_shift_histogram[1]
+         << " predictive_dp_shift_2="
+         << dlp_diagnostics.predictive_dp_shift_histogram[2]
+         << " predictive_dp_shift_3="
+         << dlp_diagnostics.predictive_dp_shift_histogram[3]
+         << " predictive_dp_shift_4="
+         << dlp_diagnostics.predictive_dp_shift_histogram[4]
+         << " predictive_dp_shift_5="
+         << dlp_diagnostics.predictive_dp_shift_histogram[5]
+         << " predictive_dp_shift_6="
+         << dlp_diagnostics.predictive_dp_shift_histogram[6]
+         << " predictive_dp_shift_7="
+         << dlp_diagnostics.predictive_dp_shift_histogram[7]
+         << " predictive_dp_shift_8="
+         << dlp_diagnostics.predictive_dp_shift_histogram[8]
+         << " predictive_dp_shift_9="
+         << dlp_diagnostics.predictive_dp_shift_histogram[9]
+         << " predictive_dp_shift_10="
+         << dlp_diagnostics.predictive_dp_shift_histogram[10]
+         << " predictive_dp_shift_11="
+         << dlp_diagnostics.predictive_dp_shift_histogram[11]
+         << " predictive_dp_shift_12="
+         << dlp_diagnostics.predictive_dp_shift_histogram[12]
+         << " predictive_dp_shift_13="
+         << dlp_diagnostics.predictive_dp_shift_histogram[13]
+         << " predictive_dp_shift_14="
+         << dlp_diagnostics.predictive_dp_shift_histogram[14]
+         << " predictive_dp_shift_15="
+         << dlp_diagnostics.predictive_dp_shift_histogram[15]
+         << " predictive_dp_shift_16="
+         << dlp_diagnostics.predictive_dp_shift_histogram[16]
          << " shadow_considered=" << shadow_diagnostics.considered
          << " shadow_upper_rejected=" << shadow_diagnostics.upper_bound_rejected
          << " shadow_actual_rejected=" << shadow_diagnostics.actual_fee_rejected
@@ -6931,6 +7726,18 @@ int main() {
          << " sampled_dlp_rebuild_cpu_ms=" << dlp_diagnostics.rebuild_cpu_ms
          << " sampled_dlp_maximum_rebuild_cpu_ms="
          << dlp_diagnostics.maximum_rebuild_cpu_ms
+         << " predictive_dp_opportunity_sum="
+         << dlp_diagnostics.predictive_dp_opportunity_cost_sum
+         << " predictive_dp_opportunity_identity_error="
+         << predictive_dp_opportunity_identity_error
+         << " predictive_dp_rebuild_cpu_ms="
+         << dlp_diagnostics.predictive_dp_rebuild_cpu_ms
+         << " predictive_dp_maximum_rebuild_cpu_ms="
+         << dlp_diagnostics.predictive_dp_maximum_rebuild_cpu_ms
+         << " predictive_dp_query_cpu_ms="
+         << dlp_diagnostics.predictive_dp_query_cpu_ms
+         << " predictive_dp_maximum_query_cpu_ms="
+         << dlp_diagnostics.predictive_dp_maximum_query_cpu_ms
          << " model_expected_p=" << density_model.expected_group_size
          << " timing_process_cpu_ms=" << runtime.process_cpu_ms
          << " timing_solver_cpu_ms=" << runtime.solver_cpu_ms
