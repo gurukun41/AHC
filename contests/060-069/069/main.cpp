@@ -30,14 +30,97 @@ bool inside(int x, int y, int h, int w) { return 0 <= x && x < h && 0 <= y && y 
 
 using Cell = pair<int, int>;
 
-struct Timer {
-    chrono::steady_clock::time_point start = chrono::steady_clock::now();
+struct RuntimeDiagnostics {
+    using WallClock = chrono::steady_clock;
 
-    double elapsed() const { return chrono::duration<double>(chrono::steady_clock::now() - start).count(); }
+    WallClock::time_point protocol_start = WallClock::now();
+    clock_t process_cpu_start = clock();
+    WallClock::duration solver_wall{};
+    WallClock::duration diagnostic_wall{};
+    WallClock::duration input_wall{};
+    WallClock::duration output_wall{};
+    WallClock::duration preprocess_wall{};
+    WallClock::duration maximum_solver_turn_wall{};
+    double solver_cpu_seconds = 0.0;
+    double diagnostic_cpu_seconds = 0.0;
+
+    static double cpu_seconds(clock_t begin, clock_t end) {
+        if (begin == (clock_t)-1 || end == (clock_t)-1) return -1.0;
+        return (double)(end - begin) / CLOCKS_PER_SEC;
+    }
+
+    void add_preprocess(WallClock::time_point wall_begin, clock_t cpu_begin) {
+        WallClock::duration elapsed_wall = WallClock::now() - wall_begin;
+        solver_wall += elapsed_wall;
+        preprocess_wall += elapsed_wall;
+        double elapsed_cpu = cpu_seconds(cpu_begin, clock());
+        if (elapsed_cpu >= 0.0) solver_cpu_seconds += elapsed_cpu;
+    }
+
+    void add_turn(WallClock::time_point wall_begin, clock_t cpu_begin) {
+        WallClock::duration elapsed_wall = WallClock::now() - wall_begin;
+        solver_wall += elapsed_wall;
+        chmax(maximum_solver_turn_wall, elapsed_wall);
+        double elapsed_cpu = cpu_seconds(cpu_begin, clock());
+        if (elapsed_cpu >= 0.0) solver_cpu_seconds += elapsed_cpu;
+    }
+
+    void add_diagnostic(WallClock::time_point wall_begin, clock_t cpu_begin) {
+        diagnostic_wall += WallClock::now() - wall_begin;
+        double elapsed_cpu = cpu_seconds(cpu_begin, clock());
+        if (elapsed_cpu >= 0.0) diagnostic_cpu_seconds += elapsed_cpu;
+    }
+
+    void add_input(WallClock::time_point wall_begin) {
+        input_wall += WallClock::now() - wall_begin;
+    }
+
+    void add_output(WallClock::time_point wall_begin) {
+        output_wall += WallClock::now() - wall_begin;
+    }
 };
+
+struct RuntimeSnapshot {
+    double process_cpu_ms = 0.0;
+    double solver_cpu_ms = 0.0;
+    double diagnostic_cpu_ms = 0.0;
+    double solver_wall_ms = 0.0;
+    double diagnostic_wall_ms = 0.0;
+    double input_wall_ms = 0.0;
+    double output_wall_ms = 0.0;
+    double protocol_wall_ms = 0.0;
+    double unaccounted_wall_ms = 0.0;
+    double preprocess_wall_ms = 0.0;
+    double maximum_solver_turn_wall_ms = 0.0;
+};
+
+RuntimeSnapshot snapshot_runtime(const RuntimeDiagnostics &diagnostics) {
+    RuntimeSnapshot result;
+    auto protocol_wall = RuntimeDiagnostics::WallClock::now() - diagnostics.protocol_start;
+    double process_cpu = RuntimeDiagnostics::cpu_seconds(diagnostics.process_cpu_start, clock());
+    result.process_cpu_ms = process_cpu < 0.0 ? -1.0 : 1000.0 * process_cpu;
+    result.solver_cpu_ms = 1000.0 * diagnostics.solver_cpu_seconds;
+    result.diagnostic_cpu_ms = 1000.0 * diagnostics.diagnostic_cpu_seconds;
+    result.solver_wall_ms = chrono::duration<double, milli>(diagnostics.solver_wall).count();
+    result.diagnostic_wall_ms = chrono::duration<double, milli>(diagnostics.diagnostic_wall).count();
+    result.input_wall_ms = chrono::duration<double, milli>(diagnostics.input_wall).count();
+    result.output_wall_ms = chrono::duration<double, milli>(diagnostics.output_wall).count();
+    result.protocol_wall_ms = chrono::duration<double, milli>(protocol_wall).count();
+    result.unaccounted_wall_ms = result.protocol_wall_ms - result.solver_wall_ms -
+                                 result.diagnostic_wall_ms - result.input_wall_ms -
+                                 result.output_wall_ms;
+    result.preprocess_wall_ms = chrono::duration<double, milli>(diagnostics.preprocess_wall).count();
+    result.maximum_solver_turn_wall_ms =
+        chrono::duration<double, milli>(diagnostics.maximum_solver_turn_wall).count();
+    return result;
+}
 
 constexpr ll ARRIVAL_TIME_HORIZON = 100000;
 constexpr int TIME_BUCKET_COUNT = 64;
+constexpr int SAMPLED_DLP_BUCKET_COUNT = 16;
+constexpr int SAMPLED_DLP_REQUEST_COUNT = 256;
+constexpr int SAMPLED_DLP_COORDINATE_SWEEPS = 8;
+constexpr long double SAMPLED_DLP_PRICE_QUANTIZATION = 1000000000.0L;
 constexpr int THETA_MIN = 2000;
 constexpr int THETA_MAX = 8000;
 constexpr int THETA_STEP = 100;
@@ -46,6 +129,8 @@ constexpr int COMPACT_PERIMETER_MARGIN = 4;
 constexpr int PLACEMENT_GLOBAL_SHORTLIST = 3;
 constexpr int PLACEMENT_SHORTLIST_LIMIT = 6;
 constexpr int CONNECTED_GROWTH_SEED_LIMIT = 16;
+constexpr int GROW_AND_TRIM_EXTRA_CELLS = 8;
+constexpr int GROW_AND_TRIM_CANDIDATE_LIMIT = 8;
 constexpr int FUTURE_FIT_SNAPSHOT_COUNT = 3;
 constexpr array<int, 8> FUTURE_FIT_SIDES = {2, 3, 4, 5, 6, 8, 10, 12};
 // Every minimum-perimeter target is cheap-scanned.  Exact blocker sets are
@@ -60,12 +145,104 @@ constexpr int RESCUE_DESTINATION_LIMIT = 10;
 constexpr int RESCUE_BEAM_WIDTH = 32;
 constexpr int RESCUE_REPAIR_NODE_LIMIT = 2048;
 constexpr int RESCUE_ROLLOUT_CANDIDATE_LIMIT = 2;
+// NoRegion is far more frequent than Accepted compact rescue.  Use the same
+// unrestricted-blocker search with smaller deterministic work caps so the
+// added repair path remains viable under the contest time limit.
+constexpr int PUSHOUT_TARGET_SHORTLIST_PER_METRIC = 96;
+constexpr int PUSHOUT_TARGET_REPAIR_LIMIT = 4;
+constexpr int PUSHOUT_DESTINATION_ANCHOR_LIMIT = 2048;
+constexpr int PUSHOUT_DESTINATION_ANCHOR_GLOBAL_LIMIT = 16000;
+constexpr int PUSHOUT_DESTINATION_LEGAL_LIMIT = 40;
+constexpr int PUSHOUT_DESTINATION_LIMIT = 8;
+constexpr int PUSHOUT_REPAIR_NODE_LIMIT = 1024;
+// A helper is an active non-blocker whose removal opens destination regions
+// for the true blockers.  Surveying reuses the legacy destination probes; the
+// second-stage repair has its own deterministic caps and never consumes work
+// reserved for the protected legacy candidates.
+constexpr int PUSHOUT_HELPER_OBSTRUCTION_PROBE_LIMIT = 1024;
+constexpr int PUSHOUT_HELPER_MAX_BLOCKERS = 3;
+#ifdef AHC069_DISABLE_WIDE_PUSHOUT_HELPER
+constexpr int PUSHOUT_HELPER_CHOICE_LIMIT_PER_TARGET = 1;
+constexpr int PUSHOUT_HELPER_REPAIR_LIMIT = 2;
+constexpr int PUSHOUT_HELPER_DESTINATION_ANCHOR_LIMIT = 1024;
+constexpr int PUSHOUT_HELPER_DESTINATION_ANCHOR_GLOBAL_LIMIT = 4096;
+constexpr int PUSHOUT_HELPER_DESTINATION_LEGAL_LIMIT = 24;
+constexpr int PUSHOUT_HELPER_DESTINATION_LIMIT = 6;
+constexpr int PUSHOUT_HELPER_REPAIR_NODE_LIMIT = 256;
+constexpr int PUSHOUT_HELPER_FEASIBLE_LIMIT = 1;
+#else
+constexpr int PUSHOUT_HELPER_CHOICE_LIMIT_PER_TARGET = 3;
+constexpr int PUSHOUT_HELPER_REPAIR_LIMIT = 6;
+constexpr int PUSHOUT_HELPER_DESTINATION_ANCHOR_LIMIT = 2048;
+constexpr int PUSHOUT_HELPER_DESTINATION_ANCHOR_GLOBAL_LIMIT = 16384;
+constexpr int PUSHOUT_HELPER_DESTINATION_LEGAL_LIMIT = 48;
+constexpr int PUSHOUT_HELPER_DESTINATION_LIMIT = 12;
+constexpr int PUSHOUT_HELPER_REPAIR_NODE_LIMIT = 1024;
+constexpr int PUSHOUT_HELPER_FEASIBLE_LIMIT = 2;
+#endif
+static_assert(PUSHOUT_HELPER_FEASIBLE_LIMIT <= RESCUE_ROLLOUT_CANDIDATE_LIMIT);
+// Deadline-layer reconstruction has no semantic limit on the number of moved
+// groups.  Every limit below counts deterministic work instead; an arbitrarily
+// deep closure remains eligible when its required work fits these budgets.
+constexpr int DEADLINE_GRAPH_BUILD_CASE_LIMIT = 8;
+constexpr int DEADLINE_WINDOW_ATTEMPT_LIMIT = 1;
+constexpr int DEADLINE_CLOSURE_EXPANSION_TURN_LIMIT = 64;
+constexpr int DEADLINE_CLOSURE_EXPANSION_CASE_LIMIT = 256;
+constexpr int DEADLINE_CLOSURE_KEEP_LIMIT = 2;
+constexpr int DEADLINE_CORE_ROOT_LIMIT = 2;
+constexpr int DEADLINE_LAYOUT_BEAM_WIDTH = 6;
+constexpr int DEADLINE_REGION_CANDIDATE_LIMIT = 3;
+constexpr int DEADLINE_LAYOUT_NODE_WORKSPACE_LIMIT = 384;
+constexpr int DEADLINE_LAYOUT_NODE_TURN_LIMIT = 768;
+constexpr int DEADLINE_LAYOUT_NODE_CASE_LIMIT = 3072;
+constexpr int DEADLINE_TEMPLATE_PROBE_TURN_LIMIT = 4096;
+constexpr int DEADLINE_TEMPLATE_PROBE_CASE_LIMIT = 16384;
+constexpr int DEADLINE_GROWTH_STEP_TURN_LIMIT = 1024;
+constexpr int DEADLINE_GROWTH_STEP_CASE_LIMIT = 4096;
+constexpr int DEADLINE_CONNECTIVITY_CALL_TURN_LIMIT = 512;
+constexpr int DEADLINE_CONNECTIVITY_CALL_CASE_LIMIT = 2048;
+constexpr int DEADLINE_CONNECTIVITY_VISIT_TURN_LIMIT = 750000;
+constexpr int DEADLINE_CONNECTIVITY_VISIT_CASE_LIMIT = 3000000;
+constexpr int DEADLINE_COMPLETE_PLAN_TURN_LIMIT = 2;
+constexpr int DEADLINE_COMPLETE_PLAN_CASE_LIMIT = 16;
+constexpr int DEADLINE_ROLLOUT_CANDIDATE_LIMIT = 2;
+constexpr int DEADLINE_CONFIRMATION_CASE_LIMIT = 1;
 constexpr int ROOT_SCREEN_SCENARIO_COUNT = 2;
 constexpr int ROOT_SCREEN_ROLLOUT_LENGTH = 4;
 constexpr int ROOT_CONFIRM_SCENARIO_COUNT = 8;
 constexpr int ROOT_CONFIRM_ROLLOUT_LENGTH = 12;
 constexpr int ROOT_CONFIRMATION_TURN_LIMIT = 4;
 constexpr int ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT = 2;
+#ifdef AHC069_DISABLE_DEADLINE_LAYER
+constexpr bool ENABLE_DEADLINE_LAYER = false;
+#else
+constexpr bool ENABLE_DEADLINE_LAYER = true;
+#endif
+#ifdef AHC069_DISABLE_NO_REGION_PUSHOUT
+constexpr bool ENABLE_NO_REGION_PUSHOUT = false;
+#else
+constexpr bool ENABLE_NO_REGION_PUSHOUT = true;
+#endif
+#ifdef AHC069_DISABLE_PUSHOUT_HELPER
+constexpr bool ENABLE_PUSHOUT_HELPER = false;
+#else
+constexpr bool ENABLE_PUSHOUT_HELPER = true;
+#endif
+#if defined(AHC069_DISABLE_PUSHOUT_HELPER) || defined(AHC069_DISABLE_WIDE_PUSHOUT_HELPER)
+constexpr bool ENABLE_WIDE_PUSHOUT_HELPER = false;
+#else
+constexpr bool ENABLE_WIDE_PUSHOUT_HELPER = true;
+#endif
+#ifdef AHC069_DISABLE_GROW_AND_TRIM
+constexpr bool ENABLE_GROW_AND_TRIM = false;
+#else
+constexpr bool ENABLE_GROW_AND_TRIM = true;
+#endif
+#ifdef AHC069_DISABLE_SAMPLED_DLP
+constexpr bool ENABLE_SAMPLED_DLP = false;
+#else
+constexpr bool ENABLE_SAMPLED_DLP = true;
+#endif
 #ifdef AHC069_PROTECTED_ONLY
 constexpr bool ROOT_PROTECTED_ONLY = true;
 #else
@@ -217,6 +394,11 @@ int rectangle_sum(const vector<vi> &prefix, int x, int y, int h, int w) {
     return prefix[x + h][y + w] - prefix[x][y + w] - prefix[x + h][y] + prefix[x][y];
 }
 
+ll rectangle_sum(const vector<vector<ll>> &prefix, int x, int y, int h, int w) {
+    if (h == 0 || w == 0) return 0;
+    return prefix[x + h][y + w] - prefix[x][y + w] - prefix[x + h][y] + prefix[x][y];
+}
+
 long double rectangle_sum(const vector<vector<long double>> &prefix, int x, int y, int h, int w) {
     if (h == 0 || w == 0) return 0.0L;
     return prefix[x + h][y + w] - prefix[x][y + w] - prefix[x + h][y] + prefix[x][y];
@@ -329,10 +511,53 @@ void place_cells(vvi &owner, const vector<Cell> &cells, int id) {
     }
 }
 
+// Read-only geometry observation used only after the turn action is fixed.
+// Keeping it out of the placement path makes the loss diagnosis independent
+// of the candidate generator that it is intended to audit.
+__attribute__((noinline)) int largest_free_component(const vs &park, const vvi &owner) {
+    int n = park.size();
+    vector<char> visited(n * n, false);
+    constexpr int DX[4] = {-1, 1, 0, 0};
+    constexpr int DY[4] = {0, 0, -1, 1};
+    int largest = 0;
+
+    for (int start_x = 0; start_x < n; start_x++) {
+        for (int start_y = 0; start_y < n; start_y++) {
+            int start = start_x * n + start_y;
+            if (visited[start] || park[start_x][start_y] == '#' || owner[start_x][start_y] != -1) {
+                continue;
+            }
+            visited[start] = true;
+            queue<int> que;
+            que.push(start);
+            int component_size = 0;
+            while (!que.empty()) {
+                int cell = que.front();
+                que.pop();
+                component_size++;
+                int x = cell / n;
+                int y = cell % n;
+                for (int dir = 0; dir < 4; dir++) {
+                    int nx = x + DX[dir];
+                    int ny = y + DY[dir];
+                    if (!inside(nx, ny, n, n)) continue;
+                    int next = nx * n + ny;
+                    if (visited[next] || park[nx][ny] == '#' || owner[nx][ny] != -1) continue;
+                    visited[next] = true;
+                    que.push(next);
+                }
+            }
+            chmax(largest, component_size);
+        }
+    }
+    return largest;
+}
+
 enum class PlacementSource {
     MinimumTemplate,
     ExtendedTemplate,
     ConnectedGrowth,
+    GrowAndTrim,
 };
 
 struct NormalPlacementChoice {
@@ -353,10 +578,12 @@ struct ThetaEstimator {
     };
 
     int observed_count = 0;
+    int rounded_zero_count = 0;
     long double exponential_sample_sum = 0.0L;
 
     void observe(ll duration) {
         observed_count++;
+        if (duration == 1) rounded_zero_count++;
         exponential_sample_sum += duration - 1;
     }
 
@@ -641,6 +868,453 @@ struct ShadowEvaluation {
     int priced_buckets = 0;
 };
 
+struct SampledDlpDiagnostics {
+    int rebuilds = 0;
+    int initial_rebuilds = 0;
+    int scheduled_rebuilds = 0;
+    int boundary_rebuilds = 0;
+    int zero_future_calls = 0;
+    int real_price_calls = 0;
+    int rollout_price_calls = 0;
+    int invalid_model_errors = 0;
+    int nonfinite_errors = 0;
+    long long generated_requests = 0;
+    long long coordinate_updates = 0;
+    long long positive_price_buckets = 0;
+    long double dual_objective_sum = 0.0L;
+    long double capacity_sum = 0.0L;
+    long double offered_load_sum = 0.0L;
+    long double opportunity_cost_sum = 0.0L;
+    long double maximum_price = 0.0L;
+    double rebuild_cpu_ms = 0.0;
+    double maximum_rebuild_cpu_ms = 0.0;
+    uint64_t sample_hash = 1469598103934665603ULL;
+};
+
+long double sampled_dlp_radical_inverse(uint64_t index, int base) {
+    long double inverse_base = 1.0L / base;
+    long double place = inverse_base;
+    long double result = 0.0L;
+    while (index > 0) {
+        result += (index % base) * place;
+        index /= base;
+        place *= inverse_base;
+    }
+    return clamp(result, 1e-12L, 1.0L - 1e-12L);
+}
+
+// A periodically re-solved deterministic linear program replaces the
+// independent 64-bucket tail approximation when sampled DLP is enabled.  It
+// prices pooled cell-time only; geometry remains the responsibility of the
+// unchanged placement and Push-out layers.
+struct SampledDlpShadowModel {
+    struct Request {
+        ll s = 0;
+        ll t = 0;
+        int p = 0;
+        ll ideal_fee = 0;
+        array<long double, SAMPLED_DLP_BUCKET_COUNT> load{};
+    };
+
+    enum class RebuildTrigger {
+        None,
+        Initial,
+        Scheduled,
+        Boundary,
+    };
+
+    array<int, 151> minimum_perimeter{};
+    vector<float> exact_future_survival;
+    array<ll, SAMPLED_DLP_BUCKET_COUNT + 1> boundaries{};
+    array<long double, SAMPLED_DLP_BUCKET_COUNT> prices{};
+    int bucket_count = 0;
+    bool ready = false;
+    SampledDlpDiagnostics diagnostics;
+
+    void initialize(const vector<vector<Shape>> &compact_shapes) {
+        for (int p = 4; p <= 150; p++) {
+            minimum_perimeter[p] = compact_shapes[p].front().perimeter;
+        }
+
+        // Q_theta(s)=Pr(S_future>s | theta) for the official rounded
+        // duration distribution.  The backward recurrence is exact up to
+        // floating point and needs one 61 x 100000 float table (about 24 MB).
+        exact_future_survival.assign(
+            (size_t)ThetaEstimator::PARTICLE_COUNT * ARRIVAL_TIME_HORIZON,
+            0.0F);
+        for (int k = 0; k < ThetaEstimator::PARTICLE_COUNT; k++) {
+            long double theta = THETA_MIN + THETA_STEP * k;
+            long double inverse_theta = 1.0L / theta;
+            long double ratio = expl(-inverse_theta);
+            long double left_tail = expl(-0.5L * inverse_theta);
+            long double normalizer =
+                -expm1l(-(ARRIVAL_TIME_HORIZON - 0.5L) * inverse_theta);
+            long double reciprocal_start_mass = 0.0L;
+            long double survival = 0.0L;
+            for (int l = 0; l <= ARRIVAL_TIME_HORIZON - 2; l++) {
+                long double unnormalized_mass =
+                    l == 0 ? -expm1l(-0.5L * inverse_theta)
+                           : left_tail * (1.0L - ratio);
+                long double probability = unnormalized_mass / normalizer;
+                reciprocal_start_mass += probability / (ARRIVAL_TIME_HORIZON - l);
+                survival += reciprocal_start_mass;
+                int s = ARRIVAL_TIME_HORIZON - l - 2;
+                exact_future_survival[(size_t)k * ARRIVAL_TIME_HORIZON + s] =
+                    (float)survival;
+                if (l >= 1) left_tail *= ratio;
+            }
+        }
+    }
+
+    array<int, 5> exact_posterior_quantiles(const ThetaEstimator &theta_estimator,
+                                            ll current_s, int remaining_groups) const {
+        static constexpr array<long double, 5> PROBABILITIES = {
+            0.10L, 0.30L, 0.50L, 0.70L, 0.90L,
+        };
+        array<long double, ThetaEstimator::PARTICLE_COUNT> log_weights{};
+        long double maximum_log_weight = -numeric_limits<long double>::infinity();
+        int positive_count = theta_estimator.observed_count - theta_estimator.rounded_zero_count;
+        for (int k = 0; k < ThetaEstimator::PARTICLE_COUNT; k++) {
+            long double theta = THETA_MIN + THETA_STEP * k;
+            long double inverse_theta = 1.0L / theta;
+            long double normalizer =
+                -expm1l(-(ARRIVAL_TIME_HORIZON - 0.5L) * inverse_theta);
+            long double log_weight =
+                theta_estimator.rounded_zero_count * logl(-expm1l(-0.5L * inverse_theta)) +
+                positive_count *
+                    (logl(-expm1l(-inverse_theta)) + 0.5L * inverse_theta) -
+                theta_estimator.exponential_sample_sum * inverse_theta -
+                theta_estimator.observed_count * logl(normalizer);
+            if (remaining_groups > 0) {
+                log_weight +=
+                    remaining_groups * logl((long double)exact_future_survival[
+                                           (size_t)k * ARRIVAL_TIME_HORIZON + current_s]);
+            }
+            log_weights[k] = log_weight;
+            chmax(maximum_log_weight, log_weight);
+        }
+
+        array<long double, ThetaEstimator::PARTICLE_COUNT> weights{};
+        long double weight_sum = 0.0L;
+        for (int k = 0; k < ThetaEstimator::PARTICLE_COUNT; k++) {
+            weights[k] = expl(log_weights[k] - maximum_log_weight);
+            weight_sum += weights[k];
+        }
+
+        array<int, 5> result{};
+        for (int quantile = 0; quantile < 5; quantile++) {
+            long double target = PROBABILITIES[quantile] * weight_sum;
+            long double cumulative = 0.0L;
+            result[quantile] = THETA_MAX;
+            for (int k = 0; k < ThetaEstimator::PARTICLE_COUNT; k++) {
+                cumulative += weights[k];
+                if (cumulative >= target) {
+                    result[quantile] = THETA_MIN + THETA_STEP * k;
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
+    RebuildTrigger rebuild_trigger(int turn, ll current_s) const {
+        if (!ready) return RebuildTrigger::Initial;
+        if (turn == 4 || turn == 8 || turn == 16 || (turn > 16 && turn % 16 == 0)) {
+            return RebuildTrigger::Scheduled;
+        }
+        int crossed = 0;
+        for (int b = 1; b < bucket_count; b++) {
+            if (boundaries[b] <= current_s) crossed++;
+        }
+        if (crossed >= 2) return RebuildTrigger::Boundary;
+        return RebuildTrigger::None;
+    }
+
+    static uint64_t mix_hash(uint64_t hash, uint64_t value) {
+        value += 0x9e3779b97f4a7c15ULL;
+        value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+        value ^= value >> 31;
+        hash ^= value;
+        hash *= 1099511628211ULL;
+        return hash;
+    }
+
+    static vector<long double> make_conditional_duration_cdf(ll current_s, int theta) {
+        int maximum_l = (int)(ARRIVAL_TIME_HORIZON - current_s - 2);
+        if (maximum_l < 0) return {};
+
+        vector<long double> cdf(maximum_l + 1);
+        long double inverse_theta = 1.0L / theta;
+        long double ratio = expl(-inverse_theta);
+        long double left_tail = expl(-0.5L * inverse_theta);
+        long double cumulative = 0.0L;
+        for (int l = 0; l <= maximum_l; l++) {
+            long double duration_mass =
+                l == 0 ? -expm1l(-0.5L * inverse_theta) : left_tail * (1.0L - ratio);
+            long double future_start_count = ARRIVAL_TIME_HORIZON - l - 1 - current_s;
+            long double all_start_count = ARRIVAL_TIME_HORIZON - l;
+            cumulative += duration_mass * future_start_count / all_start_count;
+            cdf[l] = cumulative;
+            if (l >= 1) left_tail *= ratio;
+        }
+        if (!(cumulative > 0.0L) || !isfinite(cumulative)) return {};
+        for (long double &value : cdf) value /= cumulative;
+        cdf.back() = 1.0L;
+        return cdf;
+    }
+
+    void build_buckets(ll current_s) {
+        ll remaining_time = ARRIVAL_TIME_HORIZON - current_s;
+        bucket_count = (int)min<ll>(SAMPLED_DLP_BUCKET_COUNT, max(1LL, remaining_time));
+        for (int b = 0; b <= bucket_count; b++) {
+            boundaries[b] = current_s + remaining_time * b / bucket_count;
+        }
+        prices.fill(0.0L);
+    }
+
+    vector<Request> build_requests(ll current_s, int remaining_groups,
+                                   const ThetaEstimator &theta_estimator) {
+        array<int, 5> theta_values =
+            exact_posterior_quantiles(theta_estimator, current_s, remaining_groups);
+
+        vector<int> unique_theta;
+        vector<vector<long double>> duration_cdfs;
+        array<int, 5> cdf_index{};
+        for (int k = 0; k < 5; k++) {
+            auto found = find(unique_theta.begin(), unique_theta.end(), theta_values[k]);
+            if (found == unique_theta.end()) {
+                cdf_index[k] = unique_theta.size();
+                unique_theta.push_back(theta_values[k]);
+                duration_cdfs.push_back(make_conditional_duration_cdf(current_s, theta_values[k]));
+            } else {
+                cdf_index[k] = found - unique_theta.begin();
+            }
+        }
+
+        vector<Request> requests;
+        requests.reserve(SAMPLED_DLP_REQUEST_COUNT);
+        const long double size_width = sqrtl(150.0L) - 2.0L;
+        for (int sample = 0; sample < SAMPLED_DLP_REQUEST_COUNT; sample++) {
+            uint64_t index = sample + 1;
+            // The centered first coordinate gives the five posterior strata
+            // counts 51, 51, 52, 51, 51 without correlating theta with P's
+            // base-5 radical inverse.
+            long double theta_quantile = (sample + 0.5L) / SAMPLED_DLP_REQUEST_COUNT;
+            int theta_slot = min(4, (int)floorl(5.0L * theta_quantile));
+            const vector<long double> &cdf = duration_cdfs[cdf_index[theta_slot]];
+            if (cdf.empty()) continue;
+
+            long double duration_quantile = sampled_dlp_radical_inverse(index, 2);
+            int l = lower_bound(cdf.begin(), cdf.end(), duration_quantile) - cdf.begin();
+            ll duration = l + 1;
+            ll future_start_count = ARRIVAL_TIME_HORIZON - duration - current_s;
+            if (future_start_count <= 0) continue;
+            long double start_quantile = sampled_dlp_radical_inverse(index, 3);
+            ll start = current_s + 1 +
+                       min(future_start_count - 1,
+                           (ll)floorl(start_quantile * future_start_count));
+
+            long double size_quantile = sampled_dlp_radical_inverse(index, 5);
+            long double root_size = 2.0L + size_width * size_quantile;
+            int p = clamp((int)llroundl(root_size * root_size), 4, 150);
+            long double value_quantile = sampled_dlp_radical_inverse(index, 7);
+            long double noise = 0.8L * inverse_standard_normal(value_quantile);
+            long double raw_v = p * powl((long double)duration, 0.9L) * exp2l(noise);
+            ll v = clamp((ll)llroundl(raw_v), 1LL, 100000000LL);
+
+            Request request;
+            request.s = start;
+            request.t = start + duration;
+            request.p = p;
+            request.ideal_fee = round_payment(v, p, minimum_perimeter[p]);
+            for (int b = 0; b < bucket_count; b++) {
+                ll overlap = max(0LL, min(request.t, boundaries[b + 1]) -
+                                          max(request.s, boundaries[b]));
+                request.load[b] = (long double)p * overlap;
+            }
+            requests.push_back(std::move(request));
+        }
+        return requests;
+    }
+
+    void solve_dual(const vector<Request> &requests, int remaining_groups,
+                    const vector<GroupState> &groups, int grass_cells) {
+        array<long double, SAMPLED_DLP_BUCKET_COUNT> capacity{};
+        array<long double, SAMPLED_DLP_BUCKET_COUNT> offered_load{};
+        long double sample_weight = (long double)remaining_groups / SAMPLED_DLP_REQUEST_COUNT;
+        for (int b = 0; b < bucket_count; b++) {
+            capacity[b] = (long double)grass_cells * (boundaries[b + 1] - boundaries[b]);
+            for (const GroupState &group : groups) {
+                if (!group.active) continue;
+                ll overlap = max(0LL, min(group.t, boundaries[b + 1]) -
+                                          max(group.s, boundaries[b]));
+                capacity[b] -= (long double)group.p * overlap;
+            }
+            capacity[b] = max(0.0L, capacity[b]);
+            for (const Request &request : requests) {
+                offered_load[b] += sample_weight * request.load[b];
+            }
+            diagnostics.capacity_sum += capacity[b];
+            diagnostics.offered_load_sum += offered_load[b];
+        }
+
+        struct Breakpoint {
+            long double value;
+            long double load;
+            int request_index;
+        };
+        vector<Breakpoint> breakpoints;
+        breakpoints.reserve(requests.size());
+        for (int sweep = 0; sweep < SAMPLED_DLP_COORDINATE_SWEEPS; sweep++) {
+            for (int b = 0; b < bucket_count; b++) {
+                breakpoints.clear();
+                long double active_load = 0.0L;
+                for (int request_index = 0; request_index < (int)requests.size(); request_index++) {
+                    const Request &request = requests[request_index];
+                    long double a = request.load[b];
+                    if (a <= 0.0L) continue;
+                    long double residual = request.ideal_fee;
+                    for (int c = 0; c < bucket_count; c++) {
+                        if (c != b) residual -= prices[c] * request.load[c];
+                    }
+                    if (residual <= 0.0L) continue;
+                    long double weighted_load = sample_weight * a;
+                    breakpoints.push_back({residual / a, weighted_load, request_index});
+                    active_load += weighted_load;
+                }
+
+                long double next_price = 0.0L;
+                if (active_load > capacity[b]) {
+                    sort(breakpoints.begin(), breakpoints.end(), [](const Breakpoint &lhs,
+                                                                   const Breakpoint &rhs) {
+                        if (lhs.value != rhs.value) return lhs.value < rhs.value;
+                        return lhs.request_index < rhs.request_index;
+                    });
+                    long double remaining_load = active_load;
+                    for (const Breakpoint &point : breakpoints) {
+                        remaining_load -= point.load;
+                        if (remaining_load <= capacity[b]) {
+                            next_price = point.value;
+                            break;
+                        }
+                    }
+                }
+                prices[b] = max(0.0L, next_price);
+                diagnostics.coordinate_updates++;
+            }
+        }
+
+        // Quantize only the completed solve.  Quantizing every coordinate
+        // would perturb the later Gauss-Seidel breakpoints within each sweep.
+        for (int b = 0; b < bucket_count; b++) {
+            prices[b] = roundl(prices[b] * SAMPLED_DLP_PRICE_QUANTIZATION) /
+                        SAMPLED_DLP_PRICE_QUANTIZATION;
+        }
+
+        long double dual_objective = 0.0L;
+        for (int b = 0; b < bucket_count; b++) {
+            dual_objective += prices[b] * capacity[b];
+            if (prices[b] > 0.0L) diagnostics.positive_price_buckets++;
+            chmax(diagnostics.maximum_price, prices[b]);
+        }
+        for (const Request &request : requests) {
+            long double priced_load = 0.0L;
+            for (int b = 0; b < bucket_count; b++) {
+                priced_load += prices[b] * request.load[b];
+            }
+            dual_objective += sample_weight * max(0.0L, (long double)request.ideal_fee - priced_load);
+        }
+        if (!isfinite(dual_objective) || dual_objective < 0.0L) {
+            diagnostics.nonfinite_errors++;
+            prices.fill(0.0L);
+            return;
+        }
+        diagnostics.dual_objective_sum += dual_objective;
+    }
+
+    void rebuild(int turn, ll current_s, int remaining_groups,
+                 const vector<GroupState> &groups, int grass_cells,
+                 const ThetaEstimator &theta_estimator, RebuildTrigger trigger) {
+        clock_t cpu_begin = clock();
+        build_buckets(current_s);
+        vector<Request> requests = build_requests(current_s, remaining_groups, theta_estimator);
+        diagnostics.rebuilds++;
+        if (trigger == RebuildTrigger::Initial) diagnostics.initial_rebuilds++;
+        if (trigger == RebuildTrigger::Scheduled) diagnostics.scheduled_rebuilds++;
+        if (trigger == RebuildTrigger::Boundary) diagnostics.boundary_rebuilds++;
+        diagnostics.generated_requests += requests.size();
+
+        uint64_t rebuild_hash = mix_hash(1469598103934665603ULL, turn);
+        rebuild_hash = mix_hash(rebuild_hash, current_s);
+        rebuild_hash = mix_hash(rebuild_hash, remaining_groups);
+        for (const Request &request : requests) {
+            rebuild_hash = mix_hash(rebuild_hash, request.s);
+            rebuild_hash = mix_hash(rebuild_hash, request.t);
+            rebuild_hash = mix_hash(rebuild_hash, request.p);
+            rebuild_hash = mix_hash(rebuild_hash, request.ideal_fee);
+        }
+        diagnostics.sample_hash = mix_hash(diagnostics.sample_hash, rebuild_hash);
+
+        if ((int)requests.size() != SAMPLED_DLP_REQUEST_COUNT) {
+            diagnostics.invalid_model_errors++;
+            prices.fill(0.0L);
+        } else {
+            solve_dual(requests, remaining_groups, groups, grass_cells);
+        }
+        ready = true;
+        double cpu_ms = 1000.0 * (double)(clock() - cpu_begin) / CLOCKS_PER_SEC;
+        diagnostics.rebuild_cpu_ms += cpu_ms;
+        chmax(diagnostics.maximum_rebuild_cpu_ms, cpu_ms);
+    }
+
+    ShadowEvaluation evaluate_cached(ll current_s, ll arrival_t, int p, bool rollout,
+                                     int remaining_groups = -1) {
+        ShadowEvaluation result;
+        if (rollout) {
+            diagnostics.rollout_price_calls++;
+        } else {
+            diagnostics.real_price_calls++;
+        }
+        if (remaining_groups == 0) {
+            diagnostics.zero_future_calls++;
+            return result;
+        }
+        if (!ready) {
+            diagnostics.invalid_model_errors++;
+            return result;
+        }
+        for (int b = 0; b < bucket_count; b++) {
+            ll overlap = max(0LL, min(arrival_t, boundaries[b + 1]) -
+                                      max(current_s, boundaries[b]));
+            if (overlap <= 0) continue;
+            result.opportunity_cost += (long double)p * overlap * prices[b];
+            if (prices[b] > 0.0L) result.priced_buckets++;
+        }
+        if (!isfinite(result.opportunity_cost) || result.opportunity_cost < 0.0L) {
+            diagnostics.nonfinite_errors++;
+            result = ShadowEvaluation{};
+        }
+        diagnostics.opportunity_cost_sum += result.opportunity_cost;
+        return result;
+    }
+
+    ShadowEvaluation evaluate_real_turn(int turn, ll current_s, ll arrival_t, int p,
+                                        int remaining_groups, const vector<GroupState> &groups,
+                                        int grass_cells, const ThetaEstimator &theta_estimator) {
+        if (remaining_groups <= 0) {
+            diagnostics.zero_future_calls++;
+            diagnostics.real_price_calls++;
+            return {};
+        }
+        RebuildTrigger trigger = rebuild_trigger(turn, current_s);
+        if (trigger != RebuildTrigger::None) {
+            rebuild(turn, current_s, remaining_groups, groups, grass_cells, theta_estimator, trigger);
+        }
+        return evaluate_cached(current_s, arrival_t, p, false);
+    }
+};
+
 // Price the candidate's occupied cell-time by the fee density of future groups
 // that would be crowded out.  Compact rescue is considered only after this
 // ordinary admission decision has accepted the fallback placement.
@@ -696,6 +1370,8 @@ struct TemporalPlacementDiagnostics {
     int compact_successes = 0;
     int extended_template_successes = 0;
     int fallback_successes = 0;
+    int actual_rejected_candidate_perimeter = 0;
+    ll actual_rejected_candidate_fee = 0;
     int future_fit_evaluated_turns = 0;
     int future_fit_changed_placements = 0;
     int incremental_changed_from_absolute = 0;
@@ -703,6 +1379,20 @@ struct TemporalPlacementDiagnostics {
     long long anchors_checked = 0;
     long long legal_compact_candidates = 0;
     long long connected_growth_candidates = 0;
+    long long grow_and_trim_base_candidates = 0;
+    long long grow_and_trim_growth_failures = 0;
+    long long grow_and_trim_full_growths = 0;
+    long long grow_and_trim_trim_failures = 0;
+    long long grow_and_trim_duplicate_candidates = 0;
+    long long grow_and_trim_candidates = 0;
+    long long grow_and_trim_grown_cells = 0;
+    long long grow_and_trim_trimmed_cells = 0;
+    long long grow_and_trim_perimeter_improvement = 0;
+    long long grow_and_trim_perimeter_improved_candidates = 0;
+    long long grow_and_trim_perimeter_equal_candidates = 0;
+    long long grow_and_trim_perimeter_worsened_candidates = 0;
+    long long grow_and_trim_shortlisted_candidates = 0;
+    int grow_and_trim_successes = 0;
     long long shortlisted_candidates = 0;
     long long future_fit_snapshots = 0;
 };
@@ -847,11 +1537,126 @@ struct PlacementShortlistBuilder {
     }
 };
 
-vector<vector<Cell>> make_connected_growth_candidates(const vs &park, const vvi &owner, int p) {
+bool validate_connected_region(const vector<Cell> &cells, int n);
+
+// A greedy connected prefix can end with an avoidable spike merely because it
+// stops at exactly P cells.  Continue the same growth for eight cells, then
+// peel non-articulation boundary cells.  This is only a candidate generator:
+// admission, shadow, future-fit, relocation, and every downstream evaluator
+// remain unchanged.
+optional<vector<Cell>> trim_grown_connected_region(const vs &park, const vvi &owner,
+                                                   const vector<Cell> &grown, int p,
+                                                   TemporalPlacementDiagnostics &diagnostics) {
+    int n = park.size();
+    vector<char> selected(n * n, false);
+    vector<int> growth_order(n * n, -1);
+    for (int index = 0; index < (int)grown.size(); index++) {
+        auto [x, y] = grown[index];
+        int cell = x * n + y;
+        selected[cell] = true;
+        growth_order[cell] = index;
+    }
+
+    constexpr int DX[4] = {-1, 1, 0, 0};
+    constexpr int DY[4] = {0, 0, -1, 1};
+    int remaining = grown.size();
+    vector<int> discovery(n * n);
+    vector<int> low(n * n);
+    vector<int> parent(n * n);
+    vector<char> articulation(n * n);
+    while (remaining > p) {
+        for (const Cell &position : grown) {
+            int cell = position.first * n + position.second;
+            if (!selected[cell]) continue;
+            discovery[cell] = -1;
+            low[cell] = -1;
+            parent[cell] = -1;
+            articulation[cell] = false;
+        }
+        int timer = 0;
+
+        function<void(int)> dfs = [&](int cell) {
+            discovery[cell] = low[cell] = timer++;
+            int children = 0;
+            int x = cell / n;
+            int y = cell % n;
+            for (int dir = 0; dir < 4; dir++) {
+                int nx = x + DX[dir];
+                int ny = y + DY[dir];
+                if (!inside(nx, ny, n, n)) continue;
+                int next = nx * n + ny;
+                if (!selected[next]) continue;
+                if (discovery[next] == -1) {
+                    parent[next] = cell;
+                    children++;
+                    dfs(next);
+                    chmin(low[cell], low[next]);
+                    if (parent[cell] == -1 && children > 1) articulation[cell] = true;
+                    if (parent[cell] != -1 && low[next] >= discovery[cell]) articulation[cell] = true;
+                } else if (next != parent[cell]) {
+                    chmin(low[cell], discovery[next]);
+                }
+            }
+        };
+
+        for (const Cell &position : grown) {
+            int cell = position.first * n + position.second;
+            if (selected[cell] && discovery[cell] == -1) dfs(cell);
+        }
+
+        int removed = -1;
+        int best_perimeter_change = numeric_limits<int>::max();
+        int best_growth_order = -1;
+        for (const Cell &position : grown) {
+            int cell = position.first * n + position.second;
+            if (!selected[cell] || articulation[cell]) continue;
+            int x = cell / n;
+            int y = cell % n;
+            int selected_neighbors = 0;
+            for (int dir = 0; dir < 4; dir++) {
+                int nx = x + DX[dir];
+                int ny = y + DY[dir];
+                if (inside(nx, ny, n, n) && selected[nx * n + ny]) selected_neighbors++;
+            }
+            if (selected_neighbors == 4) continue;
+            int perimeter_change = 2 * selected_neighbors - 4;
+            if (perimeter_change < best_perimeter_change ||
+                (perimeter_change == best_perimeter_change && growth_order[cell] > best_growth_order) ||
+                (perimeter_change == best_perimeter_change && growth_order[cell] == best_growth_order &&
+                 (removed == -1 || cell < removed))) {
+                removed = cell;
+                best_perimeter_change = perimeter_change;
+                best_growth_order = growth_order[cell];
+            }
+        }
+        if (removed == -1) return nullopt;
+        selected[removed] = false;
+        remaining--;
+        diagnostics.grow_and_trim_trimmed_cells++;
+    }
+
+    vector<Cell> result;
+    result.reserve(p);
+    for (const Cell &cell : grown) {
+        if (selected[cell.first * n + cell.second]) result.push_back(cell);
+    }
+    if ((int)result.size() != p || !validate_connected_region(result, n)) return nullopt;
+    for (auto [x, y] : result) {
+        if (park[x][y] != '.' || owner[x][y] != -1) return nullopt;
+    }
+    return result;
+}
+
+vector<vector<Cell>> make_connected_growth_candidates(
+    const vs &park, const vvi &owner, int p,
+    vector<vector<Cell>> &grow_and_trim_candidates,
+    TemporalPlacementDiagnostics &diagnostics) {
     int n = park.size();
     constexpr int DX[4] = {-1, 1, 0, 0};
     constexpr int DY[4] = {0, 0, -1, 1};
     vector<vector<Cell>> candidates;
+    vector<vector<Cell>> completed_grow_and_trim;
+    grow_and_trim_candidates.clear();
 
     auto add_candidate = [&](optional<vector<Cell>> candidate) {
         if (!candidate) return;
@@ -993,12 +1798,13 @@ vector<vector<Cell>> make_connected_growth_candidates(const vs &park, const vvi 
                tuple(rhs.selected_neighbors, -rhs.distance, -rhs.bias_key, -rhs.cell);
     };
 
+    int grow_and_trim_attempts = 0;
     for (const Seed &seed_info : seeds) {
         int seed_x = seed_info.cell.first;
         int seed_y = seed_info.cell.second;
         vector<char> selected(n * n, false);
         vector<Cell> region;
-        region.reserve(p);
+        region.reserve(p + GROW_AND_TRIM_EXTRA_CELLS);
         priority_queue<GrowthEntry, vector<GrowthEntry>, decltype(entry_worse)> frontier(entry_worse);
 
         auto count_selected_neighbors = [&](int cell) {
@@ -1033,23 +1839,89 @@ vector<vector<Cell>> make_connected_growth_candidates(const vs &park, const vvi 
             }
         };
 
-        select_cell(seed_x, seed_y);
-        while ((int)region.size() < p && !frontier.empty()) {
-            GrowthEntry entry = frontier.top();
-            frontier.pop();
-            if (selected[entry.cell]) continue;
-            int current_neighbors = count_selected_neighbors(entry.cell);
-            if (current_neighbors != entry.selected_neighbors) {
-                int x = entry.cell / n;
-                int y = entry.cell % n;
-                frontier.push({entry.cell, current_neighbors, abs(x - seed_x) + abs(y - seed_y), bias_key(x, y)});
-                continue;
+        auto grow_until = [&](int target_size) {
+            while ((int)region.size() < target_size && !frontier.empty()) {
+                GrowthEntry entry = frontier.top();
+                frontier.pop();
+                if (selected[entry.cell]) continue;
+                int current_neighbors = count_selected_neighbors(entry.cell);
+                if (current_neighbors != entry.selected_neighbors) {
+                    int x = entry.cell / n;
+                    int y = entry.cell % n;
+                    frontier.push(
+                        {entry.cell, current_neighbors, abs(x - seed_x) + abs(y - seed_y), bias_key(x, y)});
+                    continue;
+                }
+                select_cell(entry.cell / n, entry.cell % n);
             }
-            select_cell(entry.cell / n, entry.cell % n);
-        }
+        };
+
+        select_cell(seed_x, seed_y);
+        grow_until(p);
         if ((int)region.size() == p) {
-            add_candidate(optional<vector<Cell>>(std::move(region)));
+            if constexpr (ENABLE_GROW_AND_TRIM) {
+                // Preserve the legacy P-cell candidate and its enumeration
+                // order.  The refined candidate is an addition, never a
+                // replacement.
+                add_candidate(optional<vector<Cell>>(region));
+                if (grow_and_trim_attempts < GROW_AND_TRIM_CANDIDATE_LIMIT) {
+                    grow_and_trim_attempts++;
+                    diagnostics.grow_and_trim_base_candidates++;
+                    int base_perimeter = calc_perimeter(region, n);
+                    grow_until(p + GROW_AND_TRIM_EXTRA_CELLS);
+                    diagnostics.grow_and_trim_grown_cells += region.size() - p;
+                    if ((int)region.size() != p + GROW_AND_TRIM_EXTRA_CELLS) {
+                        diagnostics.grow_and_trim_growth_failures++;
+                    } else {
+                        diagnostics.grow_and_trim_full_growths++;
+                        optional<vector<Cell>> trimmed =
+                            trim_grown_connected_region(park, owner, region, p, diagnostics);
+                        if (!trimmed) {
+                            diagnostics.grow_and_trim_trim_failures++;
+                        } else {
+                            int improvement = base_perimeter - calc_perimeter(*trimmed, n);
+                            diagnostics.grow_and_trim_perimeter_improvement += improvement;
+                            if (improvement > 0) {
+                                diagnostics.grow_and_trim_perimeter_improved_candidates++;
+                            } else if (improvement == 0) {
+                                diagnostics.grow_and_trim_perimeter_equal_candidates++;
+                            } else {
+                                diagnostics.grow_and_trim_perimeter_worsened_candidates++;
+                            }
+                            completed_grow_and_trim.push_back(std::move(*trimmed));
+                        }
+                    }
+                }
+            } else {
+                add_candidate(optional<vector<Cell>>(std::move(region)));
+            }
         }
+    }
+
+    if constexpr (ENABLE_GROW_AND_TRIM) {
+        for (vector<Cell> &candidate : completed_grow_and_trim) {
+            bool duplicate = false;
+            for (const vector<Cell> &existing : candidates) {
+                if (same_region(existing, candidate)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                for (const vector<Cell> &existing : grow_and_trim_candidates) {
+                    if (same_region(existing, candidate)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+            }
+            if (duplicate) {
+                diagnostics.grow_and_trim_duplicate_candidates++;
+            } else {
+                grow_and_trim_candidates.push_back(std::move(candidate));
+            }
+        }
+        diagnostics.grow_and_trim_candidates += grow_and_trim_candidates.size();
     }
     return candidates;
 }
@@ -1288,7 +2160,9 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
             first = last;
         }
 
-        vector<vector<Cell>> growth_candidates = make_connected_growth_candidates(park, owner, p);
+        vector<vector<Cell>> grow_and_trim_candidates;
+        vector<vector<Cell>> growth_candidates =
+            make_connected_growth_candidates(park, owner, p, grow_and_trim_candidates, diagnostics);
         diagnostics.connected_growth_candidates += growth_candidates.size();
         for (vector<Cell> &region : growth_candidates) {
             int perimeter = calc_perimeter(region, n);
@@ -1305,11 +2179,30 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
             shortlist_builder.consider(perimeter, incremental_cost, absolute_cost, order, quadrant,
                                        PlacementSource::ConnectedGrowth, [&] { return region; });
         }
+        for (vector<Cell> &region : grow_and_trim_candidates) {
+            int perimeter = calc_perimeter(region, n);
+            long double incremental_cost = 0.0L;
+            long double absolute_cost = 0.0L;
+            for (auto [x, y] : region) {
+                incremental_cost += incremental_cell[x][y];
+                absolute_cost += absolute_cell[x][y];
+            }
+            incremental_cost -= (4 * p - perimeter) * candidate_arrival_level;
+            absolute_cost -= (4 * p - perimeter) * candidate_release_level;
+            int quadrant = placement_quadrant(region, n);
+            long long order = enumeration_order++;
+            shortlist_builder.consider(perimeter, incremental_cost, absolute_cost, order, quadrant,
+                                       PlacementSource::GrowAndTrim, [&] { return region; });
+        }
     }
 
     vector<PlacementCandidate> candidates = shortlist_builder.finalize();
     if (candidates.empty()) return nullopt;
     diagnostics.shortlisted_candidates += candidates.size();
+    diagnostics.grow_and_trim_shortlisted_candidates +=
+        count_if(candidates.begin(), candidates.end(), [](const PlacementCandidate &candidate) {
+            return candidate.source == PlacementSource::GrowAndTrim;
+        });
 
     int incremental_best = 0;
     int absolute_best = 0;
@@ -1381,8 +2274,9 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
         }
     }
     PlacementCandidate choice = std::move(candidates[best_index]);
-    if (choice.source == PlacementSource::ConnectedGrowth) {
+    if (choice.source == PlacementSource::ConnectedGrowth || choice.source == PlacementSource::GrowAndTrim) {
         diagnostics.fallback_successes++;
+        if (choice.source == PlacementSource::GrowAndTrim) diagnostics.grow_and_trim_successes++;
     } else {
         diagnostics.compact_successes++;
         if (choice.source == PlacementSource::ExtendedTemplate) {
@@ -1428,6 +2322,8 @@ void accumulate_placement_diagnostics(TemporalPlacementDiagnostics &total,
     total.compact_successes += part.compact_successes;
     total.extended_template_successes += part.extended_template_successes;
     total.fallback_successes += part.fallback_successes;
+    total.actual_rejected_candidate_perimeter += part.actual_rejected_candidate_perimeter;
+    total.actual_rejected_candidate_fee += part.actual_rejected_candidate_fee;
     total.future_fit_evaluated_turns += part.future_fit_evaluated_turns;
     total.future_fit_changed_placements += part.future_fit_changed_placements;
     total.incremental_changed_from_absolute += part.incremental_changed_from_absolute;
@@ -1435,6 +2331,23 @@ void accumulate_placement_diagnostics(TemporalPlacementDiagnostics &total,
     total.anchors_checked += part.anchors_checked;
     total.legal_compact_candidates += part.legal_compact_candidates;
     total.connected_growth_candidates += part.connected_growth_candidates;
+    total.grow_and_trim_base_candidates += part.grow_and_trim_base_candidates;
+    total.grow_and_trim_growth_failures += part.grow_and_trim_growth_failures;
+    total.grow_and_trim_full_growths += part.grow_and_trim_full_growths;
+    total.grow_and_trim_trim_failures += part.grow_and_trim_trim_failures;
+    total.grow_and_trim_duplicate_candidates += part.grow_and_trim_duplicate_candidates;
+    total.grow_and_trim_candidates += part.grow_and_trim_candidates;
+    total.grow_and_trim_grown_cells += part.grow_and_trim_grown_cells;
+    total.grow_and_trim_trimmed_cells += part.grow_and_trim_trimmed_cells;
+    total.grow_and_trim_perimeter_improvement += part.grow_and_trim_perimeter_improvement;
+    total.grow_and_trim_perimeter_improved_candidates +=
+        part.grow_and_trim_perimeter_improved_candidates;
+    total.grow_and_trim_perimeter_equal_candidates +=
+        part.grow_and_trim_perimeter_equal_candidates;
+    total.grow_and_trim_perimeter_worsened_candidates +=
+        part.grow_and_trim_perimeter_worsened_candidates;
+    total.grow_and_trim_shortlisted_candidates += part.grow_and_trim_shortlisted_candidates;
+    total.grow_and_trim_successes += part.grow_and_trim_successes;
     total.shortlisted_candidates += part.shortlisted_candidates;
     total.future_fit_snapshots += part.future_fit_snapshots;
 }
@@ -1442,6 +2355,7 @@ void accumulate_placement_diagnostics(TemporalPlacementDiagnostics &total,
 void remove_selected_placement_success(TemporalPlacementDiagnostics &diagnostics) {
     if (diagnostics.fallback_successes > 0) {
         diagnostics.fallback_successes--;
+        if (diagnostics.grow_and_trim_successes > 0) diagnostics.grow_and_trim_successes--;
         return;
     }
     if (diagnostics.compact_successes > 0) diagnostics.compact_successes--;
@@ -1451,8 +2365,9 @@ void remove_selected_placement_success(TemporalPlacementDiagnostics &diagnostics
 void replace_selected_placement_success(TemporalPlacementDiagnostics &diagnostics,
                                         PlacementSource source) {
     remove_selected_placement_success(diagnostics);
-    if (source == PlacementSource::ConnectedGrowth) {
+    if (source == PlacementSource::ConnectedGrowth || source == PlacementSource::GrowAndTrim) {
         diagnostics.fallback_successes++;
+        if (source == PlacementSource::GrowAndTrim) diagnostics.grow_and_trim_successes++;
     } else {
         diagnostics.compact_successes++;
         if (source == PlacementSource::ExtendedTemplate) diagnostics.extended_template_successes++;
@@ -1486,6 +2401,8 @@ ArrivalDecision evaluate_arrival_decision(const vs &park, const vvi &decision_ow
     ll actual_fee = round_payment(arrival.v, arrival.p, placement->perimeter);
     if ((long double)actual_fee <= opportunity_cost) {
         if (root_alternatives) root_alternatives->clear();
+        result.diagnostics.actual_rejected_candidate_perimeter = placement->perimeter;
+        result.diagnostics.actual_rejected_candidate_fee = actual_fee;
         result.status = ArrivalStatus::ActualFeeRejected;
         return result;
     }
@@ -1512,6 +2429,231 @@ TurnPlan make_arrival_plan(const ArrivalDecision &decision) {
     }
     plan.immediate_gain = decision.fee;
     return plan;
+}
+
+// This is a deliberately infeasible upper bound: every offered group is
+// assumed to be accepted at its minimum possible perimeter, with no capacity
+// conflict.  Its gap from the realized money is nevertheless an exact way to
+// separate geometry loss, rejected value, and movement cost.
+struct LossDiagnostics {
+    int observed = 0;
+    int accepted = 0;
+    int upper_rejected = 0;
+    int actual_rejected = 0;
+    int no_region_rejected = 0;
+    int rejected_status_mismatch = 0;
+    int rejected_feasible = 0;
+    int rejected_unplaceable = 0;
+    int upper_rejected_feasible = 0;
+    int upper_rejected_unplaceable = 0;
+    int unplaceable_static = 0;
+    int unplaceable_capacity = 0;
+    int unplaceable_fragmentation = 0;
+    int feasibility_mismatches = 0;
+    int accepted_status_mismatches = 0;
+    int accepted_plan_mismatches = 0;
+    int accepted_source_mismatches = 0;
+    int rejected_move_plans = 0;
+    int finalized_accepted = 0;
+    // minimum template, extended template, connected growth, unclassified
+    array<int, 4> accepted_by_source{};
+    int accepted_grow_and_trim = 0;
+
+    ll offered_ideal_fee = 0;
+    ll offered_cell_time = 0;
+    ll accepted_ideal_fee = 0;
+    ll accepted_initial_fee = 0;
+    ll accepted_initial_shape_loss = 0;
+    ll accepted_relocation_fee_loss = 0;
+    ll accepted_final_fee = 0;
+    ll accepted_cell_time = 0;
+    ll movement_cost_paid = 0;
+
+    ll rejected_ideal_fee = 0;
+    ll rejected_cell_time = 0;
+    ll upper_rejected_ideal_fee = 0;
+    ll upper_rejected_cell_time = 0;
+    ll actual_rejected_ideal_fee = 0;
+    ll actual_rejected_cell_time = 0;
+    ll actual_rejected_candidate_fee = 0;
+    ll actual_rejected_geometry_loss = 0;
+    ll no_region_ideal_fee = 0;
+    ll no_region_cell_time = 0;
+    ll rejected_status_mismatch_ideal_fee = 0;
+    ll rejected_status_mismatch_cell_time = 0;
+
+    ll rejected_feasible_ideal_fee = 0;
+    ll rejected_feasible_cell_time = 0;
+    ll rejected_unplaceable_ideal_fee = 0;
+    ll rejected_unplaceable_cell_time = 0;
+    ll unplaceable_static_ideal_fee = 0;
+    ll unplaceable_static_cell_time = 0;
+    ll unplaceable_capacity_ideal_fee = 0;
+    ll unplaceable_capacity_cell_time = 0;
+    ll unplaceable_fragmentation_ideal_fee = 0;
+    ll unplaceable_fragmentation_cell_time = 0;
+
+    ll accepted_perimeter_excess = 0;
+    ll accepted_decision_fee_error = 0;
+    ll accepted_decision_perimeter_error = 0;
+    array<ll, 4> accepted_source_ideal_fee{};
+    array<ll, 4> accepted_source_initial_fee{};
+    array<ll, 4> accepted_source_perimeter_excess{};
+    ll accepted_grow_and_trim_ideal_fee = 0;
+    ll accepted_grow_and_trim_initial_fee = 0;
+    ll accepted_grow_and_trim_perimeter_excess = 0;
+    ll accepted_free_cells_sum = 0;
+    ll rejected_feasible_free_cells_sum = 0;
+    ll rejected_unplaceable_free_cells_sum = 0;
+
+    long double accepted_opportunity_cost = 0.0L;
+    long double upper_rejected_opportunity_cost = 0.0L;
+    long double actual_rejected_opportunity_cost = 0.0L;
+    long double no_region_opportunity_cost = 0.0L;
+};
+
+__attribute__((noinline)) void observe_loss(
+    LossDiagnostics &diagnostics, const ArrivalDecision &decision, const TurnPlan &plan,
+    const GroupState &arrival, int minimum_perimeter, int free_cells_before,
+    int static_largest_component, int reject_largest_component,
+    ll turn_movement_cost, ll turn_relocation_fee_loss, long double opportunity_cost) {
+    ll ideal_fee = round_payment(arrival.v, arrival.p, minimum_perimeter);
+    ll cell_time = (ll)arrival.p * (arrival.t - arrival.s);
+    diagnostics.observed++;
+    diagnostics.offered_ideal_fee += ideal_fee;
+    diagnostics.offered_cell_time += cell_time;
+    diagnostics.movement_cost_paid += turn_movement_cost;
+    diagnostics.accepted_relocation_fee_loss += turn_relocation_fee_loss;
+
+    if (plan.arrival) {
+        ll initial_fee = round_payment(arrival.v, arrival.p, plan.arrival_perimeter);
+        diagnostics.accepted++;
+        diagnostics.accepted_ideal_fee += ideal_fee;
+        diagnostics.accepted_initial_fee += initial_fee;
+        diagnostics.accepted_initial_shape_loss += ideal_fee - initial_fee;
+        diagnostics.accepted_cell_time += cell_time;
+        diagnostics.accepted_perimeter_excess += plan.arrival_perimeter - minimum_perimeter;
+        diagnostics.accepted_free_cells_sum += free_cells_before;
+        diagnostics.accepted_decision_fee_error += decision.fee - initial_fee;
+        diagnostics.accepted_decision_perimeter_error +=
+            decision.perimeter - plan.arrival_perimeter;
+        if (decision.status != ArrivalStatus::Accepted) diagnostics.accepted_status_mismatches++;
+        if (decision.fee != initial_fee || decision.perimeter != plan.arrival_perimeter) {
+            diagnostics.accepted_plan_mismatches++;
+        }
+
+        int source = 3;
+        if (decision.diagnostics.compact_successes == 1 &&
+            decision.diagnostics.extended_template_successes == 0 &&
+            decision.diagnostics.fallback_successes == 0) {
+            source = 0;
+        } else if (decision.diagnostics.compact_successes == 1 &&
+                   decision.diagnostics.extended_template_successes == 1 &&
+                   decision.diagnostics.fallback_successes == 0) {
+            source = 1;
+        } else if (decision.diagnostics.compact_successes == 0 &&
+                   decision.diagnostics.extended_template_successes == 0 &&
+                   decision.diagnostics.fallback_successes == 1 &&
+                   (decision.diagnostics.grow_and_trim_successes == 0 ||
+                    decision.diagnostics.grow_and_trim_successes == 1)) {
+            source = 2;
+        } else {
+            diagnostics.accepted_source_mismatches++;
+        }
+        diagnostics.accepted_by_source[source]++;
+        diagnostics.accepted_source_ideal_fee[source] += ideal_fee;
+        diagnostics.accepted_source_initial_fee[source] += initial_fee;
+        diagnostics.accepted_source_perimeter_excess[source] +=
+            plan.arrival_perimeter - minimum_perimeter;
+        if (decision.diagnostics.grow_and_trim_successes == 1) {
+            diagnostics.accepted_grow_and_trim++;
+            diagnostics.accepted_grow_and_trim_ideal_fee += ideal_fee;
+            diagnostics.accepted_grow_and_trim_initial_fee += initial_fee;
+            diagnostics.accepted_grow_and_trim_perimeter_excess +=
+                plan.arrival_perimeter - minimum_perimeter;
+        }
+        diagnostics.accepted_opportunity_cost += opportunity_cost;
+        return;
+    }
+
+    diagnostics.rejected_ideal_fee += ideal_fee;
+    diagnostics.rejected_cell_time += cell_time;
+    if (!plan.moves.empty()) diagnostics.rejected_move_plans++;
+    bool feasible = reject_largest_component >= arrival.p;
+    if (reject_largest_component < 0) diagnostics.feasibility_mismatches++;
+    switch (decision.status) {
+        case ArrivalStatus::UpperBoundRejected:
+            diagnostics.upper_rejected++;
+            diagnostics.upper_rejected_ideal_fee += ideal_fee;
+            diagnostics.upper_rejected_cell_time += cell_time;
+            diagnostics.upper_rejected_opportunity_cost += opportunity_cost;
+            if (feasible) {
+                diagnostics.upper_rejected_feasible++;
+            } else {
+                diagnostics.upper_rejected_unplaceable++;
+            }
+            break;
+        case ArrivalStatus::ActualFeeRejected:
+            diagnostics.actual_rejected++;
+            diagnostics.actual_rejected_ideal_fee += ideal_fee;
+            diagnostics.actual_rejected_cell_time += cell_time;
+            diagnostics.actual_rejected_candidate_fee +=
+                decision.diagnostics.actual_rejected_candidate_fee;
+            diagnostics.actual_rejected_geometry_loss +=
+                ideal_fee - decision.diagnostics.actual_rejected_candidate_fee;
+            diagnostics.actual_rejected_opportunity_cost += opportunity_cost;
+            if (!feasible) diagnostics.feasibility_mismatches++;
+            break;
+        case ArrivalStatus::NoRegion:
+            diagnostics.no_region_rejected++;
+            diagnostics.no_region_ideal_fee += ideal_fee;
+            diagnostics.no_region_cell_time += cell_time;
+            diagnostics.no_region_opportunity_cost += opportunity_cost;
+            if (feasible) diagnostics.feasibility_mismatches++;
+            break;
+        case ArrivalStatus::Accepted:
+            diagnostics.rejected_status_mismatch++;
+            diagnostics.rejected_status_mismatch_ideal_fee += ideal_fee;
+            diagnostics.rejected_status_mismatch_cell_time += cell_time;
+            break;
+    }
+
+    if (feasible) {
+        diagnostics.rejected_feasible++;
+        diagnostics.rejected_feasible_ideal_fee += ideal_fee;
+        diagnostics.rejected_feasible_cell_time += cell_time;
+        diagnostics.rejected_feasible_free_cells_sum += free_cells_before;
+        return;
+    }
+
+    diagnostics.rejected_unplaceable++;
+    diagnostics.rejected_unplaceable_ideal_fee += ideal_fee;
+    diagnostics.rejected_unplaceable_cell_time += cell_time;
+    diagnostics.rejected_unplaceable_free_cells_sum += free_cells_before;
+
+    if (static_largest_component < arrival.p) {
+        diagnostics.unplaceable_static++;
+        diagnostics.unplaceable_static_ideal_fee += ideal_fee;
+        diagnostics.unplaceable_static_cell_time += cell_time;
+    } else if (free_cells_before < arrival.p) {
+        diagnostics.unplaceable_capacity++;
+        diagnostics.unplaceable_capacity_ideal_fee += ideal_fee;
+        diagnostics.unplaceable_capacity_cell_time += cell_time;
+    } else {
+        diagnostics.unplaceable_fragmentation++;
+        diagnostics.unplaceable_fragmentation_ideal_fee += ideal_fee;
+        diagnostics.unplaceable_fragmentation_cell_time += cell_time;
+    }
+}
+
+__attribute__((noinline)) void finalize_loss_diagnostics(
+    LossDiagnostics &diagnostics, const vector<GroupState> &groups) {
+    for (const GroupState &group : groups) {
+        if (group.max_perimeter <= 0) continue;
+        diagnostics.finalized_accepted++;
+        diagnostics.accepted_final_fee +=
+            round_payment(group.v, group.p, group.max_perimeter);
+    }
 }
 
 using BoardMask = array<uint64_t, BOARD_MASK_WORDS>;
@@ -1665,6 +2807,256 @@ struct RescueDiagnostics {
     long double root_confirmation_holdout_margin = 0.0L;
     long double root_confirmation_approved_margin = 0.0L;
     long double root_confirmation_rejected_margin = 0.0L;
+
+    // NoRegion Push-out is a Reject-vs-relocation decision, unlike the
+    // Accepted-vs-compact rescue above.  Keep its funnel separate so the two
+    // mechanisms can be judged independently even though they share search.
+    int pushout_eligible = 0;
+    int pushout_area_insufficient = 0;
+    int pushout_no_economic_target = 0;
+    int pushout_feasible_turns = 0;
+    int pushout_feasible_plans = 0;
+    int pushout_no_repair = 0;
+    int pushout_rollout_generation_failures = 0;
+    int pushout_rollout_turns = 0;
+    int pushout_screen_rejected = 0;
+    int pushout_adopted = 0;
+    int pushout_target_limit_exhausted = 0;
+    int pushout_destination_limit_exhausted = 0;
+    int pushout_node_limit_exhausted = 0;
+    int pushout_maximum_blockers = 0;
+    array<int, 4> pushout_feasible_by_blocker_count{};
+    array<int, 4> pushout_adopted_by_blocker_count{};
+    long long pushout_shadow_filtered_targets = 0;
+    long long pushout_target_anchors = 0;
+    long long pushout_target_shortlisted = 0;
+    long long pushout_exact_targets = 0;
+    long long pushout_economic_targets = 0;
+    long long pushout_repair_attempts = 0;
+    long long pushout_destination_anchors = 0;
+    long long pushout_destination_candidates = 0;
+    long long pushout_beam_nodes = 0;
+    long long pushout_rollout_policy_steps = 0;
+    long long pushout_moved_groups = 0;
+    long long pushout_moved_cells = 0;
+    ll pushout_arrival_fee = 0;
+    ll pushout_movement_cost = 0;
+    ll pushout_relocation_fee_loss = 0;
+    ll pushout_direct_gain = 0;
+    ll pushout_scenario_0_future_delta = 0;
+    ll pushout_scenario_1_future_delta = 0;
+    long double pushout_screen_margin = 0.0L;
+    double pushout_cpu_seconds = 0.0;
+    double pushout_maximum_turn_cpu_seconds = 0.0;
+
+    // One-helper Push-out is an additive second search phase.  The legacy
+    // blockers-only candidates remain protected and these counters expose the
+    // added funnel and work independently.
+    int pushout_helper_considered_turns = 0;
+    int pushout_helper_no_eligible_target_turns = 0;
+    int pushout_helper_no_evidence_turns = 0;
+    int pushout_helper_economic_rejected_turns = 0;
+    int pushout_helper_seeded_turns = 0;
+    int pushout_helper_attempts = 0;
+    int pushout_helper_missing_destination = 0;
+    int pushout_helper_missing_blocker_destination = 0;
+    int pushout_helper_missing_helper_destination = 0;
+    int pushout_helper_repair_failures = 0;
+    int pushout_helper_validation_failures = 0;
+    int pushout_helper_duplicate_plans = 0;
+    int pushout_helper_feasible_plans = 0;
+    int pushout_helper_screen_rejected = 0;
+    int pushout_helper_adopted = 0;
+    int pushout_helper_surveyed_turns = 0;
+    int pushout_helper_surveyed_targets = 0;
+    int pushout_helper_large_blocker_targets = 0;
+    int pushout_helper_probe_limit_exhausted = 0;
+    int pushout_helper_feasible_limit_exhausted = 0;
+    int pushout_helper_two_feasible_turns = 0;
+    int pushout_helper_maximum_movers = 0;
+    array<int, PUSHOUT_HELPER_MAX_BLOCKERS> pushout_helper_feasible_by_blocker_count{};
+    array<int, PUSHOUT_HELPER_MAX_BLOCKERS> pushout_helper_adopted_by_blocker_count{};
+    long long pushout_helper_obstruction_probes = 0;
+    long long pushout_helper_single_owner_regions = 0;
+    long long pushout_helper_overlap_cells = 0;
+    long long pushout_helper_evidenced_groups = 0;
+    long long pushout_helper_recorded_witnesses = 0;
+    long long pushout_helper_shortlisted_choices = 0;
+    long long pushout_helper_destination_anchors = 0;
+    long long pushout_helper_destination_candidates = 0;
+    long long pushout_helper_foreign_destination_candidates = 0;
+    long long pushout_helper_retained_foreign_destinations = 0;
+    long long pushout_helper_forced_witness_destinations = 0;
+    long long pushout_helper_beam_nodes = 0;
+    long long pushout_helper_selected_covered_blockers = 0;
+    long long pushout_helper_selected_unlocked_regions = 0;
+    long long pushout_helper_selected_overlap_cells = 0;
+    ll pushout_helper_selected_movement_cost = 0;
+    ll pushout_helper_selected_departure_distance = 0;
+    ll pushout_helper_selected_adjusted_gain = 0;
+    int pushout_helper_feasible_blocker_uses_helper = 0;
+    int pushout_helper_feasible_helper_uses_blocker = 0;
+    int pushout_helper_feasible_bidirectional_cross_use = 0;
+    int pushout_helper_adopted_blocker_uses_helper = 0;
+    int pushout_helper_adopted_helper_uses_blocker = 0;
+    int pushout_helper_adopted_bidirectional_cross_use = 0;
+    long long pushout_helper_adopted_moved_groups = 0;
+    long long pushout_helper_adopted_moved_cells = 0;
+    ll pushout_helper_adopted_arrival_fee = 0;
+    ll pushout_helper_adopted_movement_cost = 0;
+    ll pushout_helper_adopted_direct_gain = 0;
+    ll pushout_helper_scenario_0_future_delta = 0;
+    ll pushout_helper_scenario_1_future_delta = 0;
+    long double pushout_helper_screen_margin = 0.0L;
+    double pushout_helper_phase_cpu_seconds = 0.0;
+};
+
+struct DeadlineLayerDiagnostics {
+    int eligible = 0;
+    int no_region_eligible = 0;
+    int noncompact_eligible = 0;
+    int area_insufficient = 0;
+    int economic_upper_bound_rejected = 0;
+    int case_budget_skips = 0;
+    int window_budget_skips = 0;
+    int attempts = 0;
+    array<int, 4> attempts_by_window{};
+    array<int, 4> no_region_attempts_by_window{};
+    array<int, 4> noncompact_attempts_by_window{};
+    int graph_builds = 0;
+    int graph_failures = 0;
+    int closure_failures = 0;
+    int workspaces_searched = 0;
+    int layout_failures = 0;
+    int validation_failures = 0;
+    int feasible_turns = 0;
+    int feasible_plans = 0;
+    int complete_plan_attempts = 0;
+    int zero_move_candidates_filtered = 0;
+    int direct_gate_rejected = 0;
+    int rollout_generation_failures = 0;
+    int rollout_turns = 0;
+    int screen_rejected = 0;
+    int confirmation_rejected = 0;
+    int confirmation_attempts = 0;
+    int adopted = 0;
+    int adopted_with_move = 0;
+    int adopted_from_no_region = 0;
+    int closure_limit_exhausted = 0;
+    int layout_limit_exhausted = 0;
+    int template_limit_exhausted = 0;
+    int growth_limit_exhausted = 0;
+    int connectivity_limit_exhausted = 0;
+    int complete_plan_limit_exhausted = 0;
+    int partition_errors = 0;
+    int prefix_connectivity_errors = 0;
+    int direct_identity_errors = 0;
+    long long closure_expansions = 0;
+    long long closure_states = 0;
+    long long completed_closures = 0;
+    long long global_closures = 0;
+    long long layout_nodes = 0;
+    long long region_candidates = 0;
+    long long template_probes = 0;
+    long long growth_steps = 0;
+    long long connectivity_visits = 0;
+    long long connectivity_calls = 0;
+    long long rollout_policy_steps = 0;
+    long long moved_groups = 0;
+    long long moved_cells = 0;
+    ll arrival_fee = 0;
+    ll movement_cost = 0;
+    ll relocation_fee_loss = 0;
+    ll direct_gain = 0;
+    ll scenario_0_future_delta = 0;
+    ll scenario_1_future_delta = 0;
+    long double screen_margin = 0.0L;
+    double cpu_seconds = 0.0;
+    double maximum_turn_cpu_seconds = 0.0;
+};
+
+struct DeadlineLayerCpuScope {
+    DeadlineLayerDiagnostics &diagnostics;
+    clock_t begin;
+
+    explicit DeadlineLayerCpuScope(DeadlineLayerDiagnostics &diagnostics)
+        : diagnostics(diagnostics), begin(clock()) {}
+
+    ~DeadlineLayerCpuScope() {
+        clock_t end = clock();
+        if (begin == (clock_t)-1 || end == (clock_t)-1) return;
+        double seconds = (double)(end - begin) / CLOCKS_PER_SEC;
+        diagnostics.cpu_seconds += seconds;
+        chmax(diagnostics.maximum_turn_cpu_seconds, seconds);
+    }
+};
+
+struct PushOutDiagnosticScope {
+    RescueDiagnostics &diagnostics;
+    bool active;
+    clock_t cpu_begin;
+    long long target_anchors;
+    long long target_shortlisted;
+    long long exact_targets;
+    long long economic_targets;
+    long long repair_attempts;
+    long long destination_anchors;
+    long long destination_candidates;
+    long long beam_nodes;
+    long long rollout_policy_steps;
+    int feasible_plans;
+    int rollout_turns;
+    int target_limit_exhausted;
+    int destination_limit_exhausted;
+    int node_limit_exhausted;
+
+    PushOutDiagnosticScope(RescueDiagnostics &diagnostics, bool active)
+        : diagnostics(diagnostics),
+          active(active),
+          cpu_begin(active ? clock() : (clock_t)-1),
+          target_anchors(diagnostics.target_anchors),
+          target_shortlisted(diagnostics.target_shortlisted),
+          exact_targets(diagnostics.exact_targets),
+          economic_targets(diagnostics.economic_targets),
+          repair_attempts(diagnostics.repair_attempts),
+          destination_anchors(diagnostics.destination_anchors),
+          destination_candidates(diagnostics.destination_candidates),
+          beam_nodes(diagnostics.beam_nodes),
+          rollout_policy_steps(diagnostics.rollout_policy_steps),
+          feasible_plans(diagnostics.feasible_plans),
+          rollout_turns(diagnostics.rollout_turns),
+          target_limit_exhausted(diagnostics.target_limit_exhausted),
+          destination_limit_exhausted(diagnostics.destination_limit_exhausted),
+          node_limit_exhausted(diagnostics.node_limit_exhausted) {}
+
+    ~PushOutDiagnosticScope() {
+        if (!active) return;
+        diagnostics.pushout_target_anchors += diagnostics.target_anchors - target_anchors;
+        diagnostics.pushout_target_shortlisted += diagnostics.target_shortlisted - target_shortlisted;
+        diagnostics.pushout_exact_targets += diagnostics.exact_targets - exact_targets;
+        diagnostics.pushout_economic_targets += diagnostics.economic_targets - economic_targets;
+        diagnostics.pushout_repair_attempts += diagnostics.repair_attempts - repair_attempts;
+        diagnostics.pushout_destination_anchors += diagnostics.destination_anchors - destination_anchors;
+        diagnostics.pushout_destination_candidates +=
+            diagnostics.destination_candidates - destination_candidates;
+        diagnostics.pushout_beam_nodes += diagnostics.beam_nodes - beam_nodes;
+        diagnostics.pushout_rollout_policy_steps +=
+            diagnostics.rollout_policy_steps - rollout_policy_steps;
+        diagnostics.pushout_feasible_plans += diagnostics.feasible_plans - feasible_plans;
+        diagnostics.pushout_rollout_turns += diagnostics.rollout_turns - rollout_turns;
+        diagnostics.pushout_target_limit_exhausted +=
+            diagnostics.target_limit_exhausted - target_limit_exhausted;
+        diagnostics.pushout_destination_limit_exhausted +=
+            diagnostics.destination_limit_exhausted - destination_limit_exhausted;
+        diagnostics.pushout_node_limit_exhausted +=
+            diagnostics.node_limit_exhausted - node_limit_exhausted;
+        clock_t cpu_end = clock();
+        if (cpu_begin != (clock_t)-1 && cpu_end != (clock_t)-1) {
+            double seconds = (double)(cpu_end - cpu_begin) / CLOCKS_PER_SEC;
+            diagnostics.pushout_cpu_seconds += seconds;
+            chmax(diagnostics.pushout_maximum_turn_cpu_seconds, seconds);
+        }
+    }
 };
 
 struct RescueTargetSeed {
@@ -1680,6 +3072,7 @@ struct RescueTarget {
     vector<Cell> cells;
     uint64_t region_hash = 0;
     vector<int> blockers;
+    int blocker_cells = 0;
     int perimeter = 0;
     ll movement_cost = 0;
     ll immediate_improvement = 0;
@@ -1688,7 +3081,8 @@ struct RescueTarget {
 
 vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
                                          const vector<GroupState> &groups, int arrival_id, int r_milli,
-                                         const ArrivalDecision &baseline,
+                                         ll baseline_score, long double direct_gain_threshold,
+                                         bool no_region_pushout, int shortlist_per_metric,
                                          const vector<vector<Shape>> &compact_shapes,
                                          RescueDiagnostics &diagnostics) {
     int n = park.size();
@@ -1715,7 +3109,28 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
     }
     vector<vi> pond_prefix = make_flag_prefix(pond, n);
 
-    vector<RescueTargetSeed> seeds;
+    auto occupied_better = [](const RescueTargetSeed &lhs, const RescueTargetSeed &rhs) {
+        return tie(lhs.occupied_cells, lhs.fractional_move_cost, lhs.order) <
+               tie(rhs.occupied_cells, rhs.fractional_move_cost, rhs.order);
+    };
+    auto fractional_better = [](const RescueTargetSeed &lhs, const RescueTargetSeed &rhs) {
+        return tie(lhs.fractional_move_cost, lhs.occupied_cells, lhs.order) <
+               tie(rhs.fractional_move_cost, rhs.occupied_cells, rhs.order);
+    };
+    auto retain_shortlist = [&](vector<RescueTargetSeed> &heap, const RescueTargetSeed &seed, auto better) {
+        if ((int)heap.size() < shortlist_per_metric) {
+            heap.push_back(seed);
+            push_heap(heap.begin(), heap.end(), better);
+        } else if (better(seed, heap.front())) {
+            pop_heap(heap.begin(), heap.end(), better);
+            heap.back() = seed;
+            push_heap(heap.begin(), heap.end(), better);
+        }
+    };
+    vector<RescueTargetSeed> occupied_shortlist;
+    vector<RescueTargetSeed> fractional_shortlist;
+    occupied_shortlist.reserve(shortlist_per_metric);
+    fractional_shortlist.reserve(shortlist_per_metric);
     long long order = 0;
     for (int shape_index = 0; shape_index < (int)shapes.size(); shape_index++) {
         const Shape &shape = shapes[shape_index];
@@ -1734,38 +3149,34 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
                 long double fractional =
                     rectangle_sum(fractional_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
                     rectangle_sum(fractional_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
-                seeds.push_back({shape_index, base_x, base_y, occupied, fractional, order++});
+                RescueTargetSeed seed{shape_index, base_x, base_y, occupied, fractional, order++};
+                retain_shortlist(occupied_shortlist, seed, occupied_better);
+                retain_shortlist(fractional_shortlist, seed, fractional_better);
             }
         }
     }
 
-    vector<int> shortlisted;
-    auto add_shortlist = [&](auto less) {
-        vector<int> indices(seeds.size());
-        iota(indices.begin(), indices.end(), 0);
-        int keep = min(RESCUE_TARGET_SHORTLIST_PER_METRIC, (int)indices.size());
-        partial_sort(indices.begin(), indices.begin() + keep, indices.end(),
-                     [&](int lhs, int rhs) { return less(seeds[lhs], seeds[rhs]); });
-        indices.resize(keep);
-        shortlisted.insert(shortlisted.end(), indices.begin(), indices.end());
-    };
-    add_shortlist([](const RescueTargetSeed &lhs, const RescueTargetSeed &rhs) {
-        return tie(lhs.occupied_cells, lhs.fractional_move_cost, lhs.order) <
-               tie(rhs.occupied_cells, rhs.fractional_move_cost, rhs.order);
+    // Keep only the two bounded top-k heaps instead of materializing every
+    // pond-legal anchor and two full index arrays.  The unique enumeration
+    // order is the final key, so this retains exactly the old partial_sort set.
+    vector<RescueTargetSeed> shortlisted;
+    shortlisted.reserve(occupied_shortlist.size() + fractional_shortlist.size());
+    shortlisted.insert(shortlisted.end(), occupied_shortlist.begin(), occupied_shortlist.end());
+    shortlisted.insert(shortlisted.end(), fractional_shortlist.begin(), fractional_shortlist.end());
+    sort(shortlisted.begin(), shortlisted.end(), [](const RescueTargetSeed &lhs, const RescueTargetSeed &rhs) {
+        return lhs.order < rhs.order;
     });
-    add_shortlist([](const RescueTargetSeed &lhs, const RescueTargetSeed &rhs) {
-        return tie(lhs.fractional_move_cost, lhs.occupied_cells, lhs.order) <
-               tie(rhs.fractional_move_cost, rhs.occupied_cells, rhs.order);
-    });
-    sort(shortlisted.begin(), shortlisted.end());
-    shortlisted.erase(unique(shortlisted.begin(), shortlisted.end()), shortlisted.end());
+    shortlisted.erase(
+        unique(shortlisted.begin(), shortlisted.end(), [](const RescueTargetSeed &lhs, const RescueTargetSeed &rhs) {
+            return lhs.order == rhs.order;
+        }),
+        shortlisted.end());
     diagnostics.target_shortlisted += shortlisted.size();
 
     vector<RescueTarget> result;
     vector<int> seen(groups.size(), -1);
     int stamp = 0;
-    for (int seed_index : shortlisted) {
-        const RescueTargetSeed &seed = seeds[seed_index];
+    for (const RescueTargetSeed &seed : shortlisted) {
         vector<Cell> cells =
             materialize_shape(shapes[seed.shape_index], seed.base_x, seed.base_y, arrival.p);
         vector<int> blockers;
@@ -1782,10 +3193,18 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
         if (blockers.empty()) continue;
         sort(blockers.begin(), blockers.end());
         ll movement_cost_sum = 0;
-        for (int id : blockers) movement_cost_sum += move_cost(groups[id].v, r_milli);
+        int blocker_cells = 0;
+        for (int id : blockers) {
+            movement_cost_sum += move_cost(groups[id].v, r_milli);
+            blocker_cells += groups[id].p;
+        }
         diagnostics.exact_targets++;
-        ll improvement = compact_fee - baseline.fee - movement_cost_sum;
+        ll improvement = compact_fee - baseline_score - movement_cost_sum;
         if (improvement <= 0) continue;
+        if ((long double)improvement <= direct_gain_threshold) {
+            if (no_region_pushout) diagnostics.pushout_shadow_filtered_targets++;
+            continue;
+        }
         diagnostics.economic_targets++;
 
         uint64_t region_hash = placement_region_hash(cells);
@@ -1797,15 +3216,18 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
             }
         }
         if (duplicate) continue;
-        result.push_back({std::move(cells), region_hash, std::move(blockers), minimum_perimeter,
-                          movement_cost_sum, improvement, seed.order});
+        result.push_back({std::move(cells), region_hash, std::move(blockers), blocker_cells,
+                          minimum_perimeter, movement_cost_sum, improvement, seed.order});
     }
 
-    sort(result.begin(), result.end(), [](const RescueTarget &lhs, const RescueTarget &rhs) {
+    sort(result.begin(), result.end(), [&](const RescueTarget &lhs, const RescueTarget &rhs) {
         if (lhs.immediate_improvement != rhs.immediate_improvement) {
             return lhs.immediate_improvement > rhs.immediate_improvement;
         }
         if (lhs.blockers.size() != rhs.blockers.size()) return lhs.blockers.size() < rhs.blockers.size();
+        if (no_region_pushout && lhs.blocker_cells != rhs.blocker_cells) {
+            return lhs.blocker_cells < rhs.blocker_cells;
+        }
         return lhs.order < rhs.order;
     });
     return result;
@@ -1817,10 +3239,190 @@ struct RescueDestination {
     int perimeter = 0;
     int fallback_overlap = 0;
     int cleared_overlap = 0;
+    int foreign_cleared_overlap = 0;
     int quadrant = 0;
+    int sector = 0;
     long double temporal_cost = 0.0L;
     long long order = 0;
 };
+
+struct PushOutHelperWitness {
+    int blocker_id = -1;
+    vector<Cell> cells;
+    int perimeter = 0;
+};
+
+struct PushOutHelperSurvey {
+    int remaining_probes = PUSHOUT_HELPER_OBSTRUCTION_PROBE_LIMIT;
+    bool probe_limit_reported = false;
+    vector<vi> owner_count_prefix;
+    vector<vector<ll>> owner_sum_prefix;
+    vector<vector<ll>> owner_square_sum_prefix;
+    vector<int> unlocked_regions;
+    vector<long long> overlap_cells;
+    vector<int> covered_blockers;
+    vector<int> last_blocker;
+    vector<vector<PushOutHelperWitness>> witnesses;
+
+    PushOutHelperSurvey(int group_count, const vvi &base_owner)
+        : owner_count_prefix(base_owner.size() + 1,
+                             vi(base_owner.size() + 1)),
+          owner_sum_prefix(base_owner.size() + 1,
+                           vector<ll>(base_owner.size() + 1)),
+          owner_square_sum_prefix(base_owner.size() + 1,
+                                  vector<ll>(base_owner.size() + 1)),
+          unlocked_regions(group_count),
+          overlap_cells(group_count),
+          covered_blockers(group_count),
+          last_blocker(group_count, -1),
+          witnesses(group_count) {
+        int n = base_owner.size();
+        for (int x = 0; x < n; x++) {
+            for (int y = 0; y < n; y++) {
+                ll owner_value = base_owner[x][y] == -1 ? 0 : base_owner[x][y] + 1;
+                owner_count_prefix[x + 1][y + 1] =
+                    (owner_value != 0) + owner_count_prefix[x][y + 1] +
+                    owner_count_prefix[x + 1][y] - owner_count_prefix[x][y];
+                owner_sum_prefix[x + 1][y + 1] =
+                    owner_value + owner_sum_prefix[x][y + 1] +
+                    owner_sum_prefix[x + 1][y] - owner_sum_prefix[x][y];
+                owner_square_sum_prefix[x + 1][y + 1] =
+                    owner_value * owner_value +
+                    owner_square_sum_prefix[x][y + 1] +
+                    owner_square_sum_prefix[x + 1][y] -
+                    owner_square_sum_prefix[x][y];
+            }
+        }
+    }
+};
+
+// Record an almost-legal blocker destination only when clearing exactly one
+// additional active owner would make every cell available.  This is the
+// causal shortlist for a helper; arbitrary active groups are never searched.
+// Count/sum/square-sum prefixes prove in O(1) that every occupied cell has the
+// same owner, avoiding allocation and O(P) materialization per blocked anchor.
+void observe_pushout_helper_obstruction(PushOutHelperSurvey &survey,
+                                        const Shape &shape, int base_x, int base_y,
+                                        int blocked_cells,
+                                        const vector<GroupState> &groups,
+                                        int blocker_id, int arrival_id,
+                                        RescueDiagnostics &diagnostics) {
+    if (survey.remaining_probes == 0) {
+        if (!survey.probe_limit_reported) {
+            survey.probe_limit_reported = true;
+            diagnostics.pushout_helper_probe_limit_exhausted++;
+        }
+        return;
+    }
+    survey.remaining_probes--;
+    diagnostics.pushout_helper_obstruction_probes++;
+
+    const Rect &a = shape.main_rect;
+    const Rect &b = shape.extra_rect;
+    auto region_sum = [&](const auto &prefix) {
+        return rectangle_sum(prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
+               rectangle_sum(prefix, base_x + b.x, base_y + b.y, b.h, b.w);
+    };
+    int occupied_cells = region_sum(survey.owner_count_prefix);
+    // blocked_cells also counts pond cells.  Equality proves the shape is
+    // pond-free, so clearing its one owner is sufficient for legality.
+    if (occupied_cells == 0 || occupied_cells != blocked_cells) return;
+    ll owner_sum = region_sum(survey.owner_sum_prefix);
+    ll owner_square_sum = region_sum(survey.owner_square_sum_prefix);
+    if (owner_sum % occupied_cells != 0 ||
+        owner_square_sum * occupied_cells != owner_sum * owner_sum) {
+        return;
+    }
+    int helper_id = (int)(owner_sum / occupied_cells) - 1;
+    if (helper_id < 0 || helper_id >= (int)groups.size() ||
+        helper_id == arrival_id || !groups[helper_id].active) {
+        return;
+    }
+
+    diagnostics.pushout_helper_single_owner_regions++;
+    diagnostics.pushout_helper_overlap_cells += occupied_cells;
+    survey.unlocked_regions[helper_id]++;
+    survey.overlap_cells[helper_id] += occupied_cells;
+    if (survey.last_blocker[helper_id] != blocker_id) {
+        survey.last_blocker[helper_id] = blocker_id;
+        survey.covered_blockers[helper_id]++;
+    }
+    if constexpr (ENABLE_WIDE_PUSHOUT_HELPER) {
+        vector<PushOutHelperWitness> &helper_witnesses =
+            survey.witnesses[helper_id];
+        bool already_recorded = any_of(
+            helper_witnesses.begin(), helper_witnesses.end(),
+            [&](const PushOutHelperWitness &witness) {
+                return witness.blocker_id == blocker_id;
+            });
+        if (!already_recorded) {
+            helper_witnesses.push_back({
+                blocker_id,
+                materialize_shape(shape, base_x, base_y,
+                                  groups[blocker_id].p),
+                shape.perimeter,
+            });
+            diagnostics.pushout_helper_recorded_witnesses++;
+        }
+    }
+}
+
+struct PushOutHelperChoice {
+    int id = -1;
+    int covered_blockers = 0;
+    int unlocked_regions = 0;
+    long long overlap_cells = 0;
+    ll movement_cost = 0;
+    ll departure_distance = 0;
+    vector<PushOutHelperWitness> witnesses;
+};
+
+vector<PushOutHelperChoice> choose_pushout_helpers(
+    const PushOutHelperSurvey &survey, const RescueTarget &target,
+    const vector<GroupState> &groups, int arrival_id, int r_milli,
+    long double direct_gain_threshold, int choice_limit,
+    int &evidenced_groups) {
+    evidenced_groups = 0;
+    vector<ll> blocker_departures;
+    blocker_departures.reserve(target.blockers.size());
+    for (int id : target.blockers) blocker_departures.push_back(groups[id].t);
+    sort(blocker_departures.begin(), blocker_departures.end());
+    ll median_departure = blocker_departures[(blocker_departures.size() - 1) / 2];
+
+    vector<PushOutHelperChoice> choices;
+    for (int id = 0; id < (int)groups.size(); id++) {
+        if (survey.unlocked_regions[id] == 0) continue;
+        evidenced_groups++;
+        if (id == arrival_id || !groups[id].active ||
+            binary_search(target.blockers.begin(), target.blockers.end(), id)) {
+            continue;
+        }
+        ll added_movement_cost = move_cost(groups[id].v, r_milli);
+        if ((long double)(target.immediate_improvement - added_movement_cost) <=
+            direct_gain_threshold) {
+            continue;
+        }
+        choices.push_back({
+            id,
+            survey.covered_blockers[id],
+            survey.unlocked_regions[id],
+            survey.overlap_cells[id],
+            added_movement_cost,
+            llabs(groups[id].t - median_departure),
+            survey.witnesses[id],
+        });
+    }
+    auto key = [](const PushOutHelperChoice &choice) {
+        return tuple{-choice.covered_blockers, -choice.unlocked_regions,
+                     choice.movement_cost, choice.departure_distance, choice.id};
+    };
+    sort(choices.begin(), choices.end(), [&](const PushOutHelperChoice &lhs,
+                                             const PushOutHelperChoice &rhs) {
+        return key(lhs) < key(rhs);
+    });
+    if ((int)choices.size() > choice_limit) choices.resize(choice_limit);
+    return choices;
+}
 
 long double rescue_destination_temporal_cost(const vector<Cell> &cells, const BoardMask &cell_mask,
                                              const vs &park, const vvi &base_owner,
@@ -1854,7 +3456,9 @@ vector<RescueDestination> make_rescue_destinations(
     const vs &park, const vvi &base_owner, const vector<GroupState> &groups, int mover_id, int arrival_id,
     ll current_s, long double theta, const vector<Cell> &baseline_cells, const vector<char> &cleared_mask,
     const vector<vector<Shape>> &all_shapes, int &remaining_destination_anchors,
-    RescueDiagnostics &diagnostics) {
+    int anchor_limit, int legal_limit, int destination_limit,
+    RescueDiagnostics &diagnostics, PushOutHelperSurvey *helper_survey = nullptr,
+    bool prefer_joint_exchange = false) {
     int n = park.size();
     const GroupState &group = groups[mover_id];
     vector<vi> blocked_prefix = make_blocked_prefix(park, base_owner);
@@ -1862,6 +3466,12 @@ vector<RescueDestination> make_rescue_destinations(
     for (auto [x, y] : baseline_cells) fallback_mask[x * n + y] = true;
     vector<vi> fallback_prefix = make_flag_prefix(fallback_mask, n);
     vector<vi> cleared_prefix = make_flag_prefix(cleared_mask, n);
+    vector<vi> foreign_cleared_prefix;
+    if (prefer_joint_exchange) {
+        vector<char> foreign_cleared_mask = cleared_mask;
+        for (auto [x, y] : group.cells) foreign_cleared_mask[x * n + y] = false;
+        foreign_cleared_prefix = make_flag_prefix(foreign_cleared_mask, n);
+    }
 
     const vector<Shape> &shapes = all_shapes[group.p];
     ll previous_fee = round_payment(group.v, group.p, group.max_perimeter);
@@ -1891,13 +3501,12 @@ vector<RescueDestination> make_rescue_destinations(
     vector<RescueDestination> legal;
     long long local_order = 0;
     int sampled_anchors = 0;
-    while (remaining_destination_anchors > 0 && sampled_anchors < RESCUE_DESTINATION_ANCHOR_LIMIT &&
-           (int)legal.size() < RESCUE_DESTINATION_LEGAL_LIMIT) {
+    while (remaining_destination_anchors > 0 && sampled_anchors < anchor_limit &&
+           (int)legal.size() < legal_limit) {
         bool progressed = false;
         for (int index = 0; index < (int)eligible_shapes.size(); index++) {
             if (remaining_destination_anchors == 0 ||
-                sampled_anchors >= RESCUE_DESTINATION_ANCHOR_LIMIT ||
-                (int)legal.size() >= RESCUE_DESTINATION_LEGAL_LIMIT) {
+                sampled_anchors >= anchor_limit || (int)legal.size() >= legal_limit) {
                 break;
             }
             if (samples[index] >= anchor_counts[index]) continue;
@@ -1914,8 +3523,19 @@ vector<RescueDestination> make_rescue_destinations(
             int base_y = flat % columns;
             const Rect &a = shape.main_rect;
             const Rect &b = shape.extra_rect;
-            if (rectangle_sum(blocked_prefix, base_x + a.x, base_y + a.y, a.h, a.w) != 0 ||
-                rectangle_sum(blocked_prefix, base_x + b.x, base_y + b.y, b.h, b.w) != 0) {
+            int blocked_cells =
+                rectangle_sum(blocked_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
+                rectangle_sum(blocked_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
+            if (blocked_cells != 0) {
+                if (helper_survey != nullptr && helper_survey->remaining_probes > 0) {
+                    observe_pushout_helper_obstruction(
+                        *helper_survey, shape, base_x, base_y, blocked_cells,
+                        groups, mover_id, arrival_id, diagnostics);
+                } else if (helper_survey != nullptr &&
+                           !helper_survey->probe_limit_reported) {
+                    helper_survey->probe_limit_reported = true;
+                    diagnostics.pushout_helper_probe_limit_exhausted++;
+                }
                 continue;
             }
 
@@ -1935,13 +3555,25 @@ vector<RescueDestination> make_rescue_destinations(
                                    rectangle_sum(fallback_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
             int cleared_overlap = rectangle_sum(cleared_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
                                   rectangle_sum(cleared_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
+            int foreign_cleared_overlap = 0;
+            if (prefer_joint_exchange) {
+                foreign_cleared_overlap =
+                    rectangle_sum(foreign_cleared_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
+                    rectangle_sum(foreign_cleared_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
+                diagnostics.pushout_helper_foreign_destination_candidates +=
+                    foreign_cleared_overlap > 0;
+            }
             int lower_half = 2 * base_x + shape.h >= n;
             int right_half = 2 * base_y + shape.w >= n;
+            int sector_x = min(2, 3 * (2 * base_x + shape.h) / (2 * n));
+            int sector_y = min(2, 3 * (2 * base_y + shape.w) / (2 * n));
             BoardMask mask = make_board_mask(cells, n);
             long double temporal_cost = rescue_destination_temporal_cost(
                 cells, mask, park, base_owner, groups, mover_id, arrival_id, current_s, theta);
-            legal.push_back({std::move(cells), mask, shape.perimeter, fallback_overlap, cleared_overlap,
-                             2 * lower_half + right_half, temporal_cost, local_order++});
+            legal.push_back({std::move(cells), mask, shape.perimeter, fallback_overlap,
+                             cleared_overlap, foreign_cleared_overlap,
+                             2 * lower_half + right_half, 3 * sector_x + sector_y,
+                             temporal_cost, local_order++});
             diagnostics.destination_candidates++;
         }
         if (!progressed) break;
@@ -1954,8 +3586,6 @@ vector<RescueDestination> make_rescue_destinations(
         if (lhs.perimeter != rhs.perimeter) return lhs.perimeter < rhs.perimeter;
         return lhs.order < rhs.order;
     };
-    sort(legal.begin(), legal.end(), better);
-
     vector<RescueDestination> result;
     auto add = [&](const RescueDestination &candidate) {
         for (const RescueDestination &existing : result) {
@@ -1963,17 +3593,76 @@ vector<RescueDestination> make_rescue_destinations(
         }
         result.push_back(candidate);
     };
-    for (int index = 0; index < min(4, (int)legal.size()); index++) add(legal[index]);
-    for (int quadrant = 0; quadrant < 4; quadrant++) {
-        auto it = find_if(legal.begin(), legal.end(),
-                          [&](const RescueDestination &candidate) { return candidate.quadrant == quadrant; });
-        if (it != legal.end()) add(*it);
+    if (!prefer_joint_exchange) {
+        sort(legal.begin(), legal.end(), better);
+        for (int index = 0; index < min(4, (int)legal.size()); index++) add(legal[index]);
+        for (int quadrant = 0; quadrant < 4; quadrant++) {
+            auto it = find_if(legal.begin(), legal.end(),
+                              [&](const RescueDestination &candidate) {
+                                  return candidate.quadrant == quadrant;
+                              });
+            if (it != legal.end()) add(*it);
+        }
+        for (const RescueDestination &candidate : legal) {
+            if ((int)result.size() == destination_limit) break;
+            add(candidate);
+        }
+    } else {
+        // The old order made every mover chase the same pre-existing free
+        // cells.  Preserve several such choices, but explicitly retain moves
+        // into another mover's old region and spatially diverse alternatives.
+        auto joint_better = [](const RescueDestination &lhs,
+                               const RescueDestination &rhs) {
+            if (lhs.foreign_cleared_overlap != rhs.foreign_cleared_overlap) {
+                return lhs.foreign_cleared_overlap > rhs.foreign_cleared_overlap;
+            }
+            if (lhs.cleared_overlap != rhs.cleared_overlap) {
+                return lhs.cleared_overlap > rhs.cleared_overlap;
+            }
+            if (lhs.fallback_overlap != rhs.fallback_overlap) {
+                return lhs.fallback_overlap > rhs.fallback_overlap;
+            }
+            if (lhs.temporal_cost != rhs.temporal_cost) {
+                return lhs.temporal_cost < rhs.temporal_cost;
+            }
+            if (lhs.perimeter != rhs.perimeter) return lhs.perimeter < rhs.perimeter;
+            return lhs.order < rhs.order;
+        };
+        auto add_best = [&](auto comparator, int count) {
+            vector<int> order(legal.size());
+            iota(order.begin(), order.end(), 0);
+            sort(order.begin(), order.end(), [&](int lhs, int rhs) {
+                return comparator(legal[lhs], legal[rhs]);
+            });
+            for (int index : order) {
+                if (count == 0 || (int)result.size() == destination_limit) break;
+                int before = result.size();
+                add(legal[index]);
+                count -= (int)result.size() != before;
+            }
+        };
+        add_best(joint_better, 4);
+        add_best(better, 4);
+        for (int sector = 0; sector < 9 && (int)result.size() < destination_limit;
+             sector++) {
+            const RescueDestination *best_in_sector = nullptr;
+            for (const RescueDestination &candidate : legal) {
+                if (candidate.sector != sector) continue;
+                if (best_in_sector == nullptr || joint_better(candidate, *best_in_sector)) {
+                    best_in_sector = &candidate;
+                }
+            }
+            if (best_in_sector != nullptr) add(*best_in_sector);
+        }
+        add_best(joint_better, destination_limit);
     }
-    for (const RescueDestination &candidate : legal) {
-        if ((int)result.size() == RESCUE_DESTINATION_LIMIT) break;
-        add(candidate);
+    if ((int)result.size() > destination_limit) result.resize(destination_limit);
+    if (prefer_joint_exchange) {
+        for (const RescueDestination &candidate : result) {
+            diagnostics.pushout_helper_retained_foreign_destinations +=
+                candidate.foreign_cleared_overlap > 0;
+        }
     }
-    if ((int)result.size() > RESCUE_DESTINATION_LIMIT) result.resize(RESCUE_DESTINATION_LIMIT);
     return result;
 }
 
@@ -2070,8 +3759,11 @@ optional<vector<int>> repair_rescue_blockers(const vvi &base_owner, const vector
                     RescueBeamState child = state;
                     merge_mask(child.occupied, candidate.mask);
                     child.choice[pool_index] = candidate_index;
-                    child.rank += 1000.0L * candidate.fallback_overlap + 10.0L * candidate.cleared_overlap -
-                                  candidate.temporal_cost - 0.01L * candidate.perimeter;
+                    child.rank +=
+                        10000.0L * candidate.foreign_cleared_overlap +
+                        1000.0L * candidate.fallback_overlap +
+                        10.0L * candidate.cleared_overlap - candidate.temporal_cost -
+                        0.01L * candidate.perimeter;
                     child.order = state_order++;
                     next.push_back(std::move(child));
                 }
@@ -2347,7 +4039,8 @@ struct RescueRolloutOutcome {
 RescueRolloutOutcome evaluate_rescue_rollout_branch(
     const vs &park, const vvi &final_owner, const vector<GroupState> &groups, int arrival_id,
     const TurnPlan &plan, const vector<RescueSyntheticArrival> &scenario, int grass_cells,
-    const DensityModel &density_model, const vector<vector<Shape>> &compact_shapes) {
+    const DensityModel &density_model, SampledDlpShadowModel &sampled_dlp_model,
+    const vector<vector<Shape>> &compact_shapes) {
     // Future arrivals use the ordinary online policy and never recurse into
     // rescue.  Only their realized fees are compared between the two roots.
     RescueRolloutState state =
@@ -2371,9 +4064,19 @@ RescueRolloutOutcome evaluate_rescue_rollout_branch(
         synthetic.v = spec.v;
         synthetic.p = spec.p;
 
-        ShadowEvaluation shadow = evaluate_shadow_cost(state.groups, spec.s, spec.t, spec.p,
-                                                       spec.remaining_after, grass_cells, spec.theta,
-                                                       density_model);
+        ShadowEvaluation shadow;
+        if constexpr (ENABLE_SAMPLED_DLP) {
+            // Every root branch shares the real turn's frozen bid-price
+            // snapshot.  Re-solving from a sampled branch would give its
+            // synthetic future privileged information and would no longer be
+            // the isolated DLP-for-shadow replacement tested here.
+            shadow = sampled_dlp_model.evaluate_cached(
+                spec.s, spec.t, spec.p, true, spec.remaining_after);
+        } else {
+            shadow = evaluate_shadow_cost(state.groups, spec.s, spec.t, spec.p,
+                                          spec.remaining_after, grass_cells, spec.theta,
+                                          density_model);
+        }
         ArrivalDecision decision = evaluate_arrival_decision(
             park, state.owner, state.groups, synthetic_id, spec.s, spec.remaining_after, spec.theta,
             shadow.opportunity_cost, compact_shapes);
@@ -2399,7 +4102,8 @@ struct RootBranchView {
 bool confirm_root_override(
     const vs &park, const vector<GroupState> &groups, int arrival_id, ll current_s, int remaining_groups,
     long double theta, const ThetaEstimator &theta_estimator, int grass_cells,
-    const DensityModel &density_model, const vector<vector<Shape>> &compact_shapes,
+    const DensityModel &density_model, SampledDlpShadowModel &sampled_dlp_model,
+    const vector<vector<Shape>> &compact_shapes,
     const RootBranchView &protected_branch, const RootBranchView &challenger_branch,
     int &confirmations_used, RescueDiagnostics &diagnostics) {
     assert(protected_branch.plan != nullptr && protected_branch.final_owner != nullptr);
@@ -2443,10 +4147,10 @@ bool confirm_root_override(
         const auto &scenario = scenarios.arrivals[scenario_index];
         RescueRolloutOutcome protected_outcome = evaluate_rescue_rollout_branch(
             park, *protected_branch.final_owner, groups, arrival_id, *protected_branch.plan,
-            scenario, grass_cells, density_model, compact_shapes);
+            scenario, grass_cells, density_model, sampled_dlp_model, compact_shapes);
         RescueRolloutOutcome challenger_outcome = evaluate_rescue_rollout_branch(
             park, *challenger_branch.final_owner, groups, arrival_id, *challenger_branch.plan,
-            scenario, grass_cells, density_model, compact_shapes);
+            scenario, grass_cells, density_model, sampled_dlp_model, compact_shapes);
         diagnostics.root_confirmation_policy_steps += 2LL * scenario.size();
         ll future_delta = challenger_outcome.fee - protected_outcome.fee;
         future_delta_sum += future_delta;
@@ -2486,46 +4190,223 @@ enum class RootActionKind {
     NormalAlternative,
 };
 
+enum class RescueMode {
+    CompactAccepted,
+    NoRegionPushOut,
+};
+
 struct PreparedRescueCandidate {
     TurnPlan plan;
     vvi final_owner;
+    // blockers occupy the arrival target; movers additionally contains the
+    // optional helper.  Keep them separate so blocker histograms retain their
+    // original meaning while costs and emitted moves cover every mover.
     vector<int> blockers;
+    vector<int> movers;
+    int helper_id = -1;
     ll compact_fee = 0;
     ll direct_gain = 0;
     ll movement_cost = 0;
+    bool blocker_uses_helper_region = false;
+    bool helper_uses_blocker_region = false;
+};
+
+struct PushOutHelperSeed {
+    int target_index = -1;
+    PushOutHelperChoice helper;
+    ll adjusted_direct_gain = 0;
+};
+
+pair<bool, bool> classify_pushout_helper_exchange(
+    const TurnPlan &plan, const vector<GroupState> &groups,
+    const vector<int> &blockers, int helper_id, int n) {
+    vector<char> helper_old(n * n, false);
+    vector<char> blocker_old(n * n, false);
+    for (auto [x, y] : groups[helper_id].cells) helper_old[x * n + y] = true;
+    for (int id : blockers) {
+        for (auto [x, y] : groups[id].cells) blocker_old[x * n + y] = true;
+    }
+    bool blocker_uses_helper = false;
+    bool helper_uses_blocker = false;
+    for (const MovePlan &move : plan.moves) {
+        if (move.id == helper_id) {
+            for (auto [x, y] : move.cells) helper_uses_blocker |= blocker_old[x * n + y];
+        } else if (binary_search(blockers.begin(), blockers.end(), move.id)) {
+            for (auto [x, y] : move.cells) blocker_uses_helper |= helper_old[x * n + y];
+        }
+    }
+    return {blocker_uses_helper, helper_uses_blocker};
+}
+
+struct PushOutHelperPhaseScope {
+    RescueDiagnostics &diagnostics;
+    clock_t cpu_begin;
+    long long destination_anchors;
+    long long destination_candidates;
+    long long beam_nodes;
+
+    explicit PushOutHelperPhaseScope(RescueDiagnostics &diagnostics)
+        : diagnostics(diagnostics),
+          cpu_begin(clock()),
+          destination_anchors(diagnostics.destination_anchors),
+          destination_candidates(diagnostics.destination_candidates),
+          beam_nodes(diagnostics.beam_nodes) {}
+
+    ~PushOutHelperPhaseScope() {
+        diagnostics.pushout_helper_destination_anchors +=
+            diagnostics.destination_anchors - destination_anchors;
+        diagnostics.pushout_helper_destination_candidates +=
+            diagnostics.destination_candidates - destination_candidates;
+        diagnostics.pushout_helper_beam_nodes += diagnostics.beam_nodes - beam_nodes;
+        clock_t cpu_end = clock();
+        if (cpu_begin != (clock_t)-1 && cpu_end != (clock_t)-1) {
+            diagnostics.pushout_helper_phase_cpu_seconds +=
+                (double)(cpu_end - cpu_begin) / CLOCKS_PER_SEC;
+        }
+    }
 };
 
 optional<RootActionResult> choose_root_action_with_rescue(
     const vs &park, const vvi &owner, const vector<GroupState> &groups, int arrival_id, ll current_s,
     int remaining_groups, int r_milli, long double theta, const ThetaEstimator &theta_estimator,
-    const DensityModel &density_model, int grass_cells, const ArrivalDecision &baseline,
+    const DensityModel &density_model, SampledDlpShadowModel &sampled_dlp_model,
+    int grass_cells, long double opportunity_cost,
+    const ArrivalDecision &baseline,
     const vector<NormalPlacementChoice> &normal_alternatives,
     const vector<vector<Shape>> &compact_shapes, const vector<vector<Shape>> &all_shapes,
     int &confirmations_used, bool &root_screen_evaluated, RescueDiagnostics &diagnostics) {
     root_screen_evaluated = false;
     const GroupState &arrival = groups[arrival_id];
     int minimum_perimeter = compact_shapes[arrival.p].front().perimeter;
-    if (baseline.status != ArrivalStatus::Accepted || !baseline.cells ||
-        baseline.perimeter <= minimum_perimeter + COMPACT_PERIMETER_MARGIN) {
+    bool compact_rescue = baseline.status == ArrivalStatus::Accepted && baseline.cells &&
+                          baseline.perimeter > minimum_perimeter + COMPACT_PERIMETER_MARGIN;
+    bool no_region_pushout = ENABLE_NO_REGION_PUSHOUT && baseline.status == ArrivalStatus::NoRegion &&
+                             !baseline.cells;
+    if (!compact_rescue && !no_region_pushout) {
         return nullopt;
     }
-    diagnostics.eligible_fallbacks++;
-    vector<RescueTarget> targets = make_rescue_targets(park, owner, groups, arrival_id, r_milli, baseline,
-                                                       compact_shapes, diagnostics);
+    RescueMode mode = no_region_pushout ? RescueMode::NoRegionPushOut : RescueMode::CompactAccepted;
+    PushOutDiagnosticScope pushout_scope(diagnostics, no_region_pushout);
+    vector<Cell> preexisting_free_cells;
+    if (no_region_pushout) {
+        preexisting_free_cells.reserve(park.size() * park.size());
+        diagnostics.pushout_eligible++;
+        for (int x = 0; x < (int)park.size(); x++) {
+            for (int y = 0; y < (int)park.size(); y++) {
+                if (park[x][y] == '.' && owner[x][y] == -1) {
+                    preexisting_free_cells.emplace_back(x, y);
+                }
+            }
+        }
+        // Relocation preserves occupied area, so it cannot repair a capacity
+        // shortage.  Restrict Push-out to genuinely fragmented NoRegion turns.
+        if ((int)preexisting_free_cells.size() < arrival.p) {
+            diagnostics.pushout_area_insufficient++;
+            return nullopt;
+        }
+    } else {
+        diagnostics.eligible_fallbacks++;
+    }
+
+    ll baseline_score = compact_rescue ? baseline.fee : 0;
+    if (no_region_pushout) {
+        ll minimum_move_cost = numeric_limits<ll>::max();
+        for (const GroupState &group : groups) {
+            if (group.active) chmin(minimum_move_cost, move_cost(group.v, r_milli));
+        }
+        ll compact_fee = round_payment(arrival.v, arrival.p, minimum_perimeter);
+        // Every Push-out target has at least one blocker.  If even the
+        // cheapest possible single move fails the admission shadow, no exact
+        // target scan can produce an eligible action.
+        if (minimum_move_cost == numeric_limits<ll>::max() ||
+            (long double)(compact_fee - minimum_move_cost) <= opportunity_cost) {
+            diagnostics.no_economic_target++;
+            diagnostics.pushout_no_economic_target++;
+            return nullopt;
+        }
+    }
+    // Push-out must first satisfy the same full-horizon admission shadow as an
+    // ordinary arrival.  The short common-random-number rollout below is an
+    // additional veto for near-future geometry, not another score deduction.
+    long double direct_gain_threshold = no_region_pushout ? opportunity_cost : 0.0L;
+    vector<RescueTarget> targets = make_rescue_targets(
+        park, owner, groups, arrival_id, r_milli, baseline_score, direct_gain_threshold,
+        no_region_pushout,
+        no_region_pushout ? PUSHOUT_TARGET_SHORTLIST_PER_METRIC : RESCUE_TARGET_SHORTLIST_PER_METRIC,
+        compact_shapes, diagnostics);
     if (targets.empty()) {
         diagnostics.no_economic_target++;
+        if (no_region_pushout) diagnostics.pushout_no_economic_target++;
         return nullopt;
     }
 
-    int remaining_nodes = RESCUE_REPAIR_NODE_LIMIT;
-    int remaining_destination_anchors = RESCUE_DESTINATION_ANCHOR_GLOBAL_LIMIT;
+    int target_repair_limit =
+        no_region_pushout ? PUSHOUT_TARGET_REPAIR_LIMIT : RESCUE_TARGET_REPAIR_LIMIT;
+    int destination_anchor_limit =
+        no_region_pushout ? PUSHOUT_DESTINATION_ANCHOR_LIMIT : RESCUE_DESTINATION_ANCHOR_LIMIT;
+    int destination_legal_limit =
+        no_region_pushout ? PUSHOUT_DESTINATION_LEGAL_LIMIT : RESCUE_DESTINATION_LEGAL_LIMIT;
+    int destination_limit =
+        no_region_pushout ? PUSHOUT_DESTINATION_LIMIT : RESCUE_DESTINATION_LIMIT;
+    int remaining_nodes =
+        no_region_pushout ? PUSHOUT_REPAIR_NODE_LIMIT : RESCUE_REPAIR_NODE_LIMIT;
+    int remaining_destination_anchors =
+        no_region_pushout ? PUSHOUT_DESTINATION_ANCHOR_GLOBAL_LIMIT
+                          : RESCUE_DESTINATION_ANCHOR_GLOBAL_LIMIT;
     int attempted_targets = 0;
     vector<PreparedRescueCandidate> candidates;
     RescueRolloutScenarios rollout_scenarios;
     bool rollout_ready = false;
     bool stop_after_primary = false;
-    for (const RescueTarget &target : targets) {
-        if (attempted_targets == RESCUE_TARGET_REPAIR_LIMIT || remaining_nodes == 0 ||
+    vector<PushOutHelperSeed> helper_seeds;
+    bool helper_raw_evidence = false;
+    bool helper_surveyed_turn = false;
+    const vector<Cell> &preferred_destination_cells =
+        mode == RescueMode::NoRegionPushOut ? preexisting_free_cells : *baseline.cells;
+
+    auto initialize_rollout_for_first_candidate = [&]() {
+        diagnostics.feasible_turns++;
+        if (no_region_pushout) diagnostics.pushout_feasible_turns++;
+        if (remaining_groups == 0) {
+            diagnostics.rollout_skipped_no_future++;
+            stop_after_primary = true;
+            return true;
+        }
+
+        rollout_scenarios = make_rescue_rollout_scenarios(
+            groups, arrival_id, current_s, remaining_groups, theta, theta_estimator);
+        int expected_length = min(RESCUE_ROLLOUT_LENGTH, remaining_groups);
+        bool generation_ok = rollout_scenarios.complete;
+        for (const auto &scenario : rollout_scenarios.arrivals) {
+            if ((int)scenario.size() != expected_length) {
+                generation_ok = false;
+                break;
+            }
+        }
+        if (!generation_ok) {
+            diagnostics.rollout_generation_failures++;
+            if (no_region_pushout) {
+                // Reject-to-Accept is a larger intervention.  Without the
+                // common-random-number comparison, retain Reject.
+                diagnostics.pushout_rollout_generation_failures++;
+                diagnostics.pushout_screen_rejected++;
+                if (candidates.size() == 1 && candidates.front().helper_id != -1) {
+                    diagnostics.pushout_helper_screen_rejected++;
+                }
+                return false;
+            }
+            // Scenario construction is only a filter for the existing
+            // Accepted rescue.  Preserve its legal positive-direct action.
+            stop_after_primary = true;
+            return true;
+        }
+        rollout_ready = true;
+        return true;
+    };
+
+    for (int target_index = 0; target_index < (int)targets.size(); target_index++) {
+        const RescueTarget &target = targets[target_index];
+        if (attempted_targets == target_repair_limit || remaining_nodes == 0 ||
             (int)candidates.size() == RESCUE_ROLLOUT_CANDIDATE_LIMIT) {
             break;
         }
@@ -2552,18 +4433,57 @@ optional<RootActionResult> choose_root_action_with_rescue(
             continue;
         }
 
+        optional<PushOutHelperSurvey> helper_survey;
+        if constexpr (ENABLE_PUSHOUT_HELPER) {
+            if (no_region_pushout &&
+                (int)target.blockers.size() <= PUSHOUT_HELPER_MAX_BLOCKERS) {
+                helper_survey.emplace(groups.size(), base_owner);
+                diagnostics.pushout_helper_surveyed_targets++;
+                if (!helper_surveyed_turn) {
+                    helper_surveyed_turn = true;
+                    diagnostics.pushout_helper_surveyed_turns++;
+                }
+            } else if (no_region_pushout) {
+                diagnostics.pushout_helper_large_blocker_targets++;
+            }
+        }
         vector<vector<RescueDestination>> pools;
         pools.reserve(target.blockers.size());
         bool missing_destination = false;
         for (int id : target.blockers) {
             vector<RescueDestination> pool = make_rescue_destinations(
-                park, base_owner, groups, id, arrival_id, current_s, theta, *baseline.cells, cleared_mask,
-                all_shapes, remaining_destination_anchors, diagnostics);
+                park, base_owner, groups, id, arrival_id, current_s, theta,
+                preferred_destination_cells, cleared_mask,
+                all_shapes, remaining_destination_anchors, destination_anchor_limit,
+                destination_legal_limit, destination_limit, diagnostics,
+                helper_survey ? &*helper_survey : nullptr);
             if (pool.empty()) {
                 missing_destination = true;
                 break;
             }
             pools.push_back(std::move(pool));
+        }
+        if constexpr (ENABLE_PUSHOUT_HELPER) {
+            if (helper_survey) {
+                int evidenced_groups = 0;
+                vector<PushOutHelperChoice> helpers = choose_pushout_helpers(
+                    *helper_survey, target, groups, arrival_id, r_milli,
+                    direct_gain_threshold,
+                    PUSHOUT_HELPER_CHOICE_LIMIT_PER_TARGET,
+                    evidenced_groups);
+                diagnostics.pushout_helper_evidenced_groups += evidenced_groups;
+                helper_raw_evidence |= evidenced_groups > 0;
+                diagnostics.pushout_helper_shortlisted_choices += helpers.size();
+                for (PushOutHelperChoice &helper : helpers) {
+                    ll adjusted_direct_gain =
+                        target.immediate_improvement - helper.movement_cost;
+                    helper_seeds.push_back({
+                        target_index,
+                        std::move(helper),
+                        adjusted_direct_gain,
+                    });
+                }
+            }
         }
         if (missing_destination) continue;
 
@@ -2587,62 +4507,398 @@ optional<RootActionResult> choose_root_action_with_rescue(
         if (!validate_and_build_rescue_owner(plan, park, owner, groups, arrival_id, r_milli, final_owner,
                                              fee_loss, checked_movement_cost) ||
             fee_loss != 0 || checked_movement_cost != target.movement_cost ||
-            plan.immediate_gain - baseline.fee <= 0) {
+            plan.immediate_gain - baseline_score <= 0) {
             diagnostics.validation_failures++;
             continue;
         }
 
-        ll direct_gain = plan.immediate_gain - baseline.fee;
+        ll direct_gain = plan.immediate_gain - baseline_score;
         int blocker_bucket = min((int)target.blockers.size(), 4) - 1;
         diagnostics.feasible_plans++;
         diagnostics.feasible_by_blocker_count[blocker_bucket]++;
         diagnostics.feasible_direct_gain += direct_gain;
-        candidates.push_back({std::move(plan), std::move(final_owner), target.blockers, compact_fee,
-                              direct_gain, target.movement_cost});
+        if (no_region_pushout) {
+            diagnostics.pushout_feasible_by_blocker_count[blocker_bucket]++;
+            chmax(diagnostics.pushout_maximum_blockers, (int)target.blockers.size());
+        }
+        candidates.push_back({std::move(plan), std::move(final_owner), target.blockers,
+                              target.blockers, -1, compact_fee, direct_gain,
+                              target.movement_cost});
 
         if (candidates.size() == 1) {
-            diagnostics.feasible_turns++;
-            if (remaining_groups == 0) {
-                diagnostics.rollout_skipped_no_future++;
-                stop_after_primary = true;
-                break;
-            }
+            if (!initialize_rollout_for_first_candidate()) return nullopt;
+            if (stop_after_primary) break;
+        }
+    }
 
-            rollout_scenarios = make_rescue_rollout_scenarios(
-                groups, arrival_id, current_s, remaining_groups, theta, theta_estimator);
-            int expected_length = min(RESCUE_ROLLOUT_LENGTH, remaining_groups);
-            bool generation_ok = rollout_scenarios.complete;
-            for (const auto &scenario : rollout_scenarios.arrivals) {
-                if ((int)scenario.size() != expected_length) {
-                    generation_ok = false;
-                    break;
+    // Preserve the blockers-only path as the protected first phase.  The
+    // helper is tried only when that phase produced no complete plan, so it
+    // can rescue a missing action but cannot displace an existing candidate.
+    if constexpr (ENABLE_PUSHOUT_HELPER) {
+        if (no_region_pushout && candidates.empty() && !stop_after_primary) {
+            diagnostics.pushout_helper_considered_turns++;
+            if (!helper_surveyed_turn) {
+                diagnostics.pushout_helper_no_eligible_target_turns++;
+            } else if (helper_seeds.empty()) {
+                if (helper_raw_evidence) {
+                    diagnostics.pushout_helper_economic_rejected_turns++;
+                } else {
+                    diagnostics.pushout_helper_no_evidence_turns++;
                 }
+            } else {
+                diagnostics.pushout_helper_seeded_turns++;
+                sort(helper_seeds.begin(), helper_seeds.end(),
+                     [](const PushOutHelperSeed &lhs, const PushOutHelperSeed &rhs) {
+                         if (lhs.adjusted_direct_gain != rhs.adjusted_direct_gain) {
+                             return lhs.adjusted_direct_gain > rhs.adjusted_direct_gain;
+                         }
+                         if (lhs.helper.covered_blockers != rhs.helper.covered_blockers) {
+                             return lhs.helper.covered_blockers > rhs.helper.covered_blockers;
+                         }
+                         if (lhs.helper.unlocked_regions != rhs.helper.unlocked_regions) {
+                             return lhs.helper.unlocked_regions > rhs.helper.unlocked_regions;
+                         }
+                         if (lhs.target_index != rhs.target_index) {
+                             return lhs.target_index < rhs.target_index;
+                         }
+                         return lhs.helper.id < rhs.helper.id;
+                     });
+
+                PushOutHelperPhaseScope helper_scope(diagnostics);
+                int helper_remaining_nodes = PUSHOUT_HELPER_REPAIR_NODE_LIMIT;
+                int helper_remaining_destination_anchors =
+                    PUSHOUT_HELPER_DESTINATION_ANCHOR_GLOBAL_LIMIT;
+                int helper_attempts = 0;
+                for (const PushOutHelperSeed &seed : helper_seeds) {
+                    if (helper_attempts == PUSHOUT_HELPER_REPAIR_LIMIT ||
+                        helper_remaining_nodes == 0 ||
+                        helper_remaining_destination_anchors == 0 ||
+                        (int)candidates.size() == PUSHOUT_HELPER_FEASIBLE_LIMIT ||
+                        stop_after_primary) {
+                        break;
+                    }
+                    helper_attempts++;
+                    diagnostics.repair_attempts++;
+                    diagnostics.pushout_helper_attempts++;
+                    if (seed.target_index < 0 ||
+                        seed.target_index >= (int)targets.size() ||
+                        seed.helper.id < 0 || seed.helper.id >= (int)groups.size()) {
+                        diagnostics.validation_failures++;
+                        diagnostics.pushout_helper_validation_failures++;
+                        continue;
+                    }
+                    const RescueTarget &target = targets[seed.target_index];
+                    if (target.blockers.empty() ||
+                        (int)target.blockers.size() > PUSHOUT_HELPER_MAX_BLOCKERS) {
+                        diagnostics.validation_failures++;
+                        diagnostics.pushout_helper_validation_failures++;
+                        continue;
+                    }
+
+                    vector<int> movers = target.blockers;
+                    movers.push_back(seed.helper.id);
+                    sort(movers.begin(), movers.end());
+                    bool valid_movers =
+                        adjacent_find(movers.begin(), movers.end()) == movers.end() &&
+                        seed.helper.id != arrival_id && groups[seed.helper.id].active;
+                    if (!valid_movers) {
+                        diagnostics.validation_failures++;
+                        diagnostics.pushout_helper_validation_failures++;
+                        continue;
+                    }
+                    chmax(diagnostics.pushout_helper_maximum_movers,
+                          (int)movers.size());
+                    diagnostics.pushout_helper_selected_covered_blockers +=
+                        seed.helper.covered_blockers;
+                    diagnostics.pushout_helper_selected_unlocked_regions +=
+                        seed.helper.unlocked_regions;
+                    diagnostics.pushout_helper_selected_overlap_cells +=
+                        seed.helper.overlap_cells;
+                    diagnostics.pushout_helper_selected_movement_cost +=
+                        seed.helper.movement_cost;
+                    diagnostics.pushout_helper_selected_departure_distance +=
+                        seed.helper.departure_distance;
+                    diagnostics.pushout_helper_selected_adjusted_gain +=
+                        seed.adjusted_direct_gain;
+
+                    ll full_movement_cost = 0;
+                    for (int id : movers) full_movement_cost += move_cost(groups[id].v, r_milli);
+                    ll compact_fee = round_payment(arrival.v, arrival.p, target.perimeter);
+                    ll direct_gain = compact_fee - full_movement_cost - baseline_score;
+                    if ((long double)direct_gain <= direct_gain_threshold) {
+                        // The same strict economic gate was already used by
+                        // the shortlist.  Rechecking the exact mover set makes
+                        // any future refactor fail closed.
+                        diagnostics.validation_failures++;
+                        diagnostics.pushout_helper_validation_failures++;
+                        continue;
+                    }
+
+                    vvi base_owner = owner;
+                    vector<char> cleared_mask(park.size() * park.size(), false);
+                    for (int id : movers) {
+                        for (auto [x, y] : groups[id].cells) {
+                            cleared_mask[x * park.size() + y] = true;
+                        }
+                        clear_cells(base_owner, groups[id].cells);
+                    }
+                    bool target_legal = true;
+                    for (auto [x, y] : target.cells) {
+                        if (park[x][y] != '.' || base_owner[x][y] != -1) {
+                            target_legal = false;
+                            break;
+                        }
+                        base_owner[x][y] = arrival_id;
+                    }
+                    if (!target_legal) {
+                        diagnostics.validation_failures++;
+                        diagnostics.pushout_helper_validation_failures++;
+                        continue;
+                    }
+
+                    vector<char> preferred_mask;
+                    if constexpr (ENABLE_WIDE_PUSHOUT_HELPER) {
+                        preferred_mask.assign(park.size() * park.size(), false);
+                        for (auto [x, y] : preferred_destination_cells) {
+                            preferred_mask[x * park.size() + y] = true;
+                        }
+                    }
+                    auto force_causal_witness =
+                        [&](int mover_id, vector<RescueDestination> &pool) {
+                            if constexpr (!ENABLE_WIDE_PUSHOUT_HELPER) return;
+                            if (!binary_search(target.blockers.begin(),
+                                               target.blockers.end(), mover_id)) {
+                                return;
+                            }
+                            auto witness_it = find_if(
+                                seed.helper.witnesses.begin(),
+                                seed.helper.witnesses.end(),
+                                [&](const PushOutHelperWitness &witness) {
+                                    return witness.blocker_id == mover_id;
+                                });
+                            if (witness_it == seed.helper.witnesses.end()) return;
+                            const PushOutHelperWitness &witness = *witness_it;
+                            if ((int)witness.cells.size() != groups[mover_id].p ||
+                                same_region(witness.cells, groups[mover_id].cells)) {
+                                return;
+                            }
+                            for (auto [x, y] : witness.cells) {
+                                if (park[x][y] != '.' || base_owner[x][y] != -1) {
+                                    return;
+                                }
+                            }
+                            ll old_fee = round_payment(
+                                groups[mover_id].v, groups[mover_id].p,
+                                groups[mover_id].max_perimeter);
+                            ll new_fee = round_payment(
+                                groups[mover_id].v, groups[mover_id].p,
+                                max(groups[mover_id].max_perimeter,
+                                    witness.perimeter));
+                            if (old_fee != new_fee) return;
+                            for (int index = 0; index < (int)pool.size(); index++) {
+                                if (!same_region(pool[index].cells, witness.cells)) continue;
+                                rotate(pool.begin(), pool.begin() + index,
+                                       pool.begin() + index + 1);
+                                diagnostics.pushout_helper_forced_witness_destinations++;
+                                return;
+                            }
+
+                            vector<char> own_old(park.size() * park.size(), false);
+                            for (auto [x, y] : groups[mover_id].cells) {
+                                own_old[x * park.size() + y] = true;
+                            }
+                            int fallback_overlap = 0;
+                            int cleared_overlap = 0;
+                            int foreign_cleared_overlap = 0;
+                            int min_x = park.size(), min_y = park.size();
+                            int max_x = -1, max_y = -1;
+                            for (auto [x, y] : witness.cells) {
+                                int cell = x * park.size() + y;
+                                fallback_overlap += preferred_mask[cell];
+                                cleared_overlap += cleared_mask[cell];
+                                foreign_cleared_overlap +=
+                                    cleared_mask[cell] && !own_old[cell];
+                                chmin(min_x, x);
+                                chmin(min_y, y);
+                                chmax(max_x, x);
+                                chmax(max_y, y);
+                            }
+                            int height = max_x - min_x + 1;
+                            int width = max_y - min_y + 1;
+                            int lower_half = 2 * min_x + height >= (int)park.size();
+                            int right_half = 2 * min_y + width >= (int)park.size();
+                            int sector_x = min(
+                                2, 3 * (2 * min_x + height) /
+                                       (2 * (int)park.size()));
+                            int sector_y = min(
+                                2, 3 * (2 * min_y + width) /
+                                       (2 * (int)park.size()));
+                            BoardMask mask = make_board_mask(witness.cells, park.size());
+                            long double temporal_cost =
+                                rescue_destination_temporal_cost(
+                                    witness.cells, mask, park, base_owner, groups,
+                                    mover_id, arrival_id, current_s, theta);
+                            RescueDestination destination{
+                                witness.cells,
+                                mask,
+                                witness.perimeter,
+                                fallback_overlap,
+                                cleared_overlap,
+                                foreign_cleared_overlap,
+                                2 * lower_half + right_half,
+                                3 * sector_x + sector_y,
+                                temporal_cost,
+                                -1,
+                            };
+                            pool.insert(pool.begin(), std::move(destination));
+                            if ((int)pool.size() > PUSHOUT_HELPER_DESTINATION_LIMIT) {
+                                pool.pop_back();
+                            }
+                            diagnostics.destination_candidates++;
+                            diagnostics.pushout_helper_forced_witness_destinations++;
+                            diagnostics.pushout_helper_foreign_destination_candidates +=
+                                foreign_cleared_overlap > 0;
+                            diagnostics.pushout_helper_retained_foreign_destinations +=
+                                foreign_cleared_overlap > 0;
+                        };
+
+                    vector<vector<RescueDestination>> pools;
+                    pools.reserve(movers.size());
+                    bool missing_destination = false;
+                    for (int id : movers) {
+                        vector<RescueDestination> pool = make_rescue_destinations(
+                            park, base_owner, groups, id, arrival_id, current_s, theta,
+                            preferred_destination_cells, cleared_mask, all_shapes,
+                            helper_remaining_destination_anchors,
+                            PUSHOUT_HELPER_DESTINATION_ANCHOR_LIMIT,
+                            PUSHOUT_HELPER_DESTINATION_LEGAL_LIMIT,
+                            PUSHOUT_HELPER_DESTINATION_LIMIT, diagnostics,
+                            nullptr, ENABLE_WIDE_PUSHOUT_HELPER);
+                        force_causal_witness(id, pool);
+                        if (pool.empty()) {
+                            missing_destination = true;
+                            if (id == seed.helper.id) {
+                                diagnostics.pushout_helper_missing_helper_destination++;
+                            } else {
+                                diagnostics.pushout_helper_missing_blocker_destination++;
+                            }
+                            break;
+                        }
+                        pools.push_back(std::move(pool));
+                    }
+                    if (missing_destination) {
+                        diagnostics.pushout_helper_missing_destination++;
+                        continue;
+                    }
+
+                    optional<vector<int>> choices = repair_rescue_blockers(
+                        base_owner, groups, movers, pools, helper_remaining_nodes,
+                        diagnostics);
+                    if (!choices) {
+                        diagnostics.pushout_helper_repair_failures++;
+                        continue;
+                    }
+
+                    TurnPlan plan;
+                    for (int index = 0; index < (int)movers.size(); index++) {
+                        const RescueDestination &destination =
+                            pools[index][(*choices)[index]];
+                        plan.moves.push_back(
+                            {movers[index], destination.cells, destination.perimeter});
+                    }
+                    plan.arrival = target.cells;
+                    plan.arrival_perimeter = target.perimeter;
+                    plan.immediate_gain = compact_fee - full_movement_cost;
+
+                    vvi final_owner;
+                    ll fee_loss = 0;
+                    ll checked_movement_cost = 0;
+                    if (!validate_and_build_rescue_owner(
+                            plan, park, owner, groups, arrival_id, r_milli,
+                            final_owner, fee_loss, checked_movement_cost) ||
+                        fee_loss != 0 || checked_movement_cost != full_movement_cost ||
+                        plan.immediate_gain - baseline_score != direct_gain ||
+                        (long double)direct_gain <= direct_gain_threshold) {
+                        diagnostics.validation_failures++;
+                        diagnostics.pushout_helper_validation_failures++;
+                        continue;
+                    }
+
+                    bool duplicate = false;
+                    for (const PreparedRescueCandidate &candidate : candidates) {
+                        if (candidate.final_owner == final_owner) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (duplicate) {
+                        diagnostics.pushout_helper_duplicate_plans++;
+                        continue;
+                    }
+
+                    int blocker_bucket = min((int)target.blockers.size(), 4) - 1;
+                    auto [blocker_uses_helper, helper_uses_blocker] =
+                        classify_pushout_helper_exchange(
+                            plan, groups, target.blockers, seed.helper.id,
+                            park.size());
+                    diagnostics.feasible_plans++;
+                    diagnostics.feasible_by_blocker_count[blocker_bucket]++;
+                    diagnostics.feasible_direct_gain += direct_gain;
+                    diagnostics.pushout_feasible_by_blocker_count[blocker_bucket]++;
+                    chmax(diagnostics.pushout_maximum_blockers,
+                          (int)target.blockers.size());
+                    diagnostics.pushout_helper_feasible_plans++;
+                    diagnostics.pushout_helper_feasible_by_blocker_count[
+                        target.blockers.size() - 1]++;
+                    diagnostics.pushout_helper_feasible_blocker_uses_helper +=
+                        blocker_uses_helper;
+                    diagnostics.pushout_helper_feasible_helper_uses_blocker +=
+                        helper_uses_blocker;
+                    diagnostics.pushout_helper_feasible_bidirectional_cross_use +=
+                        blocker_uses_helper && helper_uses_blocker;
+                    candidates.push_back({
+                        std::move(plan), std::move(final_owner), target.blockers,
+                        std::move(movers), seed.helper.id, compact_fee, direct_gain,
+                        full_movement_cost, blocker_uses_helper,
+                        helper_uses_blocker,
+                    });
+
+                    if (candidates.size() == 1 &&
+                        !initialize_rollout_for_first_candidate()) {
+                        return nullopt;
+                    }
+                }
+                if ((int)candidates.size() == PUSHOUT_HELPER_FEASIBLE_LIMIT &&
+                    helper_attempts < (int)helper_seeds.size()) {
+                    diagnostics.pushout_helper_feasible_limit_exhausted++;
+                }
+                diagnostics.pushout_helper_two_feasible_turns +=
+                    candidates.size() >= 2;
+                if (helper_remaining_nodes == 0) diagnostics.node_limit_exhausted++;
             }
-            if (!generation_ok) {
-                // Scenario construction is only a filter.  Preserve the legal,
-                // positive-immediate v1 action if that filter cannot be built.
-                diagnostics.rollout_generation_failures++;
-                stop_after_primary = true;
-                break;
-            }
-            rollout_ready = true;
         }
     }
 
     if (candidates.empty()) {
-        if (attempted_targets == RESCUE_TARGET_REPAIR_LIMIT && (int)targets.size() > attempted_targets) {
+        if (attempted_targets == target_repair_limit && (int)targets.size() > attempted_targets) {
             diagnostics.target_limit_exhausted++;
         }
         if (remaining_nodes == 0) diagnostics.node_limit_exhausted++;
         diagnostics.no_repair++;
+        if (no_region_pushout) diagnostics.pushout_no_repair++;
         return nullopt;
     }
     if (!stop_after_primary && (int)candidates.size() < RESCUE_ROLLOUT_CANDIDATE_LIMIT &&
-        attempted_targets == RESCUE_TARGET_REPAIR_LIMIT && (int)targets.size() > attempted_targets) {
+        attempted_targets == target_repair_limit && (int)targets.size() > attempted_targets) {
         diagnostics.target_limit_exhausted++;
     }
     if (remaining_nodes == 0) diagnostics.node_limit_exhausted++;
 
+    int helper_candidate_count = count_if(
+        candidates.begin(), candidates.end(),
+        [](const PreparedRescueCandidate &candidate) {
+            return candidate.helper_id != -1;
+        });
     RootActionKind selected_kind = RootActionKind::Rescue;
     int selected_candidate = 0;
     int selected_alternative = -1;
@@ -2652,9 +4908,11 @@ optional<RootActionResult> choose_root_action_with_rescue(
         diagnostics.rollout_candidates_compared += candidates.size();
         vector<int> available_alternatives;
         if constexpr (!ROOT_PROTECTED_ONLY) {
-            for (int index = 0; index < (int)normal_alternatives.size(); index++) {
-                if (!same_region(normal_alternatives[index].cells, *baseline.cells)) {
-                    available_alternatives.push_back(index);
+            if (mode == RescueMode::CompactAccepted) {
+                for (int index = 0; index < (int)normal_alternatives.size(); index++) {
+                    if (!same_region(normal_alternatives[index].cells, *baseline.cells)) {
+                        available_alternatives.push_back(index);
+                    }
                 }
             }
         }
@@ -2676,13 +4934,14 @@ optional<RootActionResult> choose_root_action_with_rescue(
         }
 
         vvi baseline_final_owner = owner;
-        place_cells(baseline_final_owner, *baseline.cells, arrival_id);
+        if (baseline.cells) place_cells(baseline_final_owner, *baseline.cells, arrival_id);
         TurnPlan baseline_plan = make_arrival_plan(baseline);
         array<RescueRolloutOutcome, RESCUE_ROLLOUT_SCENARIO_COUNT> baseline_outcomes;
         for (int scenario = 0; scenario < RESCUE_ROLLOUT_SCENARIO_COUNT; scenario++) {
             baseline_outcomes[scenario] = evaluate_rescue_rollout_branch(
                 park, baseline_final_owner, groups, arrival_id, baseline_plan,
-                rollout_scenarios.arrivals[scenario], grass_cells, density_model, compact_shapes);
+                rollout_scenarios.arrivals[scenario], grass_cells, density_model,
+                sampled_dlp_model, compact_shapes);
             diagnostics.rollout_policy_steps += rollout_scenarios.arrivals[scenario].size();
             diagnostics.rollout_baseline_acceptances += baseline_outcomes[scenario].acceptances;
         }
@@ -2698,7 +4957,8 @@ optional<RootActionResult> choose_root_action_with_rescue(
             for (int scenario = 0; scenario < RESCUE_ROLLOUT_SCENARIO_COUNT; scenario++) {
                 RescueRolloutOutcome rescue_outcome = evaluate_rescue_rollout_branch(
                     park, candidate.final_owner, groups, arrival_id, candidate.plan,
-                    rollout_scenarios.arrivals[scenario], grass_cells, density_model, compact_shapes);
+                    rollout_scenarios.arrivals[scenario], grass_cells, density_model,
+                    sampled_dlp_model, compact_shapes);
                 diagnostics.rollout_policy_steps += rollout_scenarios.arrivals[scenario].size();
                 diagnostics.rollout_rescue_acceptances += rescue_outcome.acceptances;
                 evaluation.future_delta[scenario] = rescue_outcome.fee - baseline_outcomes[scenario].fee;
@@ -2739,9 +4999,21 @@ optional<RootActionResult> choose_root_action_with_rescue(
         long double future_mean =
             0.5L * (best_evaluation.future_delta[0] + best_evaluation.future_delta[1]);
         long double rollout_margin = 0.5L * best_evaluation.margin_twice;
+        if (best_candidate.helper_id != -1) {
+            diagnostics.pushout_helper_scenario_0_future_delta +=
+                best_evaluation.future_delta[0];
+            diagnostics.pushout_helper_scenario_1_future_delta +=
+                best_evaluation.future_delta[1];
+            diagnostics.pushout_helper_screen_margin += rollout_margin;
+        }
         bool first_accepts = best_candidate.direct_gain + best_evaluation.future_delta[0] > 0;
         bool second_accepts = best_candidate.direct_gain + best_evaluation.future_delta[1] > 0;
         if (first_accepts != second_accepts) diagnostics.rollout_scenario_disagreements++;
+        if (no_region_pushout) {
+            diagnostics.pushout_scenario_0_future_delta += best_evaluation.future_delta[0];
+            diagnostics.pushout_scenario_1_future_delta += best_evaluation.future_delta[1];
+            diagnostics.pushout_screen_margin += rollout_margin;
+        }
 
         if (candidates.size() == 2) {
             ll width_one_margin = max(0LL, evaluations[0].margin_twice);
@@ -2788,7 +5060,8 @@ optional<RootActionResult> choose_root_action_with_rescue(
                 for (int scenario = 0; scenario < RESCUE_ROLLOUT_SCENARIO_COUNT; scenario++) {
                     RescueRolloutOutcome alternative_outcome = evaluate_rescue_rollout_branch(
                         park, alternative_owner, groups, arrival_id, alternative_plan,
-                        rollout_scenarios.arrivals[scenario], grass_cells, density_model, compact_shapes);
+                        rollout_scenarios.arrivals[scenario], grass_cells, density_model,
+                        sampled_dlp_model, compact_shapes);
                     diagnostics.rollout_policy_steps += rollout_scenarios.arrivals[scenario].size();
                     diagnostics.root_alternative_acceptances += alternative_outcome.acceptances;
                     alternative_evaluation.future_delta[scenario] =
@@ -2845,8 +5118,8 @@ optional<RootActionResult> choose_root_action_with_rescue(
                     alternative_decisions[selected_alternative].fee - baseline.fee};
                 bool confirmed = confirm_root_override(
                     park, groups, arrival_id, current_s, remaining_groups, theta, theta_estimator,
-                    grass_cells, density_model, compact_shapes, protected_branch, challenger_branch,
-                    confirmations_used, diagnostics);
+                    grass_cells, density_model, sampled_dlp_model, compact_shapes,
+                    protected_branch, challenger_branch, confirmations_used, diagnostics);
                 if (!confirmed) {
                     selected_kind = protected_kind;
                     selected_candidate = protected_candidate;
@@ -2871,9 +5144,15 @@ optional<RootActionResult> choose_root_action_with_rescue(
             diagnostics.rollout_not_selected_margin += rollout_margin;
             if (selected_kind == RootActionKind::Baseline) {
                 diagnostics.root_selected_primary++;
+                if (no_region_pushout) {
+                    diagnostics.pushout_screen_rejected++;
+                    diagnostics.pushout_helper_screen_rejected +=
+                        helper_candidate_count;
+                }
                 return nullopt;
             }
             assert(selected_kind == RootActionKind::NormalAlternative);
+            diagnostics.pushout_helper_screen_rejected += helper_candidate_count;
             diagnostics.root_selected_alternative++;
             diagnostics.root_selected_alternative_rank[selected_alternative]++;
             return RootActionResult{std::move(alternative_plans[selected_alternative]),
@@ -2890,28 +5169,63 @@ optional<RootActionResult> choose_root_action_with_rescue(
         diagnostics.rollout_adopted_margin += rollout_margin;
     }
 
+    if (no_region_pushout) {
+        diagnostics.pushout_helper_screen_rejected +=
+            helper_candidate_count -
+            (candidates[selected_candidate].helper_id != -1);
+    }
     PreparedRescueCandidate &chosen = candidates[selected_candidate];
     int blocker_bucket = min((int)chosen.blockers.size(), 4) - 1;
     ArrivalDecision selected = baseline;
+    selected.status = ArrivalStatus::Accepted;
     selected.cells = *chosen.plan.arrival;
     selected.perimeter = chosen.plan.arrival_perimeter;
     selected.fee = chosen.compact_fee;
-    // The counterfactual used connected growth, but the selected arrival is
-    // now a minimum-perimeter template.  Keep diagnostics factual.
+    // Whether the protected action was connected growth or Reject, the
+    // selected arrival is now a minimum-perimeter template.
     replace_selected_placement_success(selected.diagnostics, PlacementSource::MinimumTemplate);
     diagnostics.successes++;
     diagnostics.successes_by_blocker_count[blocker_bucket]++;
-    diagnostics.moved_groups += chosen.blockers.size();
-    diagnostics.arrival_fee_gain += chosen.compact_fee - baseline.fee;
+    diagnostics.moved_groups += chosen.movers.size();
+    diagnostics.arrival_fee_gain += chosen.compact_fee - baseline_score;
     diagnostics.movement_cost += chosen.movement_cost;
     diagnostics.immediate_gain += chosen.direct_gain;
+    if (no_region_pushout) {
+        diagnostics.pushout_adopted++;
+        diagnostics.pushout_adopted_by_blocker_count[blocker_bucket]++;
+        diagnostics.pushout_moved_groups += chosen.movers.size();
+        for (int id : chosen.movers) diagnostics.pushout_moved_cells += groups[id].p;
+        diagnostics.pushout_arrival_fee += chosen.compact_fee;
+        diagnostics.pushout_movement_cost += chosen.movement_cost;
+        diagnostics.pushout_direct_gain += chosen.direct_gain;
+        if (chosen.helper_id != -1) {
+            diagnostics.pushout_helper_adopted++;
+            diagnostics.pushout_helper_adopted_by_blocker_count[
+                chosen.blockers.size() - 1]++;
+            diagnostics.pushout_helper_adopted_blocker_uses_helper +=
+                chosen.blocker_uses_helper_region;
+            diagnostics.pushout_helper_adopted_helper_uses_blocker +=
+                chosen.helper_uses_blocker_region;
+            diagnostics.pushout_helper_adopted_bidirectional_cross_use +=
+                chosen.blocker_uses_helper_region &&
+                chosen.helper_uses_blocker_region;
+            diagnostics.pushout_helper_adopted_moved_groups += chosen.movers.size();
+            for (int id : chosen.movers) {
+                diagnostics.pushout_helper_adopted_moved_cells += groups[id].p;
+            }
+            diagnostics.pushout_helper_adopted_arrival_fee += chosen.compact_fee;
+            diagnostics.pushout_helper_adopted_movement_cost += chosen.movement_cost;
+            diagnostics.pushout_helper_adopted_direct_gain += chosen.direct_gain;
+        }
+    }
     return RootActionResult{std::move(chosen.plan), std::move(selected)};
 }
 
 optional<RootActionResult> choose_normal_root_action(
     const vs &park, const vvi &owner, const vector<GroupState> &groups, int arrival_id,
     ll current_s, int remaining_groups, long double theta, const ThetaEstimator &theta_estimator,
-    const DensityModel &density_model, int grass_cells, const ArrivalDecision &baseline,
+    const DensityModel &density_model, SampledDlpShadowModel &sampled_dlp_model,
+    int grass_cells, const ArrivalDecision &baseline,
     const vector<NormalPlacementChoice> &normal_alternatives,
     const vector<vector<Shape>> &compact_shapes, int &confirmations_used,
     RescueDiagnostics &diagnostics) {
@@ -2960,7 +5274,8 @@ optional<RootActionResult> choose_normal_root_action(
     for (int scenario = 0; scenario < ROOT_SCREEN_SCENARIO_COUNT; scenario++) {
         baseline_outcomes[scenario] = evaluate_rescue_rollout_branch(
             park, baseline_owner, groups, arrival_id, baseline_plan,
-            scenarios.arrivals[scenario], grass_cells, density_model, compact_shapes);
+            scenarios.arrivals[scenario], grass_cells, density_model,
+            sampled_dlp_model, compact_shapes);
         diagnostics.normal_root_policy_steps += scenarios.arrivals[scenario].size();
     }
 
@@ -2994,7 +5309,7 @@ optional<RootActionResult> choose_normal_root_action(
         for (int scenario = 0; scenario < ROOT_SCREEN_SCENARIO_COUNT; scenario++) {
             RescueRolloutOutcome outcome = evaluate_rescue_rollout_branch(
                 park, final_owner, groups, arrival_id, plan, scenarios.arrivals[scenario],
-                grass_cells, density_model, compact_shapes);
+                grass_cells, density_model, sampled_dlp_model, compact_shapes);
             diagnostics.normal_root_policy_steps += scenarios.arrivals[scenario].size();
             evaluation.future_delta[scenario] = outcome.fee - baseline_outcomes[scenario].fee;
         }
@@ -3029,8 +5344,8 @@ optional<RootActionResult> choose_normal_root_action(
         alternative_decisions[selected_alternative].fee - baseline.fee};
     bool confirmed = confirm_root_override(
         park, groups, arrival_id, current_s, remaining_groups, theta, theta_estimator,
-        grass_cells, density_model, compact_shapes, baseline_branch, challenger_branch,
-        confirmations_used, diagnostics);
+        grass_cells, density_model, sampled_dlp_model, compact_shapes,
+        baseline_branch, challenger_branch, confirmations_used, diagnostics);
     if (!confirmed) {
         diagnostics.normal_root_selected_primary++;
         return nullopt;
@@ -3040,6 +5355,1467 @@ optional<RootActionResult> choose_normal_root_action(
     diagnostics.normal_root_selected_alternative_rank[selected_alternative]++;
     return RootActionResult{std::move(alternative_plans[selected_alternative]),
                             std::move(alternative_decisions[selected_alternative])};
+}
+
+// ---------------------------------------------------------------------------
+// Deadline-layer canonical rebuilding
+// ---------------------------------------------------------------------------
+
+bool deadline_mask_has(const BoardMask &mask, int index) {
+    return (mask[index >> 6] >> (index & 63)) & 1ULL;
+}
+
+void deadline_mask_set(BoardMask &mask, int index) {
+    mask[index >> 6] |= 1ULL << (index & 63);
+}
+
+void deadline_mask_reset(BoardMask &mask, int index) {
+    mask[index >> 6] &= ~(1ULL << (index & 63));
+}
+
+int deadline_mask_count(const BoardMask &mask) {
+    int result = 0;
+    for (uint64_t word : mask) result += __builtin_popcountll(word);
+    return result;
+}
+
+bool deadline_mask_subset(const BoardMask &part, const BoardMask &whole) {
+    for (int word = 0; word < BOARD_MASK_WORDS; word++) {
+        if (part[word] & ~whole[word]) return false;
+    }
+    return true;
+}
+
+BoardMask deadline_mask_difference(const BoardMask &whole, const BoardMask &part) {
+    BoardMask result{};
+    for (int word = 0; word < BOARD_MASK_WORDS; word++) {
+        result[word] = whole[word] & ~part[word];
+    }
+    return result;
+}
+
+BoardMask deadline_mask_union(const BoardMask &lhs, const BoardMask &rhs) {
+    BoardMask result = lhs;
+    merge_mask(result, rhs);
+    return result;
+}
+
+uint64_t deadline_mask_hash(const BoardMask &mask) {
+    uint64_t result = 0x9e3779b97f4a7c15ULL;
+    for (uint64_t word : mask) {
+        word += 0x9e3779b97f4a7c15ULL;
+        word = (word ^ (word >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        word = (word ^ (word >> 27)) * 0x94d049bb133111ebULL;
+        word ^= word >> 31;
+        result ^= word + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+    }
+    return result;
+}
+
+vector<Cell> deadline_mask_cells(const BoardMask &mask, int n) {
+    vector<Cell> cells;
+    cells.reserve(deadline_mask_count(mask));
+    for (int index = 0; index < n * n; index++) {
+        if (deadline_mask_has(mask, index)) cells.emplace_back(index / n, index % n);
+    }
+    return cells;
+}
+
+struct DeadlineAtom {
+    bool is_free = false;
+    int group_id = -1;
+    vector<Cell> cells;
+    vector<int> adjacent;
+};
+
+struct DeadlineQuotientGraph {
+    int n = 0;
+    vector<DeadlineAtom> atoms;
+    vector<int> cell_atom;
+    vector<int> free_atoms;
+};
+
+optional<DeadlineQuotientGraph> build_deadline_quotient_graph(
+    const vs &park, const vvi &owner, const vector<GroupState> &groups) {
+    int n = park.size();
+    DeadlineQuotientGraph graph;
+    graph.n = n;
+    graph.cell_atom.assign(n * n, -1);
+    graph.atoms.reserve(n * n);
+
+    // Active groups are owner-closed atoms: selecting one always selects its
+    // complete old region, which is essential for simultaneous swaps/cycles.
+    for (int id = 0; id < (int)groups.size(); id++) {
+        if (!groups[id].active) continue;
+        int atom_id = graph.atoms.size();
+        DeadlineAtom atom;
+        atom.group_id = id;
+        atom.cells = groups[id].cells;
+        if ((int)atom.cells.size() != groups[id].p) return nullopt;
+        for (auto [x, y] : atom.cells) {
+            if (!inside(x, y, n, n) || park[x][y] != '.' || owner[x][y] != id) return nullopt;
+            int cell = x * n + y;
+            if (graph.cell_atom[cell] != -1) return nullopt;
+            graph.cell_atom[cell] = atom_id;
+        }
+        graph.atoms.push_back(std::move(atom));
+    }
+
+    constexpr int DX[4] = {-1, 1, 0, 0};
+    constexpr int DY[4] = {0, 0, -1, 1};
+    array<int, 2500> que{};
+    for (int start = 0; start < n * n; start++) {
+        int sx = start / n;
+        int sy = start % n;
+        if (park[sx][sy] != '.' || owner[sx][sy] != -1 || graph.cell_atom[start] != -1) continue;
+        int atom_id = graph.atoms.size();
+        graph.atoms.push_back(DeadlineAtom{});
+        DeadlineAtom &atom = graph.atoms.back();
+        atom.is_free = true;
+        graph.free_atoms.push_back(atom_id);
+        int head = 0;
+        int tail = 0;
+        que[tail++] = start;
+        graph.cell_atom[start] = atom_id;
+        while (head < tail) {
+            int cell = que[head++];
+            int x = cell / n;
+            int y = cell % n;
+            atom.cells.emplace_back(x, y);
+            for (int dir = 0; dir < 4; dir++) {
+                int nx = x + DX[dir];
+                int ny = y + DY[dir];
+                if (!inside(nx, ny, n, n)) continue;
+                int next = nx * n + ny;
+                if (park[nx][ny] != '.' || owner[nx][ny] != -1 || graph.cell_atom[next] != -1) continue;
+                graph.cell_atom[next] = atom_id;
+                que[tail++] = next;
+            }
+        }
+    }
+
+    vector<pair<int, int>> edges;
+    edges.reserve(2 * n * n);
+    for (int x = 0; x < n; x++) {
+        for (int y = 0; y < n; y++) {
+            if (park[x][y] != '.') continue;
+            int from = graph.cell_atom[x * n + y];
+            if (from < 0) return nullopt;
+            if (x + 1 < n && park[x + 1][y] == '.') {
+                int to = graph.cell_atom[(x + 1) * n + y];
+                if (from != to) edges.emplace_back(min(from, to), max(from, to));
+            }
+            if (y + 1 < n && park[x][y + 1] == '.') {
+                int to = graph.cell_atom[x * n + y + 1];
+                if (from != to) edges.emplace_back(min(from, to), max(from, to));
+            }
+        }
+    }
+    sort(edges.begin(), edges.end());
+    edges.erase(unique(edges.begin(), edges.end()), edges.end());
+    for (auto [from, to] : edges) {
+        graph.atoms[from].adjacent.push_back(to);
+        graph.atoms[to].adjacent.push_back(from);
+    }
+    return graph;
+}
+
+struct DeadlineClosureState {
+    BoardMask atoms{};
+    int free_area = 0;
+    int total_area = 0;
+    ll proxy_move_cost = 0;
+    bool expanded_after_feasible = false;
+    uint64_t order = 0;
+};
+
+struct DeadlineClosureOrder {
+    int required_free = 0;
+
+    bool operator()(const DeadlineClosureState &lhs, const DeadlineClosureState &rhs) const {
+        auto key = [&](const DeadlineClosureState &state) {
+            int deficit = max(0, required_free - state.free_area);
+            return tuple<int, ll, int, int, uint64_t>{
+                deficit, state.proxy_move_cost, state.total_area, -state.free_area, state.order};
+        };
+        return key(lhs) > key(rhs);
+    }
+};
+
+DeadlineClosureState make_deadline_seed_closure(const DeadlineQuotientGraph &graph, int free_atom,
+                                                uint64_t order) {
+    DeadlineClosureState state;
+    deadline_mask_set(state.atoms, free_atom);
+    state.free_area = graph.atoms[free_atom].cells.size();
+    state.total_area = state.free_area;
+    state.order = order;
+    return state;
+}
+
+DeadlineClosureState extend_deadline_closure(
+    const DeadlineClosureState &parent, int group_atom, const DeadlineQuotientGraph &graph,
+    const vector<GroupState> &groups, int r_milli, uint64_t order) {
+    DeadlineClosureState child = parent;
+    child.order = order;
+    child.expanded_after_feasible = parent.free_area > 0 && parent.expanded_after_feasible;
+    if (!deadline_mask_has(child.atoms, group_atom)) {
+        deadline_mask_set(child.atoms, group_atom);
+        const DeadlineAtom &atom = graph.atoms[group_atom];
+        child.total_area += atom.cells.size();
+        ll candidate_cost = move_cost(groups[atom.group_id].v, r_milli);
+        child.proxy_move_cost = child.proxy_move_cost == 0
+                                    ? candidate_cost
+                                    : min(child.proxy_move_cost, candidate_cost);
+    }
+    // FreeClose: once a group is selected, take every adjacent current free
+    // component.  This prevents a workspace from arbitrarily cutting away the
+    // free reservoir exposed around that group.
+    for (int next : graph.atoms[group_atom].adjacent) {
+        const DeadlineAtom &atom = graph.atoms[next];
+        if (!atom.is_free || deadline_mask_has(child.atoms, next)) continue;
+        deadline_mask_set(child.atoms, next);
+        child.free_area += atom.cells.size();
+        child.total_area += atom.cells.size();
+    }
+    return child;
+}
+
+vector<DeadlineClosureState> enumerate_deadline_closures(
+    const DeadlineQuotientGraph &graph, const vector<GroupState> &groups, int required_free,
+    int r_milli, int &turn_expansions, DeadlineLayerDiagnostics &diagnostics) {
+    priority_queue<DeadlineClosureState, vector<DeadlineClosureState>, DeadlineClosureOrder> queue(
+        DeadlineClosureOrder{required_free});
+    set<BoardMask> seen;
+    uint64_t order = 0;
+    for (int atom : graph.free_atoms) {
+        DeadlineClosureState state = make_deadline_seed_closure(graph, atom, order++);
+        if (seen.insert(state.atoms).second) queue.push(std::move(state));
+    }
+
+    vector<DeadlineClosureState> complete;
+    while (!queue.empty()) {
+        DeadlineClosureState state = queue.top();
+        queue.pop();
+        diagnostics.closure_states++;
+        bool feasible = state.free_area >= required_free;
+        if (feasible) {
+            complete.push_back(state);
+            diagnostics.completed_closures++;
+            if ((int)complete.size() >= 2 * DEADLINE_CLOSURE_KEEP_LIMIT || state.expanded_after_feasible) {
+                continue;
+            }
+        }
+
+        vector<int> frontier;
+        for (int atom = 0; atom < (int)graph.atoms.size(); atom++) {
+            if (!deadline_mask_has(state.atoms, atom)) continue;
+            for (int next : graph.atoms[atom].adjacent) {
+                if (deadline_mask_has(state.atoms, next) || graph.atoms[next].is_free) continue;
+                frontier.push_back(next);
+            }
+        }
+        sort(frontier.begin(), frontier.end(), [&](int lhs, int rhs) {
+            auto key = [&](int atom_id) {
+                int free_gain = 0;
+                for (int next : graph.atoms[atom_id].adjacent) {
+                    if (graph.atoms[next].is_free && !deadline_mask_has(state.atoms, next)) {
+                        free_gain += graph.atoms[next].cells.size();
+                    }
+                }
+                int deficit = max(0, required_free - state.free_area - free_gain);
+                ll cost = move_cost(groups[graph.atoms[atom_id].group_id].v, r_milli);
+                return tuple<int, ll, int, int>{deficit, cost, -free_gain, atom_id};
+            };
+            return key(lhs) < key(rhs);
+        });
+        frontier.erase(unique(frontier.begin(), frontier.end()), frontier.end());
+        if (feasible && (int)frontier.size() > 4) frontier.resize(4);
+        for (int group_atom : frontier) {
+            if (turn_expansions >= DEADLINE_CLOSURE_EXPANSION_TURN_LIMIT ||
+                diagnostics.closure_expansions >= DEADLINE_CLOSURE_EXPANSION_CASE_LIMIT) {
+                diagnostics.closure_limit_exhausted++;
+                break;
+            }
+            turn_expansions++;
+            diagnostics.closure_expansions++;
+            DeadlineClosureState child = extend_deadline_closure(
+                state, group_atom, graph, groups, r_milli, order++);
+            if (feasible) child.expanded_after_feasible = true;
+            if (seen.insert(child.atoms).second) queue.push(std::move(child));
+        }
+        if (turn_expansions >= DEADLINE_CLOSURE_EXPANSION_TURN_LIMIT ||
+            diagnostics.closure_expansions >= DEADLINE_CLOSURE_EXPANSION_CASE_LIMIT) {
+            break;
+        }
+    }
+
+    auto closure_key = [](const DeadlineClosureState &state) {
+        return tuple<ll, int, int, uint64_t>{
+            state.proxy_move_cost, state.total_area, -state.free_area, state.order};
+    };
+    sort(complete.begin(), complete.end(), [&](const DeadlineClosureState &lhs,
+                                               const DeadlineClosureState &rhs) {
+        return closure_key(lhs) < closure_key(rhs);
+    });
+    vector<DeadlineClosureState> retained;
+    for (const DeadlineClosureState &state : complete) {
+        if ((int)retained.size() == DEADLINE_CLOSURE_KEEP_LIMIT - 1) break;
+        retained.push_back(state);
+    }
+
+    // Also expose one true global candidate: every atom in one quotient-graph
+    // component.  It is admitted only when even one node per item fits the
+    // remaining deterministic layout budget; there is no group-count rule.
+    vector<char> graph_seen(graph.atoms.size(), false);
+    optional<DeadlineClosureState> global;
+    for (int seed : graph.free_atoms) {
+        if (graph_seen[seed]) continue;
+        DeadlineClosureState state;
+        vector<int> stack{seed};
+        graph_seen[seed] = true;
+        int item_count = 0;
+        while (!stack.empty()) {
+            int atom_id = stack.back();
+            stack.pop_back();
+            const DeadlineAtom &atom = graph.atoms[atom_id];
+            deadline_mask_set(state.atoms, atom_id);
+            state.total_area += atom.cells.size();
+            if (atom.is_free) {
+                state.free_area += atom.cells.size();
+            } else {
+                item_count++;
+                ll candidate_cost = move_cost(groups[atom.group_id].v, r_milli);
+                state.proxy_move_cost = state.proxy_move_cost == 0
+                                            ? candidate_cost
+                                            : min(state.proxy_move_cost, candidate_cost);
+            }
+            for (int next : atom.adjacent) {
+                if (graph_seen[next]) continue;
+                graph_seen[next] = true;
+                stack.push_back(next);
+            }
+        }
+        long long object_count = item_count + 1LL;
+        long long minimum_layout_work = object_count * (object_count + 1) / 2;
+        if (state.free_area < required_free ||
+            minimum_layout_work > DEADLINE_LAYOUT_NODE_WORKSPACE_LIMIT ||
+            minimum_layout_work > DEADLINE_LAYOUT_NODE_CASE_LIMIT - diagnostics.layout_nodes) {
+            continue;
+        }
+        state.order = order++;
+        if (!global || closure_key(state) < closure_key(*global)) global = std::move(state);
+    }
+    if (global) {
+        bool duplicate = false;
+        for (const auto &state : retained) duplicate |= state.atoms == global->atoms;
+        if (!duplicate) {
+            retained.insert(retained.begin(), std::move(*global));
+            diagnostics.global_closures++;
+        }
+    }
+    if ((int)retained.size() > DEADLINE_CLOSURE_KEEP_LIMIT) {
+        retained.resize(DEADLINE_CLOSURE_KEEP_LIMIT);
+    }
+    return retained;
+}
+
+struct DeadlineTurnWork {
+    int closure_expansions = 0;
+    int layout_nodes = 0;
+    int template_probes = 0;
+    int growth_steps = 0;
+    int complete_plans = 0;
+    long long connectivity_visits = 0;
+    int connectivity_calls = 0;
+};
+
+bool deadline_connectivity_budget_exhausted(const DeadlineTurnWork &work,
+                                            const DeadlineLayerDiagnostics &diagnostics) {
+    return work.connectivity_calls >= DEADLINE_CONNECTIVITY_CALL_TURN_LIMIT ||
+           diagnostics.connectivity_calls >= DEADLINE_CONNECTIVITY_CALL_CASE_LIMIT ||
+           work.connectivity_visits >= DEADLINE_CONNECTIVITY_VISIT_TURN_LIMIT ||
+           diagnostics.connectivity_visits >= DEADLINE_CONNECTIVITY_VISIT_CASE_LIMIT;
+}
+
+bool deadline_begin_connectivity_call(DeadlineTurnWork &work,
+                                      DeadlineLayerDiagnostics &diagnostics) {
+    if (deadline_connectivity_budget_exhausted(work, diagnostics)) {
+        diagnostics.connectivity_limit_exhausted++;
+        return false;
+    }
+    work.connectivity_calls++;
+    diagnostics.connectivity_calls++;
+    return true;
+}
+
+bool deadline_consume_connectivity_visit(DeadlineTurnWork &work,
+                                         DeadlineLayerDiagnostics &diagnostics) {
+    if (work.connectivity_visits >= DEADLINE_CONNECTIVITY_VISIT_TURN_LIMIT ||
+        diagnostics.connectivity_visits >= DEADLINE_CONNECTIVITY_VISIT_CASE_LIMIT) {
+        diagnostics.connectivity_limit_exhausted++;
+        return false;
+    }
+    work.connectivity_visits++;
+    diagnostics.connectivity_visits++;
+    return true;
+}
+
+bool deadline_mask_connected(const BoardMask &mask, int expected_count, int n,
+                             DeadlineTurnWork &work, DeadlineLayerDiagnostics &diagnostics) {
+    if (expected_count <= 0 || deadline_mask_count(mask) != expected_count) return false;
+    if (!deadline_begin_connectivity_call(work, diagnostics)) return false;
+    int first = -1;
+    for (int word = 0; word < BOARD_MASK_WORDS && first < 0; word++) {
+        if (mask[word]) first = 64 * word + __builtin_ctzll(mask[word]);
+    }
+    if (first < 0 || first >= n * n) return false;
+    array<int, 2500> que{};
+    array<unsigned char, 2500> visited{};
+    int head = 0;
+    int tail = 0;
+    que[tail++] = first;
+    visited[first] = true;
+    constexpr int DX[4] = {-1, 1, 0, 0};
+    constexpr int DY[4] = {0, 0, -1, 1};
+    while (head < tail) {
+        if (!deadline_consume_connectivity_visit(work, diagnostics)) return false;
+        int cell = que[head++];
+        int x = cell / n;
+        int y = cell % n;
+        for (int dir = 0; dir < 4; dir++) {
+            int nx = x + DX[dir];
+            int ny = y + DY[dir];
+            if (!inside(nx, ny, n, n)) continue;
+            int next = nx * n + ny;
+            if (visited[next] || !deadline_mask_has(mask, next)) continue;
+            visited[next] = true;
+            que[tail++] = next;
+        }
+    }
+    return tail == expected_count;
+}
+
+optional<vector<int>> deadline_mask_distances(const BoardMask &mask, int root, int n,
+                                              DeadlineTurnWork &work,
+                                              DeadlineLayerDiagnostics &diagnostics) {
+    if (!deadline_mask_has(mask, root)) return nullopt;
+    if (!deadline_begin_connectivity_call(work, diagnostics)) return nullopt;
+    vector<int> distance(n * n, -1);
+    array<int, 2500> que{};
+    int head = 0;
+    int tail = 0;
+    que[tail++] = root;
+    distance[root] = 0;
+    constexpr int DX[4] = {-1, 1, 0, 0};
+    constexpr int DY[4] = {0, 0, -1, 1};
+    while (head < tail) {
+        if (!deadline_consume_connectivity_visit(work, diagnostics)) return nullopt;
+        int cell = que[head++];
+        int x = cell / n;
+        int y = cell % n;
+        for (int dir = 0; dir < 4; dir++) {
+            int nx = x + DX[dir];
+            int ny = y + DY[dir];
+            if (!inside(nx, ny, n, n)) continue;
+            int next = nx * n + ny;
+            if (distance[next] != -1 || !deadline_mask_has(mask, next)) continue;
+            distance[next] = distance[cell] + 1;
+            que[tail++] = next;
+        }
+    }
+    return distance;
+}
+
+optional<vector<int>> deadline_boundary_clearance(const BoardMask &mask, int n,
+                                                  DeadlineTurnWork &work,
+                                                  DeadlineLayerDiagnostics &diagnostics) {
+    if (!deadline_begin_connectivity_call(work, diagnostics)) return nullopt;
+    vector<int> clearance(n * n, -1);
+    array<int, 2500> que{};
+    int head = 0;
+    int tail = 0;
+    constexpr int DX[4] = {-1, 1, 0, 0};
+    constexpr int DY[4] = {0, 0, -1, 1};
+    for (int cell = 0; cell < n * n; cell++) {
+        if (!deadline_mask_has(mask, cell)) continue;
+        int x = cell / n;
+        int y = cell % n;
+        bool boundary = false;
+        for (int dir = 0; dir < 4; dir++) {
+            int nx = x + DX[dir];
+            int ny = y + DY[dir];
+            if (!inside(nx, ny, n, n) || !deadline_mask_has(mask, nx * n + ny)) {
+                boundary = true;
+            }
+        }
+        if (boundary) {
+            clearance[cell] = 0;
+            que[tail++] = cell;
+        }
+    }
+    while (head < tail) {
+        if (!deadline_consume_connectivity_visit(work, diagnostics)) return nullopt;
+        int cell = que[head++];
+        int x = cell / n;
+        int y = cell % n;
+        for (int dir = 0; dir < 4; dir++) {
+            int nx = x + DX[dir];
+            int ny = y + DY[dir];
+            if (!inside(nx, ny, n, n)) continue;
+            int next = nx * n + ny;
+            if (!deadline_mask_has(mask, next) || clearance[next] != -1) continue;
+            clearance[next] = clearance[cell] + 1;
+            que[tail++] = next;
+        }
+    }
+    return clearance;
+}
+
+int deadline_mask_perimeter(const BoardMask &mask, int n) {
+    int perimeter = 0;
+    constexpr int DX[4] = {-1, 1, 0, 0};
+    constexpr int DY[4] = {0, 0, -1, 1};
+    for (int cell = 0; cell < n * n; cell++) {
+        if (!deadline_mask_has(mask, cell)) continue;
+        int x = cell / n;
+        int y = cell % n;
+        for (int dir = 0; dir < 4; dir++) {
+            int nx = x + DX[dir];
+            int ny = y + DY[dir];
+            if (!inside(nx, ny, n, n) || !deadline_mask_has(mask, nx * n + ny)) perimeter++;
+        }
+    }
+    return perimeter;
+}
+
+struct DeadlineWorkspace {
+    BoardMask mask{};
+    BoardMask current_free{};
+    vector<int> group_ids;
+    int area = 0;
+    int free_area = 0;
+};
+
+optional<DeadlineWorkspace> materialize_deadline_workspace(
+    const DeadlineClosureState &closure, const DeadlineQuotientGraph &graph, int arrival_p,
+    DeadlineTurnWork &work, DeadlineLayerDiagnostics &diagnostics) {
+    DeadlineWorkspace workspace;
+    for (int atom_id = 0; atom_id < (int)graph.atoms.size(); atom_id++) {
+        if (!deadline_mask_has(closure.atoms, atom_id)) continue;
+        const DeadlineAtom &atom = graph.atoms[atom_id];
+        for (auto [x, y] : atom.cells) {
+            int cell = x * graph.n + y;
+            deadline_mask_set(workspace.mask, cell);
+            if (atom.is_free) deadline_mask_set(workspace.current_free, cell);
+        }
+        workspace.area += atom.cells.size();
+        if (atom.is_free) {
+            workspace.free_area += atom.cells.size();
+        } else {
+            workspace.group_ids.push_back(atom.group_id);
+        }
+    }
+    sort(workspace.group_ids.begin(), workspace.group_ids.end());
+    if (workspace.free_area < arrival_p + 1 || workspace.area != deadline_mask_count(workspace.mask) ||
+        workspace.free_area != deadline_mask_count(workspace.current_free)) {
+        diagnostics.partition_errors++;
+        return nullopt;
+    }
+    if (!deadline_mask_connected(workspace.mask, workspace.area, graph.n, work, diagnostics)) {
+        return nullopt;
+    }
+    return workspace;
+}
+
+vector<int> make_deadline_core_roots(const DeadlineWorkspace &workspace, int n,
+                                     DeadlineTurnWork &work,
+                                     DeadlineLayerDiagnostics &diagnostics) {
+    vector<int> free_cells;
+    free_cells.reserve(workspace.free_area);
+    for (int cell = 0; cell < n * n; cell++) {
+        if (deadline_mask_has(workspace.current_free, cell)) free_cells.push_back(cell);
+    }
+    if (free_cells.empty()) return {};
+
+    vector<int> roots;
+    optional<vector<int>> clearance = deadline_boundary_clearance(
+        workspace.mask, n, work, diagnostics);
+    if (!clearance) return {};
+    int first_root = free_cells.front();
+    for (int cell : free_cells) {
+        if ((*clearance)[cell] > (*clearance)[first_root] ||
+            ((*clearance)[cell] == (*clearance)[first_root] && cell < first_root)) {
+            first_root = cell;
+        }
+    }
+    roots.push_back(first_root);
+    if (DEADLINE_CORE_ROOT_LIMIT == 1) return roots;
+
+    optional<vector<int>> second_distance = deadline_mask_distances(
+        workspace.mask, first_root, n, work, diagnostics);
+    if (!second_distance) return roots;
+    int second_root = first_root;
+    for (int cell : free_cells) {
+        if ((*second_distance)[cell] > (*second_distance)[second_root] ||
+            ((*second_distance)[cell] == (*second_distance)[second_root] && cell < second_root)) {
+            second_root = cell;
+        }
+    }
+    if (second_root != first_root) roots.push_back(second_root);
+    return roots;
+}
+
+struct DeadlineLayerItem {
+    bool is_arrival = false;
+    int id = -1;
+    ll t = 0;
+    ll v = 0;
+    int p = 0;
+    int old_max_perimeter = 0;
+    BoardMask old_region{};
+};
+
+vector<DeadlineLayerItem> make_deadline_layer_items(
+    const DeadlineWorkspace &workspace, const vector<GroupState> &groups, int arrival_id,
+    int n) {
+    vector<DeadlineLayerItem> items;
+    items.reserve(workspace.group_ids.size() + 1);
+    for (int id : workspace.group_ids) {
+        const GroupState &group = groups[id];
+        items.push_back({false, id, group.t, group.v, group.p, group.max_perimeter,
+                         make_board_mask(group.cells, n)});
+    }
+    const GroupState &arrival = groups[arrival_id];
+    items.push_back({true, arrival_id, arrival.t, arrival.v, arrival.p, 0, BoardMask{}});
+    sort(items.begin(), items.end(), [](const DeadlineLayerItem &lhs,
+                                       const DeadlineLayerItem &rhs) {
+        if (lhs.t != rhs.t) return lhs.t > rhs.t;
+        if (lhs.p != rhs.p) return lhs.p > rhs.p;
+        if (lhs.is_arrival != rhs.is_arrival) return lhs.is_arrival < rhs.is_arrival;
+        return lhs.id < rhs.id;
+    });
+    return items;
+}
+
+vector<int> deadline_boundary_seeds(const BoardMask &remaining, int root,
+                                    const vector<int> &distance, int n, int limit) {
+    struct RankedCell {
+        int distance;
+        int outside_edges;
+        int cell;
+    };
+    vector<RankedCell> ranked;
+    constexpr int DX[4] = {-1, 1, 0, 0};
+    constexpr int DY[4] = {0, 0, -1, 1};
+    for (int cell = 0; cell < n * n; cell++) {
+        if (cell == root || !deadline_mask_has(remaining, cell)) continue;
+        int x = cell / n;
+        int y = cell % n;
+        int outside_edges = 0;
+        for (int dir = 0; dir < 4; dir++) {
+            int nx = x + DX[dir];
+            int ny = y + DY[dir];
+            if (!inside(nx, ny, n, n) || !deadline_mask_has(remaining, nx * n + ny)) {
+                outside_edges++;
+            }
+        }
+        if (outside_edges > 0) ranked.push_back({distance[cell], outside_edges, cell});
+    }
+    sort(ranked.begin(), ranked.end(), [](const RankedCell &lhs, const RankedCell &rhs) {
+        if (lhs.distance != rhs.distance) return lhs.distance > rhs.distance;
+        if (lhs.outside_edges != rhs.outside_edges) return lhs.outside_edges > rhs.outside_edges;
+        return lhs.cell < rhs.cell;
+    });
+    vector<int> result;
+    for (const RankedCell &entry : ranked) {
+        result.push_back(entry.cell);
+        if ((int)result.size() == limit) break;
+    }
+    return result;
+}
+
+struct DeadlineRegionCandidate {
+    BoardMask mask{};
+    int perimeter = 0;
+    ll local_direct = 0;
+    ll movement_cost = 0;
+    ll fee_loss = 0;
+    bool moved = false;
+    uint64_t order = 0;
+};
+
+DeadlineRegionCandidate score_deadline_region(
+    const BoardMask &region, int perimeter, const DeadlineLayerItem &item,
+    const vector<GroupState> &groups, int r_milli, uint64_t order) {
+    DeadlineRegionCandidate result;
+    result.mask = region;
+    result.perimeter = perimeter;
+    result.order = order;
+    if (item.is_arrival) {
+        result.local_direct = round_payment(item.v, item.p, perimeter);
+        return result;
+    }
+    result.moved = region != item.old_region;
+    if (!result.moved) return result;
+    const GroupState &group = groups[item.id];
+    result.movement_cost = move_cost(group.v, r_milli);
+    int next_max_perimeter = max(group.max_perimeter, perimeter);
+    result.fee_loss = round_payment(group.v, group.p, group.max_perimeter) -
+                      round_payment(group.v, group.p, next_max_perimeter);
+    result.local_direct = -result.movement_cost - result.fee_loss;
+    return result;
+}
+
+optional<DeadlineRegionCandidate> make_deadline_ear_growth(
+    const BoardMask &initial_remaining, int remaining_count, int root, int seed,
+    const vector<int> &distance, const DeadlineLayerItem &item,
+    const vector<GroupState> &groups, int r_milli, int n, uint64_t order,
+    bool preserve_every_step, DeadlineTurnWork &work,
+    DeadlineLayerDiagnostics &diagnostics) {
+    if (seed == root || !deadline_mask_has(initial_remaining, seed) || item.p >= remaining_count) {
+        return nullopt;
+    }
+    BoardMask remaining = initial_remaining;
+    BoardMask region{};
+    BoardMask frontier{};
+    deadline_mask_set(frontier, seed);
+    constexpr int DX[4] = {-1, 1, 0, 0};
+    constexpr int DY[4] = {0, 0, -1, 1};
+
+    for (int placed = 0; placed < item.p; placed++) {
+        if (work.growth_steps >= DEADLINE_GROWTH_STEP_TURN_LIMIT ||
+            diagnostics.growth_steps >= DEADLINE_GROWTH_STEP_CASE_LIMIT) {
+            diagnostics.growth_limit_exhausted++;
+            return nullopt;
+        }
+        work.growth_steps++;
+        diagnostics.growth_steps++;
+        struct Choice {
+            int shared_edges;
+            int distance;
+            int boundary_edges;
+            int cell;
+        };
+        vector<Choice> choices;
+        for (int word = 0; word < BOARD_MASK_WORDS; word++) {
+            uint64_t bits = frontier[word] & remaining[word];
+            while (bits) {
+                int bit = __builtin_ctzll(bits);
+                bits &= bits - 1;
+                int cell = 64 * word + bit;
+                if (cell >= n * n || cell == root) continue;
+            int x = cell / n;
+            int y = cell % n;
+            int shared_edges = 0;
+            int boundary_edges = 0;
+            for (int dir = 0; dir < 4; dir++) {
+                int nx = x + DX[dir];
+                int ny = y + DY[dir];
+                if (!inside(nx, ny, n, n)) {
+                    boundary_edges++;
+                    continue;
+                }
+                int next = nx * n + ny;
+                shared_edges += deadline_mask_has(region, next);
+                boundary_edges += !deadline_mask_has(initial_remaining, next);
+            }
+            choices.push_back({shared_edges, distance[cell], boundary_edges, cell});
+            }
+        }
+        sort(choices.begin(), choices.end(), [](const Choice &lhs, const Choice &rhs) {
+            if (lhs.shared_edges != rhs.shared_edges) return lhs.shared_edges > rhs.shared_edges;
+            if (lhs.distance != rhs.distance) return lhs.distance > rhs.distance;
+            if (lhs.boundary_edges != rhs.boundary_edges) return lhs.boundary_edges > rhs.boundary_edges;
+            return lhs.cell < rhs.cell;
+        });
+
+        int selected = -1;
+        int tries = 0;
+        for (const Choice &choice : choices) {
+            if (!preserve_every_step) {
+                selected = choice.cell;
+                break;
+            }
+            if (tries++ == 6) break;
+            BoardMask next_remaining = remaining;
+            deadline_mask_reset(next_remaining, choice.cell);
+            int next_count = remaining_count - placed - 1;
+            if (deadline_mask_connected(next_remaining, next_count, n, work, diagnostics)) {
+                selected = choice.cell;
+                break;
+            }
+        }
+        if (selected < 0) return nullopt;
+        deadline_mask_reset(remaining, selected);
+        deadline_mask_reset(frontier, selected);
+        deadline_mask_set(region, selected);
+        int x = selected / n;
+        int y = selected % n;
+        for (int dir = 0; dir < 4; dir++) {
+            int nx = x + DX[dir];
+            int ny = y + DY[dir];
+            if (!inside(nx, ny, n, n)) continue;
+            int next = nx * n + ny;
+            if (deadline_mask_has(remaining, next)) deadline_mask_set(frontier, next);
+        }
+    }
+    if (deadline_mask_count(region) != item.p) return nullopt;
+    if (!preserve_every_step &&
+        !deadline_mask_connected(remaining, remaining_count - item.p, n, work, diagnostics)) {
+        return nullopt;
+    }
+    int perimeter = deadline_mask_perimeter(region, n);
+    return score_deadline_region(region, perimeter, item, groups, r_milli, order);
+}
+
+vector<DeadlineRegionCandidate> make_deadline_region_candidates(
+    const BoardMask &remaining, int remaining_count, int root,
+    const DeadlineLayerItem &item, const vector<GroupState> &groups, int r_milli,
+    int n, const vector<vector<Shape>> &compact_shapes, DeadlineTurnWork &work,
+    DeadlineLayerDiagnostics &diagnostics, uint64_t &order) {
+    vector<DeadlineRegionCandidate> candidates;
+    set<BoardMask> seen;
+    auto try_region = [&](const BoardMask &region, int perimeter) {
+        if ((int)candidates.size() >= 2 * DEADLINE_REGION_CANDIDATE_LIMIT ||
+            deadline_mask_has(region, root) || deadline_mask_count(region) != item.p ||
+            !deadline_mask_subset(region, remaining) || !seen.insert(region).second) {
+            return;
+        }
+        BoardMask next_remaining = deadline_mask_difference(remaining, region);
+        if (!deadline_mask_connected(next_remaining, remaining_count - item.p, n, work, diagnostics)) {
+            return;
+        }
+        candidates.push_back(score_deadline_region(
+            region, perimeter, item, groups, r_milli, order++));
+        diagnostics.region_candidates++;
+    };
+
+    if (!item.is_arrival && deadline_mask_subset(item.old_region, remaining)) {
+        try_region(item.old_region, deadline_mask_perimeter(item.old_region, n));
+    }
+
+    optional<vector<int>> distance = deadline_mask_distances(
+        remaining, root, n, work, diagnostics);
+    if (!distance) return candidates;
+    vector<int> boundary = deadline_boundary_seeds(remaining, root, *distance, n, 8);
+    vector<int> shape_indices;
+    set<pair<int, int>> seen_dimensions;
+    auto add_shape_index = [&](int index) {
+        if (index < 0 || index >= (int)compact_shapes[item.p].size() ||
+            (int)shape_indices.size() == 4) {
+            return;
+        }
+        const Shape &shape = compact_shapes[item.p][index];
+        if (seen_dimensions.insert({shape.h, shape.w}).second) shape_indices.push_back(index);
+    };
+    add_shape_index(0);
+    for (int relation : {1, -1, 0}) {
+        for (int index = 0; index < (int)compact_shapes[item.p].size(); index++) {
+            const Shape &shape = compact_shapes[item.p][index];
+            int shape_relation = (shape.h > shape.w) - (shape.h < shape.w);
+            if (shape_relation == relation) {
+                add_shape_index(index);
+                break;
+            }
+        }
+    }
+    for (int index = 0; index < (int)compact_shapes[item.p].size(); index++) add_shape_index(index);
+    for (int seed : boundary) {
+        for (int shape_index : shape_indices) {
+            const Shape &shape = compact_shapes[item.p][shape_index];
+            array<pair<int, int>, 4> offsets = {
+                pair<int, int>{0, 0}, {shape.h - 1, 0},
+                {0, shape.w - 1}, {shape.h - 1, shape.w - 1}};
+            for (auto [dx, dy] : offsets) {
+                if (deadline_connectivity_budget_exhausted(work, diagnostics)) break;
+                if (work.template_probes >= DEADLINE_TEMPLATE_PROBE_TURN_LIMIT ||
+                    diagnostics.template_probes >= DEADLINE_TEMPLATE_PROBE_CASE_LIMIT) {
+                    diagnostics.template_limit_exhausted++;
+                    break;
+                }
+                work.template_probes++;
+                diagnostics.template_probes++;
+                int base_x = seed / n - dx;
+                int base_y = seed % n - dy;
+                if (base_x < 0 || base_y < 0 || base_x + shape.h > n || base_y + shape.w > n) {
+                    continue;
+                }
+                vector<Cell> cells = materialize_shape(shape, base_x, base_y, item.p);
+                BoardMask region{};
+                bool legal = true;
+                for (auto [x, y] : cells) {
+                    int cell = x * n + y;
+                    if (!deadline_mask_has(remaining, cell) || cell == root ||
+                        deadline_mask_has(region, cell)) {
+                        legal = false;
+                        break;
+                    }
+                    deadline_mask_set(region, cell);
+                }
+                if (legal) try_region(region, shape.perimeter);
+            }
+            if (work.template_probes >= DEADLINE_TEMPLATE_PROBE_TURN_LIMIT ||
+                diagnostics.template_probes >= DEADLINE_TEMPLATE_PROBE_CASE_LIMIT ||
+                deadline_connectivity_budget_exhausted(work, diagnostics)) {
+                break;
+            }
+        }
+        if (work.template_probes >= DEADLINE_TEMPLATE_PROBE_TURN_LIMIT ||
+            diagnostics.template_probes >= DEADLINE_TEMPLATE_PROBE_CASE_LIMIT ||
+            deadline_connectivity_budget_exhausted(work, diagnostics)) {
+            break;
+        }
+    }
+
+    vector<pair<int, bool>> growth_modes;
+    if (!boundary.empty()) {
+        growth_modes.push_back({0, true});
+        growth_modes.push_back({0, false});
+    }
+    if ((int)boundary.size() >= 2) growth_modes.push_back({1, false});
+    for (auto [index, preserve_every_step] : growth_modes) {
+        if (deadline_connectivity_budget_exhausted(work, diagnostics)) break;
+        optional<DeadlineRegionCandidate> growth = make_deadline_ear_growth(
+            remaining, remaining_count, root, boundary[index], *distance, item, groups,
+            r_milli, n, order++, preserve_every_step, work, diagnostics);
+        if (growth && seen.insert(growth->mask).second) {
+            candidates.push_back(std::move(*growth));
+            diagnostics.region_candidates++;
+        }
+    }
+
+    sort(candidates.begin(), candidates.end(), [](const DeadlineRegionCandidate &lhs,
+                                                   const DeadlineRegionCandidate &rhs) {
+        if (lhs.local_direct != rhs.local_direct) return lhs.local_direct > rhs.local_direct;
+        if (lhs.moved != rhs.moved) return lhs.moved < rhs.moved;
+        if (lhs.perimeter != rhs.perimeter) return lhs.perimeter < rhs.perimeter;
+        return lhs.order < rhs.order;
+    });
+    if ((int)candidates.size() > DEADLINE_REGION_CANDIDATE_LIMIT) {
+        candidates.resize(DEADLINE_REGION_CANDIDATE_LIMIT);
+    }
+    return candidates;
+}
+
+struct DeadlinePeelState {
+    BoardMask remaining{};
+    int remaining_count = 0;
+    vector<BoardMask> assignments;
+    ll direct_score = 0;
+    ll movement_cost = 0;
+    ll fee_loss = 0;
+    int moved_groups = 0;
+    int perimeter_sum = 0;
+    uint64_t order = 0;
+};
+
+struct DeadlineLayoutResult {
+    DeadlineWorkspace workspace;
+    vector<DeadlineLayerItem> items;
+    vector<BoardMask> assignments;
+    BoardMask core{};
+    ll direct_score = 0;
+    ll movement_cost = 0;
+    ll fee_loss = 0;
+    int moved_groups = 0;
+    uint64_t order = 0;
+};
+
+vector<DeadlineLayoutResult> search_deadline_layout(
+    const DeadlineWorkspace &workspace, const vector<GroupState> &groups, int arrival_id,
+    int r_milli, int n, const vector<vector<Shape>> &compact_shapes,
+    DeadlineTurnWork &work, DeadlineLayerDiagnostics &diagnostics) {
+    vector<DeadlineLayoutResult> results;
+    vector<DeadlineLayerItem> items = make_deadline_layer_items(workspace, groups, arrival_id, n);
+    vector<int> roots = make_deadline_core_roots(workspace, n, work, diagnostics);
+    uint64_t order = 0;
+    int workspace_layout_begin = work.layout_nodes;
+    for (int root : roots) {
+        vector<DeadlinePeelState> beam(1);
+        beam.front().remaining = workspace.mask;
+        beam.front().remaining_count = workspace.area;
+        bool exhausted = false;
+        for (int item_index = 0; item_index < (int)items.size(); item_index++) {
+            vector<DeadlinePeelState> next;
+            for (const DeadlinePeelState &state : beam) {
+                if (work.layout_nodes - workspace_layout_begin >= DEADLINE_LAYOUT_NODE_WORKSPACE_LIMIT ||
+                    work.layout_nodes >= DEADLINE_LAYOUT_NODE_TURN_LIMIT ||
+                    diagnostics.layout_nodes >= DEADLINE_LAYOUT_NODE_CASE_LIMIT) {
+                    diagnostics.layout_limit_exhausted++;
+                    exhausted = true;
+                    break;
+                }
+                vector<DeadlineRegionCandidate> regions = make_deadline_region_candidates(
+                    state.remaining, state.remaining_count, root, items[item_index], groups,
+                    r_milli, n, compact_shapes, work, diagnostics, order);
+                for (const DeadlineRegionCandidate &region : regions) {
+                    int node_work = (int)state.assignments.size() + 1;
+                    if (work.layout_nodes - workspace_layout_begin + node_work >
+                            DEADLINE_LAYOUT_NODE_WORKSPACE_LIMIT ||
+                        work.layout_nodes + node_work > DEADLINE_LAYOUT_NODE_TURN_LIMIT ||
+                        diagnostics.layout_nodes + node_work > DEADLINE_LAYOUT_NODE_CASE_LIMIT) {
+                        diagnostics.layout_limit_exhausted++;
+                        exhausted = true;
+                        break;
+                    }
+                    work.layout_nodes += node_work;
+                    diagnostics.layout_nodes += node_work;
+                    DeadlinePeelState child = state;
+                    child.remaining = deadline_mask_difference(state.remaining, region.mask);
+                    child.remaining_count -= items[item_index].p;
+                    child.assignments.push_back(region.mask);
+                    child.direct_score += region.local_direct;
+                    child.movement_cost += region.movement_cost;
+                    child.fee_loss += region.fee_loss;
+                    child.moved_groups += region.moved;
+                    child.perimeter_sum += region.perimeter;
+                    child.order = order++;
+                    next.push_back(std::move(child));
+                }
+                if (exhausted) break;
+            }
+            if (next.empty()) {
+                beam.clear();
+                break;
+            }
+            sort(next.begin(), next.end(), [](const DeadlinePeelState &lhs,
+                                              const DeadlinePeelState &rhs) {
+                if (lhs.direct_score != rhs.direct_score) return lhs.direct_score > rhs.direct_score;
+                if (lhs.moved_groups != rhs.moved_groups) return lhs.moved_groups < rhs.moved_groups;
+                if (lhs.perimeter_sum != rhs.perimeter_sum) return lhs.perimeter_sum < rhs.perimeter_sum;
+                return lhs.order < rhs.order;
+            });
+            if ((int)next.size() > DEADLINE_LAYOUT_BEAM_WIDTH) next.resize(DEADLINE_LAYOUT_BEAM_WIDTH);
+            beam = std::move(next);
+            if (exhausted) break;
+        }
+        if (exhausted) break;
+        for (const DeadlinePeelState &state : beam) {
+            if ((int)state.assignments.size() != (int)items.size()) continue;
+            if (!deadline_mask_connected(state.remaining, state.remaining_count, n, work, diagnostics)) {
+                continue;
+            }
+            results.push_back({workspace, items, state.assignments, state.remaining,
+                               state.direct_score, state.movement_cost, state.fee_loss,
+                               state.moved_groups, state.order});
+        }
+    }
+    sort(results.begin(), results.end(), [](const DeadlineLayoutResult &lhs,
+                                            const DeadlineLayoutResult &rhs) {
+        if (lhs.direct_score != rhs.direct_score) return lhs.direct_score > rhs.direct_score;
+        if (lhs.moved_groups != rhs.moved_groups) return lhs.moved_groups < rhs.moved_groups;
+        return lhs.order < rhs.order;
+    });
+    return results;
+}
+
+bool validate_and_build_deadline_owner(
+    const TurnPlan &plan, const vs &park, const vvi &owner,
+    const vector<GroupState> &groups, int arrival_id, int r_milli,
+    vvi &final_owner, ll &fee_loss, ll &movement_cost_sum) {
+    if (!plan.arrival || groups[arrival_id].active) return false;
+    int n = park.size();
+    vector<char> moved(groups.size(), false);
+    final_owner = owner;
+    for (const MovePlan &move : plan.moves) {
+        if (move.id < 0 || move.id >= (int)groups.size() || move.id == arrival_id ||
+            moved[move.id] || !groups[move.id].active) {
+            return false;
+        }
+        moved[move.id] = true;
+        const GroupState &group = groups[move.id];
+        if ((int)group.cells.size() != group.p) return false;
+        for (auto [x, y] : group.cells) {
+            if (!inside(x, y, n, n) || final_owner[x][y] != move.id) return false;
+        }
+    }
+    for (const MovePlan &move : plan.moves) clear_cells(final_owner, groups[move.id].cells);
+
+    auto region_is_legal = [&](const vector<Cell> &cells, int expected_size) {
+        if ((int)cells.size() != expected_size || !validate_connected_region(cells, n)) return false;
+        for (auto [x, y] : cells) {
+            if (!inside(x, y, n, n) || park[x][y] != '.' || final_owner[x][y] != -1) return false;
+        }
+        return true;
+    };
+
+    fee_loss = 0;
+    movement_cost_sum = 0;
+    for (const MovePlan &move : plan.moves) {
+        const GroupState &group = groups[move.id];
+        if (!region_is_legal(move.cells, group.p) || same_region(move.cells, group.cells)) return false;
+        int perimeter = calc_perimeter(move.cells, n);
+        if (perimeter != move.perimeter) return false;
+        ll previous_fee = round_payment(group.v, group.p, group.max_perimeter);
+        ll next_fee = round_payment(group.v, group.p, max(group.max_perimeter, perimeter));
+        fee_loss += previous_fee - next_fee;
+        movement_cost_sum += move_cost(group.v, r_milli);
+        place_cells(final_owner, move.cells, move.id);
+    }
+
+    const GroupState &arrival = groups[arrival_id];
+    if (!region_is_legal(*plan.arrival, arrival.p) ||
+        calc_perimeter(*plan.arrival, n) != plan.arrival_perimeter) {
+        return false;
+    }
+    ll arrival_fee = round_payment(arrival.v, arrival.p, plan.arrival_perimeter);
+    if (plan.immediate_gain != arrival_fee - movement_cost_sum) return false;
+    place_cells(final_owner, *plan.arrival, arrival_id);
+    return true;
+}
+
+bool validate_deadline_layout_invariant(const DeadlineLayoutResult &layout, int n,
+                                        DeadlineLayerDiagnostics &diagnostics) {
+    int arrival_p = 0;
+    for (const DeadlineLayerItem &item : layout.items) {
+        if (item.is_arrival) arrival_p = item.p;
+    }
+    if (layout.assignments.size() != layout.items.size() || arrival_p == 0 ||
+        deadline_mask_count(layout.core) != layout.workspace.free_area - arrival_p) {
+        diagnostics.partition_errors++;
+        return false;
+    }
+
+    BoardMask reconstructed = layout.core;
+    if (!validate_connected_region(deadline_mask_cells(reconstructed, n), n)) {
+        diagnostics.prefix_connectivity_errors++;
+        return false;
+    }
+    for (int item_index = (int)layout.items.size() - 1; item_index >= 0; item_index--) {
+        const BoardMask &region = layout.assignments[item_index];
+        if (deadline_mask_count(region) != layout.items[item_index].p ||
+            masks_overlap(reconstructed, region) ||
+            !validate_connected_region(deadline_mask_cells(region, n), n)) {
+            diagnostics.partition_errors++;
+            return false;
+        }
+        merge_mask(reconstructed, region);
+        if (!validate_connected_region(deadline_mask_cells(reconstructed, n), n)) {
+            diagnostics.prefix_connectivity_errors++;
+            return false;
+        }
+    }
+    if (reconstructed != layout.workspace.mask) {
+        diagnostics.partition_errors++;
+        return false;
+    }
+    return true;
+}
+
+struct PreparedDeadlineCandidate {
+    TurnPlan plan;
+    vvi final_owner;
+    ll arrival_fee = 0;
+    ll movement_cost = 0;
+    ll fee_loss = 0;
+    ll direct_score = 0;
+    int moved_groups = 0;
+    int moved_cells = 0;
+    uint64_t order = 0;
+};
+
+optional<PreparedDeadlineCandidate> prepare_deadline_candidate(
+    const DeadlineLayoutResult &layout, const vs &park, const vvi &owner,
+    const vector<GroupState> &groups, int arrival_id, int r_milli,
+    DeadlineLayerDiagnostics &diagnostics) {
+    int n = park.size();
+    if (!validate_deadline_layout_invariant(layout, n, diagnostics)) return nullopt;
+
+    PreparedDeadlineCandidate candidate;
+    candidate.order = layout.order;
+    for (int item_index = 0; item_index < (int)layout.items.size(); item_index++) {
+        const DeadlineLayerItem &item = layout.items[item_index];
+        vector<Cell> cells = deadline_mask_cells(layout.assignments[item_index], n);
+        int perimeter = calc_perimeter(cells, n);
+        if (item.is_arrival) {
+            candidate.plan.arrival = std::move(cells);
+            candidate.plan.arrival_perimeter = perimeter;
+            candidate.arrival_fee = round_payment(item.v, item.p, perimeter);
+        } else if (layout.assignments[item_index] != item.old_region) {
+            candidate.moved_groups++;
+            candidate.moved_cells += item.p;
+            candidate.plan.moves.push_back({item.id, std::move(cells), perimeter});
+        }
+    }
+    sort(candidate.plan.moves.begin(), candidate.plan.moves.end(),
+         [](const MovePlan &lhs, const MovePlan &rhs) { return lhs.id < rhs.id; });
+    candidate.plan.immediate_gain = candidate.arrival_fee - layout.movement_cost;
+
+    ll validated_fee_loss = 0;
+    ll validated_movement_cost = 0;
+    if (!validate_and_build_deadline_owner(
+            candidate.plan, park, owner, groups, arrival_id, r_milli,
+            candidate.final_owner, validated_fee_loss, validated_movement_cost)) {
+        diagnostics.validation_failures++;
+        return nullopt;
+    }
+    candidate.movement_cost = validated_movement_cost;
+    candidate.fee_loss = validated_fee_loss;
+    candidate.direct_score = candidate.arrival_fee - candidate.movement_cost - candidate.fee_loss;
+    if (candidate.moved_groups != (int)candidate.plan.moves.size() ||
+        candidate.moved_groups != layout.moved_groups ||
+        candidate.movement_cost != layout.movement_cost ||
+        candidate.fee_loss != layout.fee_loss ||
+        candidate.direct_score != layout.direct_score) {
+        diagnostics.direct_identity_errors++;
+        return nullopt;
+    }
+    return candidate;
+}
+
+optional<RootActionResult> choose_deadline_layer_root(
+    const vs &park, const vvi &owner, const vector<GroupState> &groups,
+    int arrival_id, int turn, int total_groups, ll current_s, int remaining_groups,
+    int free_cells_before, int r_milli, long double theta,
+    const ThetaEstimator &theta_estimator, const DensityModel &density_model,
+    SampledDlpShadowModel &sampled_dlp_model,
+    int grass_cells, long double opportunity_cost, const ArrivalDecision &baseline,
+    const vector<vector<Shape>> &compact_shapes, int &deadline_confirmations_used,
+    DeadlineLayerDiagnostics &diagnostics) {
+    if constexpr (!ENABLE_DEADLINE_LAYER) return nullopt;
+
+    const GroupState &arrival = groups[arrival_id];
+    int minimum_perimeter = compact_shapes[arrival.p].front().perimeter;
+    bool no_region = baseline.status == ArrivalStatus::NoRegion && !baseline.cells;
+    bool noncompact = baseline.status == ArrivalStatus::Accepted && baseline.cells &&
+                      baseline.perimeter > minimum_perimeter;
+    if (!no_region && !noncompact) return nullopt;
+
+    DeadlineLayerCpuScope cpu_scope(diagnostics);
+    diagnostics.eligible++;
+    diagnostics.no_region_eligible += no_region;
+    diagnostics.noncompact_eligible += noncompact;
+    if (free_cells_before < arrival.p + 1) {
+        diagnostics.area_insufficient++;
+        return nullopt;
+    }
+
+    if (no_region) {
+        ll minimum_move_cost = numeric_limits<ll>::max();
+        for (const GroupState &group : groups) {
+            if (group.active) chmin(minimum_move_cost, move_cost(group.v, r_milli));
+        }
+        ll compact_fee = round_payment(arrival.v, arrival.p, minimum_perimeter);
+        if (minimum_move_cost == numeric_limits<ll>::max() ||
+            (long double)(compact_fee - minimum_move_cost) <= opportunity_cost) {
+            diagnostics.economic_upper_bound_rejected++;
+            return nullopt;
+        }
+    }
+
+    if (diagnostics.graph_builds >= DEADLINE_GRAPH_BUILD_CASE_LIMIT ||
+        diagnostics.closure_expansions >= DEADLINE_CLOSURE_EXPANSION_CASE_LIMIT ||
+        diagnostics.layout_nodes >= DEADLINE_LAYOUT_NODE_CASE_LIMIT ||
+        diagnostics.template_probes >= DEADLINE_TEMPLATE_PROBE_CASE_LIMIT ||
+        diagnostics.growth_steps >= DEADLINE_GROWTH_STEP_CASE_LIMIT ||
+        diagnostics.connectivity_calls >= DEADLINE_CONNECTIVITY_CALL_CASE_LIMIT ||
+        diagnostics.connectivity_visits >= DEADLINE_CONNECTIVITY_VISIT_CASE_LIMIT ||
+        diagnostics.complete_plan_attempts >= DEADLINE_COMPLETE_PLAN_CASE_LIMIT) {
+        diagnostics.case_budget_skips++;
+        return nullopt;
+    }
+    int window = min(3, turn * 4 / total_groups);
+    array<int, 4> &mode_attempts =
+        no_region ? diagnostics.no_region_attempts_by_window
+                  : diagnostics.noncompact_attempts_by_window;
+    if (mode_attempts[window] >= DEADLINE_WINDOW_ATTEMPT_LIMIT) {
+        diagnostics.window_budget_skips++;
+        return nullopt;
+    }
+    diagnostics.attempts++;
+    diagnostics.attempts_by_window[window]++;
+    mode_attempts[window]++;
+    diagnostics.graph_builds++;
+
+    optional<DeadlineQuotientGraph> graph = build_deadline_quotient_graph(park, owner, groups);
+    if (!graph) {
+        diagnostics.graph_failures++;
+        return nullopt;
+    }
+    DeadlineTurnWork work;
+    vector<DeadlineClosureState> closures = enumerate_deadline_closures(
+        *graph, groups, arrival.p + 1, r_milli, work.closure_expansions, diagnostics);
+    if (closures.empty()) {
+        diagnostics.closure_failures++;
+        return nullopt;
+    }
+
+    vector<PreparedDeadlineCandidate> candidates;
+    for (const DeadlineClosureState &closure : closures) {
+        optional<DeadlineWorkspace> workspace = materialize_deadline_workspace(
+            closure, *graph, arrival.p, work, diagnostics);
+        if (!workspace) continue;
+        diagnostics.workspaces_searched++;
+        vector<DeadlineLayoutResult> layouts = search_deadline_layout(
+            *workspace, groups, arrival_id, r_milli, park.size(), compact_shapes,
+            work, diagnostics);
+        for (const DeadlineLayoutResult &layout : layouts) {
+            // Do not let arrival-only layouts consume the limited number of
+            // complete-plan validations reserved for real reconstructions.
+            if (layout.moved_groups == 0) {
+                diagnostics.zero_move_candidates_filtered++;
+                continue;
+            }
+            if (work.complete_plans >= DEADLINE_COMPLETE_PLAN_TURN_LIMIT ||
+                diagnostics.complete_plan_attempts >= DEADLINE_COMPLETE_PLAN_CASE_LIMIT) {
+                diagnostics.complete_plan_limit_exhausted++;
+                break;
+            }
+            work.complete_plans++;
+            diagnostics.complete_plan_attempts++;
+            optional<PreparedDeadlineCandidate> candidate = prepare_deadline_candidate(
+                layout, park, owner, groups, arrival_id, r_milli, diagnostics);
+            if (!candidate) break;
+            // The prepared output is validated independently from the layout.
+            if (candidate->moved_groups == 0) {
+                diagnostics.direct_identity_errors++;
+                continue;
+            }
+            if (no_region && (long double)candidate->direct_score <= opportunity_cost) {
+                diagnostics.direct_gate_rejected++;
+                break;
+            }
+            diagnostics.feasible_plans++;
+            candidates.push_back(std::move(*candidate));
+            break;
+        }
+        if (work.complete_plans >= DEADLINE_COMPLETE_PLAN_TURN_LIMIT ||
+            diagnostics.complete_plan_attempts >= DEADLINE_COMPLETE_PLAN_CASE_LIMIT) {
+            break;
+        }
+    }
+    if (candidates.empty()) {
+        diagnostics.layout_failures++;
+        return nullopt;
+    }
+    diagnostics.feasible_turns++;
+    sort(candidates.begin(), candidates.end(), [](const PreparedDeadlineCandidate &lhs,
+                                                   const PreparedDeadlineCandidate &rhs) {
+        if (lhs.direct_score != rhs.direct_score) return lhs.direct_score > rhs.direct_score;
+        if (lhs.moved_groups != rhs.moved_groups) return lhs.moved_groups < rhs.moved_groups;
+        return lhs.order < rhs.order;
+    });
+    if ((int)candidates.size() > DEADLINE_ROLLOUT_CANDIDATE_LIMIT) {
+        candidates.resize(DEADLINE_ROLLOUT_CANDIDATE_LIMIT);
+    }
+
+    TurnPlan baseline_plan = make_arrival_plan(baseline);
+    vvi baseline_owner = owner;
+    if (baseline_plan.arrival) place_cells(baseline_owner, *baseline_plan.arrival, arrival_id);
+    ll baseline_fee = baseline.status == ArrivalStatus::Accepted ? baseline.fee : 0;
+    int selected = -1;
+    i128 best_margin_twice = 0;
+    array<ll, ROOT_SCREEN_SCENARIO_COUNT> selected_future{};
+
+    if (remaining_groups == 0) {
+        for (int index = 0; index < (int)candidates.size(); index++) {
+            ll direct_delta = candidates[index].direct_score - baseline_fee;
+            if ((i128)2 * direct_delta > best_margin_twice) {
+                best_margin_twice = (i128)2 * direct_delta;
+                selected = index;
+            }
+        }
+    } else {
+        RescueRolloutScenarios scenarios = make_rescue_rollout_scenarios(
+            groups, arrival_id, current_s, remaining_groups, theta, theta_estimator);
+        int expected_length = min(ROOT_SCREEN_ROLLOUT_LENGTH, remaining_groups);
+        bool generation_ok = scenarios.complete &&
+                             (int)scenarios.arrivals.size() == ROOT_SCREEN_SCENARIO_COUNT;
+        if (generation_ok) {
+            for (const auto &scenario : scenarios.arrivals) {
+                if ((int)scenario.size() != expected_length) generation_ok = false;
+            }
+        }
+        if (!generation_ok) {
+            diagnostics.rollout_generation_failures++;
+            return nullopt;
+        }
+        diagnostics.rollout_turns++;
+        array<RescueRolloutOutcome, ROOT_SCREEN_SCENARIO_COUNT> baseline_outcomes;
+        for (int scenario = 0; scenario < ROOT_SCREEN_SCENARIO_COUNT; scenario++) {
+            baseline_outcomes[scenario] = evaluate_rescue_rollout_branch(
+                park, baseline_owner, groups, arrival_id, baseline_plan,
+                scenarios.arrivals[scenario], grass_cells, density_model,
+                sampled_dlp_model, compact_shapes);
+            diagnostics.rollout_policy_steps += scenarios.arrivals[scenario].size();
+        }
+        for (int index = 0; index < (int)candidates.size(); index++) {
+            array<ll, ROOT_SCREEN_SCENARIO_COUNT> future_delta{};
+            for (int scenario = 0; scenario < ROOT_SCREEN_SCENARIO_COUNT; scenario++) {
+                RescueRolloutOutcome outcome = evaluate_rescue_rollout_branch(
+                    park, candidates[index].final_owner, groups, arrival_id,
+                    candidates[index].plan, scenarios.arrivals[scenario], grass_cells,
+                    density_model, sampled_dlp_model, compact_shapes);
+                diagnostics.rollout_policy_steps += scenarios.arrivals[scenario].size();
+                future_delta[scenario] = outcome.fee - baseline_outcomes[scenario].fee;
+            }
+            ll direct_delta = candidates[index].direct_score - baseline_fee;
+            i128 margin_twice = (i128)ROOT_SCREEN_SCENARIO_COUNT * direct_delta +
+                                future_delta[0] + future_delta[1];
+            if (margin_twice > best_margin_twice) {
+                best_margin_twice = margin_twice;
+                selected = index;
+                selected_future = future_delta;
+            }
+        }
+    }
+    if (selected < 0) {
+        diagnostics.screen_rejected++;
+        return nullopt;
+    }
+
+    PreparedDeadlineCandidate &chosen = candidates[selected];
+    if (remaining_groups > 0) {
+        if (deadline_confirmations_used >= DEADLINE_CONFIRMATION_CASE_LIMIT) {
+            diagnostics.confirmation_rejected++;
+            return nullopt;
+        }
+        diagnostics.confirmation_attempts++;
+        RootBranchView protected_branch{&baseline_plan, &baseline_owner, 0};
+        RootBranchView challenger_branch{
+            &chosen.plan, &chosen.final_owner, chosen.direct_score - baseline_fee};
+        RescueDiagnostics confirmation_diagnostics;
+        if (!confirm_root_override(
+                park, groups, arrival_id, current_s, remaining_groups, theta,
+                theta_estimator, grass_cells, density_model, sampled_dlp_model, compact_shapes,
+                protected_branch, challenger_branch, deadline_confirmations_used,
+                confirmation_diagnostics)) {
+            diagnostics.rollout_policy_steps +=
+                confirmation_diagnostics.root_confirmation_policy_steps;
+            diagnostics.confirmation_rejected++;
+            return nullopt;
+        }
+        diagnostics.rollout_policy_steps +=
+            confirmation_diagnostics.root_confirmation_policy_steps;
+    }
+
+    ArrivalDecision selected_arrival = baseline;
+    selected_arrival.status = ArrivalStatus::Accepted;
+    selected_arrival.cells = *chosen.plan.arrival;
+    selected_arrival.perimeter = chosen.plan.arrival_perimeter;
+    selected_arrival.fee = chosen.arrival_fee;
+    replace_selected_placement_success(
+        selected_arrival.diagnostics,
+        chosen.plan.arrival_perimeter == minimum_perimeter
+            ? PlacementSource::MinimumTemplate
+            : PlacementSource::ConnectedGrowth);
+
+    diagnostics.adopted++;
+    diagnostics.adopted_with_move += chosen.moved_groups > 0;
+    diagnostics.adopted_from_no_region += no_region;
+    diagnostics.moved_groups += chosen.moved_groups;
+    diagnostics.moved_cells += chosen.moved_cells;
+    diagnostics.arrival_fee += chosen.arrival_fee;
+    diagnostics.movement_cost += chosen.movement_cost;
+    diagnostics.relocation_fee_loss += chosen.fee_loss;
+    diagnostics.direct_gain += chosen.direct_score;
+    diagnostics.scenario_0_future_delta += selected_future[0];
+    diagnostics.scenario_1_future_delta += selected_future[1];
+    diagnostics.screen_margin += (long double)best_margin_twice / ROOT_SCREEN_SCENARIO_COUNT;
+    if (chosen.arrival_fee - chosen.movement_cost - chosen.fee_loss != chosen.direct_score) {
+        diagnostics.direct_identity_errors++;
+    }
+    return RootActionResult{std::move(chosen.plan), std::move(selected_arrival)};
 }
 
 bool validate_connected_region(const vector<Cell> &cells, int n) {
@@ -3118,14 +6894,19 @@ void emit_plan(const TurnPlan &plan) {
 int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
-    Timer timer;
+    RuntimeDiagnostics runtime_diagnostics;
 
+    auto initial_input_wall_begin = RuntimeDiagnostics::WallClock::now();
     int N, M;
     ld R;
     cin >> N >> M >> R;
     int r_milli = (int)llroundl(R * 1000.0L);
     vs park(N);
     for (string &row : park) cin >> row;
+    runtime_diagnostics.add_input(initial_input_wall_begin);
+
+    auto preprocess_wall_begin = RuntimeDiagnostics::WallClock::now();
+    clock_t preprocess_cpu_begin = clock();
 
     vector<vector<Shape>> compact_shapes(151);
     vector<vector<Shape>> all_shapes(151);
@@ -3140,6 +6921,8 @@ int main() {
             compact_shapes[p].end());
     }
     DensityModel density_model(compact_shapes);
+    SampledDlpShadowModel sampled_dlp_model;
+    if constexpr (ENABLE_SAMPLED_DLP) sampled_dlp_model.initialize(compact_shapes);
     ThetaEstimator theta_estimator;
     int grass_cells = 0;
     for (const string &row : park) {
@@ -3154,13 +6937,28 @@ int main() {
     ShadowDiagnostics shadow_diagnostics;
     TemporalPlacementDiagnostics placement_diagnostics;
     RescueDiagnostics rescue_diagnostics;
+    DeadlineLayerDiagnostics deadline_diagnostics;
+    LossDiagnostics loss_diagnostics;
     int root_confirmations_used = 0;
+    int deadline_confirmations_used = 0;
     array<bool, 4> normal_root_window_used{};
+    int occupied_cells = 0;
+    runtime_diagnostics.add_preprocess(preprocess_wall_begin, preprocess_cpu_begin);
+
+    auto static_geometry_wall_begin = RuntimeDiagnostics::WallClock::now();
+    clock_t static_geometry_cpu_begin = clock();
+    int static_largest_component = largest_free_component(park, owner);
+    runtime_diagnostics.add_diagnostic(static_geometry_wall_begin, static_geometry_cpu_begin);
 
     for (int turn = 0; turn < M; turn++) {
+        auto input_wall_begin = RuntimeDiagnostics::WallClock::now();
         int i, P;
         ll S, T, V;
         cin >> i >> S >> T >> P >> V;
+        runtime_diagnostics.add_input(input_wall_begin);
+
+        auto turn_wall_begin = RuntimeDiagnostics::WallClock::now();
+        clock_t turn_cpu_begin = clock();
 
         groups[i].s = S;
         groups[i].t = T;
@@ -3177,12 +6975,20 @@ int main() {
             departures.pop();
             if (!groups[j].active) continue;
             clear_cells(owner, groups[j].cells);
+            occupied_cells -= groups[j].p;
             groups[j].cells.clear();
             groups[j].active = false;
         }
+        int free_cells_before = grass_cells - occupied_cells;
 
-        ShadowEvaluation shadow =
-            evaluate_shadow_cost(groups, S, T, P, remaining_groups, grass_cells, theta, density_model);
+        ShadowEvaluation shadow;
+        if constexpr (ENABLE_SAMPLED_DLP) {
+            shadow = sampled_dlp_model.evaluate_real_turn(
+                turn, S, T, P, remaining_groups, groups, grass_cells, theta_estimator);
+        } else {
+            shadow = evaluate_shadow_cost(groups, S, T, P, remaining_groups,
+                                          grass_cells, theta, density_model);
+        }
         shadow_diagnostics.considered++;
         shadow_diagnostics.theta_sum += theta;
         shadow_diagnostics.opportunity_cost_sum += shadow.opportunity_cost;
@@ -3195,13 +7001,22 @@ int main() {
         // normal turns may use the same root machinery without relocation.
         vector<NormalPlacementChoice> baseline_alternatives;
         ArrivalDecision baseline_arrival = evaluate_arrival_decision(
-            park, owner, groups, i, S, remaining_groups, theta, shadow.opportunity_cost, compact_shapes,
-            &baseline_alternatives);
+            park, owner, groups, i, S, remaining_groups, theta, shadow.opportunity_cost,
+            compact_shapes, &baseline_alternatives);
         bool rescue_root_screen_evaluated = false;
-        optional<RootActionResult> expanded_action = choose_root_action_with_rescue(
-            park, owner, groups, i, S, remaining_groups, r_milli, theta, theta_estimator, density_model,
-            grass_cells, baseline_arrival, baseline_alternatives, compact_shapes, all_shapes,
-            root_confirmations_used, rescue_root_screen_evaluated, rescue_diagnostics);
+        optional<RootActionResult> expanded_action = choose_deadline_layer_root(
+            park, owner, groups, i, turn, M, S, remaining_groups, free_cells_before,
+            r_milli, theta, theta_estimator, density_model, sampled_dlp_model, grass_cells,
+            shadow.opportunity_cost, baseline_arrival, compact_shapes,
+            deadline_confirmations_used, deadline_diagnostics);
+        if (!expanded_action) {
+            expanded_action = choose_root_action_with_rescue(
+                park, owner, groups, i, S, remaining_groups, r_milli, theta,
+                theta_estimator, density_model, sampled_dlp_model,
+                grass_cells, shadow.opportunity_cost,
+                baseline_arrival, baseline_alternatives, compact_shapes, all_shapes,
+                root_confirmations_used, rescue_root_screen_evaluated, rescue_diagnostics);
+        }
 
         int minimum_perimeter = compact_shapes[P].front().perimeter;
         int normal_root_window = min(3, turn * 4 / M);
@@ -3214,8 +7029,9 @@ int main() {
             normal_root_window_used[normal_root_window] = true;
             rescue_diagnostics.normal_root_gate_turns++;
             expanded_action = choose_normal_root_action(
-                park, owner, groups, i, S, remaining_groups, theta, theta_estimator, density_model,
-                grass_cells, baseline_arrival, baseline_alternatives, compact_shapes,
+                park, owner, groups, i, S, remaining_groups, theta, theta_estimator,
+                density_model, sampled_dlp_model, grass_cells, baseline_arrival,
+                baseline_alternatives, compact_shapes,
                 root_confirmations_used, rescue_diagnostics);
         }
 
@@ -3244,16 +7060,46 @@ int main() {
                 break;
         }
 
+        ll turn_movement_cost = 0;
+        ll turn_relocation_fee_loss = 0;
+        for (const MovePlan &move : plan.moves) {
+            const GroupState &group = groups[move.id];
+            int next_max_perimeter = max(group.max_perimeter, move.perimeter);
+            turn_movement_cost += move_cost(group.v, r_milli);
+            turn_relocation_fee_loss +=
+                round_payment(group.v, group.p, group.max_perimeter) -
+                round_payment(group.v, group.p, next_max_perimeter);
+        }
+
         apply_plan(i, plan, owner, groups);
         if (plan.arrival) {
             departures.emplace(T, i);
             accepted_count++;
+            occupied_cells += P;
         } else {
             rejected_count++;
         }
+        runtime_diagnostics.add_turn(turn_wall_begin, turn_cpu_begin);
 
+        auto loss_wall_begin = RuntimeDiagnostics::WallClock::now();
+        clock_t loss_cpu_begin = clock();
+        int reject_largest_component = -1;
+        if (!plan.arrival) {
+            reject_largest_component = largest_free_component(park, owner);
+        }
+        observe_loss(loss_diagnostics, selected_arrival, plan, groups[i], minimum_perimeter,
+                     free_cells_before, static_largest_component, reject_largest_component,
+                     turn_movement_cost, turn_relocation_fee_loss, shadow.opportunity_cost);
+        runtime_diagnostics.add_diagnostic(loss_wall_begin, loss_cpu_begin);
+
+        auto output_wall_begin = RuntimeDiagnostics::WallClock::now();
         emit_plan(plan);
+        runtime_diagnostics.add_output(output_wall_begin);
     }
+
+    auto final_loss_wall_begin = RuntimeDiagnostics::WallClock::now();
+    clock_t final_loss_cpu_begin = clock();
+    finalize_loss_diagnostics(loss_diagnostics, groups);
 
     long double mean_theta =
         shadow_diagnostics.considered == 0 ? 0.0L : shadow_diagnostics.theta_sum / shadow_diagnostics.considered;
@@ -3263,7 +7109,576 @@ int main() {
     long double mean_rejected_fraction = shadow_diagnostics.considered == 0
                                              ? 0.0L
                                              : shadow_diagnostics.rejected_fraction_sum / shadow_diagnostics.considered;
+    ll reconstructed_raw_score =
+        loss_diagnostics.accepted_final_fee - loss_diagnostics.movement_cost_paid;
+    ll reconstructed_absolute_score = max(0LL, reconstructed_raw_score);
+    ll accepted_initial_identity_error =
+        loss_diagnostics.accepted_ideal_fee - loss_diagnostics.accepted_initial_fee -
+        loss_diagnostics.accepted_initial_shape_loss;
+    ll accepted_final_identity_error =
+        loss_diagnostics.accepted_initial_fee - loss_diagnostics.accepted_final_fee -
+        loss_diagnostics.accepted_relocation_fee_loss;
+    ll offered_identity_error =
+        loss_diagnostics.offered_ideal_fee - loss_diagnostics.accepted_ideal_fee -
+        loss_diagnostics.rejected_ideal_fee;
+    ll cell_time_identity_error =
+        loss_diagnostics.offered_cell_time - loss_diagnostics.accepted_cell_time -
+        loss_diagnostics.rejected_cell_time;
+    ll gap_identity_error =
+        loss_diagnostics.offered_ideal_fee - reconstructed_raw_score -
+        loss_diagnostics.rejected_ideal_fee - loss_diagnostics.accepted_initial_shape_loss -
+        loss_diagnostics.accepted_relocation_fee_loss - loss_diagnostics.movement_cost_paid;
+    int observed_count_error = loss_diagnostics.observed - M;
+    int total_count_partition_error =
+        loss_diagnostics.observed - loss_diagnostics.accepted -
+        loss_diagnostics.rejected_feasible - loss_diagnostics.rejected_unplaceable;
+    int accepted_count_error = accepted_count - loss_diagnostics.accepted;
+    int finalized_count_error =
+        loss_diagnostics.accepted - loss_diagnostics.finalized_accepted;
+    int rejected_count_error =
+        rejected_count - loss_diagnostics.rejected_feasible -
+        loss_diagnostics.rejected_unplaceable;
+    int rejected_status_count_error =
+        rejected_count - loss_diagnostics.upper_rejected - loss_diagnostics.actual_rejected -
+        loss_diagnostics.no_region_rejected - loss_diagnostics.rejected_status_mismatch;
+    int upper_count_partition_error =
+        loss_diagnostics.upper_rejected - loss_diagnostics.upper_rejected_feasible -
+        loss_diagnostics.upper_rejected_unplaceable;
+    int unplaceable_count_partition_error =
+        loss_diagnostics.rejected_unplaceable - loss_diagnostics.unplaceable_static -
+        loss_diagnostics.unplaceable_capacity - loss_diagnostics.unplaceable_fragmentation;
+    int accepted_source_count_error =
+        loss_diagnostics.accepted -
+        accumulate(loss_diagnostics.accepted_by_source.begin(),
+                   loss_diagnostics.accepted_by_source.end(), 0);
+    ll rejected_fee_partition_error =
+        loss_diagnostics.rejected_ideal_fee - loss_diagnostics.rejected_feasible_ideal_fee -
+        loss_diagnostics.rejected_unplaceable_ideal_fee;
+    ll rejected_cell_time_partition_error =
+        loss_diagnostics.rejected_cell_time - loss_diagnostics.rejected_feasible_cell_time -
+        loss_diagnostics.rejected_unplaceable_cell_time;
+    ll rejected_status_fee_error =
+        loss_diagnostics.rejected_ideal_fee - loss_diagnostics.upper_rejected_ideal_fee -
+        loss_diagnostics.actual_rejected_ideal_fee - loss_diagnostics.no_region_ideal_fee -
+        loss_diagnostics.rejected_status_mismatch_ideal_fee;
+    ll rejected_status_cell_time_error =
+        loss_diagnostics.rejected_cell_time - loss_diagnostics.upper_rejected_cell_time -
+        loss_diagnostics.actual_rejected_cell_time - loss_diagnostics.no_region_cell_time -
+        loss_diagnostics.rejected_status_mismatch_cell_time;
+    ll unplaceable_fee_partition_error =
+        loss_diagnostics.rejected_unplaceable_ideal_fee -
+        loss_diagnostics.unplaceable_static_ideal_fee -
+        loss_diagnostics.unplaceable_capacity_ideal_fee -
+        loss_diagnostics.unplaceable_fragmentation_ideal_fee;
+    ll unplaceable_cell_time_partition_error =
+        loss_diagnostics.rejected_unplaceable_cell_time -
+        loss_diagnostics.unplaceable_static_cell_time -
+        loss_diagnostics.unplaceable_capacity_cell_time -
+        loss_diagnostics.unplaceable_fragmentation_cell_time;
+    ll accepted_source_ideal_fee_error =
+        loss_diagnostics.accepted_ideal_fee -
+        accumulate(loss_diagnostics.accepted_source_ideal_fee.begin(),
+                   loss_diagnostics.accepted_source_ideal_fee.end(), 0LL);
+    ll accepted_source_initial_fee_error =
+        loss_diagnostics.accepted_initial_fee -
+        accumulate(loss_diagnostics.accepted_source_initial_fee.begin(),
+                   loss_diagnostics.accepted_source_initial_fee.end(), 0LL);
+    ll accepted_source_perimeter_error =
+        loss_diagnostics.accepted_perimeter_excess -
+        accumulate(loss_diagnostics.accepted_source_perimeter_excess.begin(),
+                   loss_diagnostics.accepted_source_perimeter_excess.end(), 0LL);
+    ll actual_candidate_fee_identity_error =
+        placement_diagnostics.actual_rejected_candidate_fee -
+        loss_diagnostics.actual_rejected_candidate_fee;
+    long long grow_and_trim_growth_funnel_error =
+        placement_diagnostics.grow_and_trim_base_candidates -
+        placement_diagnostics.grow_and_trim_growth_failures -
+        placement_diagnostics.grow_and_trim_full_growths;
+    long long grow_and_trim_completion_funnel_error =
+        placement_diagnostics.grow_and_trim_full_growths -
+        placement_diagnostics.grow_and_trim_trim_failures -
+        placement_diagnostics.grow_and_trim_duplicate_candidates -
+        placement_diagnostics.grow_and_trim_candidates;
+    long long grow_and_trim_perimeter_partition_error =
+        placement_diagnostics.grow_and_trim_full_growths -
+        placement_diagnostics.grow_and_trim_trim_failures -
+        placement_diagnostics.grow_and_trim_perimeter_improved_candidates -
+        placement_diagnostics.grow_and_trim_perimeter_equal_candidates -
+        placement_diagnostics.grow_and_trim_perimeter_worsened_candidates;
+    int grow_and_trim_source_error =
+        max(0, loss_diagnostics.accepted_grow_and_trim -
+                   loss_diagnostics.accepted_by_source[2]);
+    int pushout_status_identity_error =
+        ENABLE_NO_REGION_PUSHOUT
+            ? rescue_diagnostics.pushout_eligible - shadow_diagnostics.no_region_rejected -
+                  rescue_diagnostics.pushout_adopted
+            : 0;
+    int pushout_feasible_histogram_error =
+        rescue_diagnostics.pushout_feasible_plans -
+        accumulate(rescue_diagnostics.pushout_feasible_by_blocker_count.begin(),
+                   rescue_diagnostics.pushout_feasible_by_blocker_count.end(), 0);
+    int pushout_adopted_histogram_error =
+        rescue_diagnostics.pushout_adopted -
+        accumulate(rescue_diagnostics.pushout_adopted_by_blocker_count.begin(),
+                   rescue_diagnostics.pushout_adopted_by_blocker_count.end(), 0);
+    int pushout_funnel_identity_error =
+        rescue_diagnostics.pushout_eligible - rescue_diagnostics.pushout_area_insufficient -
+        rescue_diagnostics.pushout_no_economic_target - rescue_diagnostics.pushout_no_repair -
+        rescue_diagnostics.pushout_screen_rejected - rescue_diagnostics.pushout_adopted;
+    ll pushout_direct_identity_error =
+        rescue_diagnostics.pushout_arrival_fee - rescue_diagnostics.pushout_movement_cost -
+        rescue_diagnostics.pushout_relocation_fee_loss - rescue_diagnostics.pushout_direct_gain;
+    int pushout_helper_turn_funnel_error =
+        rescue_diagnostics.pushout_helper_considered_turns -
+        rescue_diagnostics.pushout_helper_no_eligible_target_turns -
+        rescue_diagnostics.pushout_helper_no_evidence_turns -
+        rescue_diagnostics.pushout_helper_economic_rejected_turns -
+        rescue_diagnostics.pushout_helper_seeded_turns;
+    int pushout_helper_attempt_funnel_error =
+        rescue_diagnostics.pushout_helper_attempts -
+        rescue_diagnostics.pushout_helper_missing_destination -
+        rescue_diagnostics.pushout_helper_repair_failures -
+        rescue_diagnostics.pushout_helper_validation_failures -
+        rescue_diagnostics.pushout_helper_duplicate_plans -
+        rescue_diagnostics.pushout_helper_feasible_plans;
+    int pushout_helper_missing_partition_error =
+        rescue_diagnostics.pushout_helper_missing_destination -
+        rescue_diagnostics.pushout_helper_missing_blocker_destination -
+        rescue_diagnostics.pushout_helper_missing_helper_destination;
+    int pushout_helper_feasible_funnel_error =
+        rescue_diagnostics.pushout_helper_feasible_plans -
+        rescue_diagnostics.pushout_helper_screen_rejected -
+        rescue_diagnostics.pushout_helper_adopted;
+    int pushout_helper_feasible_histogram_error =
+        rescue_diagnostics.pushout_helper_feasible_plans -
+        accumulate(rescue_diagnostics.pushout_helper_feasible_by_blocker_count.begin(),
+                   rescue_diagnostics.pushout_helper_feasible_by_blocker_count.end(), 0);
+    int pushout_helper_adopted_histogram_error =
+        rescue_diagnostics.pushout_helper_adopted -
+        accumulate(rescue_diagnostics.pushout_helper_adopted_by_blocker_count.begin(),
+                   rescue_diagnostics.pushout_helper_adopted_by_blocker_count.end(), 0);
+    ll pushout_helper_direct_identity_error =
+        rescue_diagnostics.pushout_helper_adopted_arrival_fee -
+        rescue_diagnostics.pushout_helper_adopted_movement_cost -
+        rescue_diagnostics.pushout_helper_adopted_direct_gain;
+    int pushout_helper_work_cap_error =
+        (rescue_diagnostics.pushout_helper_attempts >
+         PUSHOUT_HELPER_REPAIR_LIMIT *
+             rescue_diagnostics.pushout_helper_seeded_turns) +
+        (rescue_diagnostics.pushout_helper_surveyed_targets >
+         PUSHOUT_TARGET_REPAIR_LIMIT *
+             rescue_diagnostics.pushout_helper_surveyed_turns) +
+        (rescue_diagnostics.pushout_helper_obstruction_probes >
+         (long long)PUSHOUT_HELPER_OBSTRUCTION_PROBE_LIMIT *
+             rescue_diagnostics.pushout_helper_surveyed_targets) +
+        (rescue_diagnostics.pushout_helper_destination_anchors >
+         (long long)PUSHOUT_HELPER_DESTINATION_ANCHOR_GLOBAL_LIMIT *
+             rescue_diagnostics.pushout_helper_seeded_turns) +
+        (rescue_diagnostics.pushout_helper_beam_nodes >
+         (long long)PUSHOUT_HELPER_REPAIR_NODE_LIMIT *
+             rescue_diagnostics.pushout_helper_seeded_turns) +
+        (rescue_diagnostics.pushout_helper_feasible_plans >
+         (long long)PUSHOUT_HELPER_FEASIBLE_LIMIT *
+             rescue_diagnostics.pushout_helper_seeded_turns) +
+        (rescue_diagnostics.pushout_helper_shortlisted_choices >
+         (long long)PUSHOUT_HELPER_CHOICE_LIMIT_PER_TARGET *
+             rescue_diagnostics.pushout_helper_surveyed_targets) +
+        (rescue_diagnostics.pushout_helper_two_feasible_turns >
+         rescue_diagnostics.pushout_helper_seeded_turns) +
+        (rescue_diagnostics.pushout_helper_maximum_movers >
+         PUSHOUT_HELPER_MAX_BLOCKERS + 1);
+#ifdef AHC069_DISABLE_PUSHOUT_HELPER
+    bool any_pushout_helper_diagnostic =
+        rescue_diagnostics.pushout_helper_considered_turns != 0 ||
+        rescue_diagnostics.pushout_helper_no_eligible_target_turns != 0 ||
+        rescue_diagnostics.pushout_helper_no_evidence_turns != 0 ||
+        rescue_diagnostics.pushout_helper_economic_rejected_turns != 0 ||
+        rescue_diagnostics.pushout_helper_seeded_turns != 0 ||
+        rescue_diagnostics.pushout_helper_attempts != 0 ||
+        rescue_diagnostics.pushout_helper_missing_blocker_destination != 0 ||
+        rescue_diagnostics.pushout_helper_missing_helper_destination != 0 ||
+        rescue_diagnostics.pushout_helper_feasible_plans != 0 ||
+        rescue_diagnostics.pushout_helper_screen_rejected != 0 ||
+        rescue_diagnostics.pushout_helper_adopted != 0 ||
+        rescue_diagnostics.pushout_helper_surveyed_targets != 0 ||
+        rescue_diagnostics.pushout_helper_large_blocker_targets != 0 ||
+        rescue_diagnostics.pushout_helper_feasible_limit_exhausted != 0 ||
+        rescue_diagnostics.pushout_helper_two_feasible_turns != 0 ||
+        rescue_diagnostics.pushout_helper_obstruction_probes != 0 ||
+        rescue_diagnostics.pushout_helper_single_owner_regions != 0 ||
+        rescue_diagnostics.pushout_helper_evidenced_groups != 0 ||
+        rescue_diagnostics.pushout_helper_recorded_witnesses != 0 ||
+        rescue_diagnostics.pushout_helper_shortlisted_choices != 0 ||
+        rescue_diagnostics.pushout_helper_destination_anchors != 0 ||
+        rescue_diagnostics.pushout_helper_destination_candidates != 0 ||
+        rescue_diagnostics.pushout_helper_foreign_destination_candidates != 0 ||
+        rescue_diagnostics.pushout_helper_retained_foreign_destinations != 0 ||
+        rescue_diagnostics.pushout_helper_forced_witness_destinations != 0 ||
+        rescue_diagnostics.pushout_helper_beam_nodes != 0 ||
+        rescue_diagnostics.pushout_helper_adopted_arrival_fee != 0 ||
+        rescue_diagnostics.pushout_helper_adopted_movement_cost != 0 ||
+        rescue_diagnostics.pushout_helper_adopted_direct_gain != 0 ||
+        rescue_diagnostics.pushout_helper_phase_cpu_seconds != 0.0;
+    int pushout_helper_disabled_error = any_pushout_helper_diagnostic;
+#else
+    int pushout_helper_disabled_error = 0;
+#endif
+    ll deadline_direct_identity_error =
+        deadline_diagnostics.arrival_fee - deadline_diagnostics.movement_cost -
+        deadline_diagnostics.relocation_fee_loss - deadline_diagnostics.direct_gain;
+    int deadline_funnel_identity_error =
+        deadline_diagnostics.eligible - deadline_diagnostics.area_insufficient -
+        deadline_diagnostics.economic_upper_bound_rejected -
+        deadline_diagnostics.case_budget_skips - deadline_diagnostics.window_budget_skips -
+        deadline_diagnostics.graph_failures - deadline_diagnostics.closure_failures -
+        deadline_diagnostics.layout_failures -
+        deadline_diagnostics.rollout_generation_failures - deadline_diagnostics.screen_rejected -
+        deadline_diagnostics.confirmation_rejected - deadline_diagnostics.adopted;
+    int deadline_no_region_status_identity_error =
+        ENABLE_DEADLINE_LAYER
+            ? deadline_diagnostics.no_region_eligible -
+                  deadline_diagnostics.adopted_from_no_region -
+                  rescue_diagnostics.pushout_adopted - shadow_diagnostics.no_region_rejected
+            : 0;
+    int deadline_adopted_move_identity_error =
+        deadline_diagnostics.adopted - deadline_diagnostics.adopted_with_move;
+    int deadline_work_cap_error =
+        (deadline_diagnostics.graph_builds > DEADLINE_GRAPH_BUILD_CASE_LIMIT) +
+        (deadline_diagnostics.closure_expansions > DEADLINE_CLOSURE_EXPANSION_CASE_LIMIT) +
+        (deadline_diagnostics.layout_nodes > DEADLINE_LAYOUT_NODE_CASE_LIMIT) +
+        (deadline_diagnostics.template_probes > DEADLINE_TEMPLATE_PROBE_CASE_LIMIT) +
+        (deadline_diagnostics.growth_steps > DEADLINE_GROWTH_STEP_CASE_LIMIT) +
+        (deadline_diagnostics.connectivity_calls > DEADLINE_CONNECTIVITY_CALL_CASE_LIMIT) +
+        (deadline_diagnostics.connectivity_visits > DEADLINE_CONNECTIVITY_VISIT_CASE_LIMIT) +
+        (deadline_diagnostics.complete_plan_attempts > DEADLINE_COMPLETE_PLAN_CASE_LIMIT);
+    const SampledDlpDiagnostics &dlp_diagnostics = sampled_dlp_model.diagnostics;
+    long long sampled_dlp_request_count_error =
+        ENABLE_SAMPLED_DLP
+            ? dlp_diagnostics.generated_requests -
+                  (long long)dlp_diagnostics.rebuilds * SAMPLED_DLP_REQUEST_COUNT
+            : dlp_diagnostics.generated_requests;
+    int sampled_dlp_trigger_partition_error =
+        dlp_diagnostics.rebuilds - dlp_diagnostics.initial_rebuilds -
+        dlp_diagnostics.scheduled_rebuilds - dlp_diagnostics.boundary_rebuilds;
+    int sampled_dlp_real_call_error =
+        ENABLE_SAMPLED_DLP ? dlp_diagnostics.real_price_calls - M
+                           : dlp_diagnostics.real_price_calls;
+    long long sampled_dlp_expected_rollout_calls =
+        rescue_diagnostics.rollout_policy_steps +
+        rescue_diagnostics.normal_root_policy_steps +
+        rescue_diagnostics.root_confirmation_policy_steps +
+        deadline_diagnostics.rollout_policy_steps;
+    long long sampled_dlp_rollout_call_error =
+        ENABLE_SAMPLED_DLP
+            ? dlp_diagnostics.rollout_price_calls - sampled_dlp_expected_rollout_calls
+            : dlp_diagnostics.rollout_price_calls;
+    runtime_diagnostics.add_diagnostic(final_loss_wall_begin, final_loss_cpu_begin);
+    RuntimeSnapshot runtime = snapshot_runtime(runtime_diagnostics);
     cerr << "accepted=" << accepted_count << " rejected=" << rejected_count
+         << " deadline_enabled=" << ENABLE_DEADLINE_LAYER
+         << " deadline_eligible=" << deadline_diagnostics.eligible
+         << " deadline_no_region_eligible=" << deadline_diagnostics.no_region_eligible
+         << " deadline_noncompact_eligible=" << deadline_diagnostics.noncompact_eligible
+         << " deadline_area_insufficient=" << deadline_diagnostics.area_insufficient
+         << " deadline_economic_ub_rejected="
+         << deadline_diagnostics.economic_upper_bound_rejected
+         << " deadline_case_budget_skips=" << deadline_diagnostics.case_budget_skips
+         << " deadline_window_budget_skips=" << deadline_diagnostics.window_budget_skips
+         << " deadline_attempts=" << deadline_diagnostics.attempts
+         << " deadline_graph_builds=" << deadline_diagnostics.graph_builds
+         << " deadline_graph_failures=" << deadline_diagnostics.graph_failures
+         << " deadline_closure_failures=" << deadline_diagnostics.closure_failures
+         << " deadline_workspaces=" << deadline_diagnostics.workspaces_searched
+         << " deadline_layout_failures=" << deadline_diagnostics.layout_failures
+         << " deadline_validation_failures=" << deadline_diagnostics.validation_failures
+         << " deadline_feasible_turns=" << deadline_diagnostics.feasible_turns
+         << " deadline_feasible_plans=" << deadline_diagnostics.feasible_plans
+         << " deadline_complete_plan_attempts="
+         << deadline_diagnostics.complete_plan_attempts
+         << " deadline_zero_move_candidates_filtered="
+         << deadline_diagnostics.zero_move_candidates_filtered
+         << " deadline_direct_gate_rejected=" << deadline_diagnostics.direct_gate_rejected
+         << " deadline_rollout_generation_failures="
+         << deadline_diagnostics.rollout_generation_failures
+         << " deadline_rollout_turns=" << deadline_diagnostics.rollout_turns
+         << " deadline_screen_rejected=" << deadline_diagnostics.screen_rejected
+         << " deadline_confirmation_rejected=" << deadline_diagnostics.confirmation_rejected
+         << " deadline_confirmation_attempts=" << deadline_diagnostics.confirmation_attempts
+         << " deadline_confirmation_used=" << deadline_confirmations_used
+         << " deadline_adopted=" << deadline_diagnostics.adopted
+         << " deadline_adopted_with_move=" << deadline_diagnostics.adopted_with_move
+         << " deadline_adopted_from_no_region=" << deadline_diagnostics.adopted_from_no_region
+         << " deadline_closure_limit_exhausted="
+         << deadline_diagnostics.closure_limit_exhausted
+         << " deadline_layout_limit_exhausted="
+         << deadline_diagnostics.layout_limit_exhausted
+         << " deadline_template_limit_exhausted="
+         << deadline_diagnostics.template_limit_exhausted
+         << " deadline_growth_limit_exhausted="
+         << deadline_diagnostics.growth_limit_exhausted
+         << " deadline_connectivity_limit_exhausted="
+         << deadline_diagnostics.connectivity_limit_exhausted
+         << " deadline_complete_plan_limit_exhausted="
+         << deadline_diagnostics.complete_plan_limit_exhausted
+         << " deadline_closure_expansions=" << deadline_diagnostics.closure_expansions
+         << " deadline_closure_states=" << deadline_diagnostics.closure_states
+         << " deadline_completed_closures=" << deadline_diagnostics.completed_closures
+         << " deadline_global_closures=" << deadline_diagnostics.global_closures
+         << " deadline_layout_nodes=" << deadline_diagnostics.layout_nodes
+         << " deadline_region_candidates=" << deadline_diagnostics.region_candidates
+         << " deadline_template_probes=" << deadline_diagnostics.template_probes
+         << " deadline_growth_steps=" << deadline_diagnostics.growth_steps
+         << " deadline_connectivity_visits=" << deadline_diagnostics.connectivity_visits
+         << " deadline_connectivity_calls=" << deadline_diagnostics.connectivity_calls
+         << " deadline_rollout_policy_steps=" << deadline_diagnostics.rollout_policy_steps
+         << " deadline_moved_groups=" << deadline_diagnostics.moved_groups
+         << " deadline_moved_cells=" << deadline_diagnostics.moved_cells
+         << " deadline_arrival_fee=" << deadline_diagnostics.arrival_fee
+         << " deadline_movement_cost=" << deadline_diagnostics.movement_cost
+         << " deadline_relocation_fee_loss=" << deadline_diagnostics.relocation_fee_loss
+         << " deadline_direct_gain=" << deadline_diagnostics.direct_gain
+         << " deadline_scenario_0_future_delta="
+         << deadline_diagnostics.scenario_0_future_delta
+         << " deadline_scenario_1_future_delta="
+         << deadline_diagnostics.scenario_1_future_delta
+         << " deadline_screen_margin=" << fixed << setprecision(6)
+         << (double)deadline_diagnostics.screen_margin
+         << " deadline_cpu_ms=" << 1000.0 * deadline_diagnostics.cpu_seconds
+         << " deadline_maximum_turn_cpu_ms="
+         << 1000.0 * deadline_diagnostics.maximum_turn_cpu_seconds
+         << " deadline_partition_errors=" << deadline_diagnostics.partition_errors
+         << " deadline_prefix_connectivity_errors="
+         << deadline_diagnostics.prefix_connectivity_errors
+         << " deadline_direct_identity_errors=" << deadline_diagnostics.direct_identity_errors
+         << " deadline_direct_identity_error=" << deadline_direct_identity_error
+         << " deadline_funnel_identity_error=" << deadline_funnel_identity_error
+         << " deadline_no_region_status_identity_error="
+         << deadline_no_region_status_identity_error
+         << " deadline_adopted_move_identity_error="
+         << deadline_adopted_move_identity_error
+         << " deadline_work_cap_error=" << deadline_work_cap_error
+         << " pushout_enabled=" << ENABLE_NO_REGION_PUSHOUT
+         << " pushout_eligible=" << rescue_diagnostics.pushout_eligible
+         << " pushout_area_insufficient=" << rescue_diagnostics.pushout_area_insufficient
+         << " pushout_shadow_filtered_targets="
+         << rescue_diagnostics.pushout_shadow_filtered_targets
+         << " pushout_no_economic_target=" << rescue_diagnostics.pushout_no_economic_target
+         << " pushout_feasible_turns=" << rescue_diagnostics.pushout_feasible_turns
+         << " pushout_feasible_plans=" << rescue_diagnostics.pushout_feasible_plans
+         << " pushout_no_repair=" << rescue_diagnostics.pushout_no_repair
+         << " pushout_rollout_generation_failures="
+         << rescue_diagnostics.pushout_rollout_generation_failures
+         << " pushout_rollout_turns=" << rescue_diagnostics.pushout_rollout_turns
+         << " pushout_screen_rejected=" << rescue_diagnostics.pushout_screen_rejected
+         << " pushout_adopted=" << rescue_diagnostics.pushout_adopted
+         << " pushout_target_limit_exhausted="
+         << rescue_diagnostics.pushout_target_limit_exhausted
+         << " pushout_destination_limit_exhausted="
+         << rescue_diagnostics.pushout_destination_limit_exhausted
+         << " pushout_node_limit_exhausted="
+         << rescue_diagnostics.pushout_node_limit_exhausted
+         << " pushout_maximum_blockers=" << rescue_diagnostics.pushout_maximum_blockers
+         << " pushout_feasible_1_blocker="
+         << rescue_diagnostics.pushout_feasible_by_blocker_count[0]
+         << " pushout_feasible_2_blockers="
+         << rescue_diagnostics.pushout_feasible_by_blocker_count[1]
+         << " pushout_feasible_3_blockers="
+         << rescue_diagnostics.pushout_feasible_by_blocker_count[2]
+         << " pushout_feasible_4plus_blockers="
+         << rescue_diagnostics.pushout_feasible_by_blocker_count[3]
+         << " pushout_adopted_1_blocker="
+         << rescue_diagnostics.pushout_adopted_by_blocker_count[0]
+         << " pushout_adopted_2_blockers="
+         << rescue_diagnostics.pushout_adopted_by_blocker_count[1]
+         << " pushout_adopted_3_blockers="
+         << rescue_diagnostics.pushout_adopted_by_blocker_count[2]
+         << " pushout_adopted_4plus_blockers="
+         << rescue_diagnostics.pushout_adopted_by_blocker_count[3]
+         << " pushout_target_anchors=" << rescue_diagnostics.pushout_target_anchors
+         << " pushout_target_shortlisted=" << rescue_diagnostics.pushout_target_shortlisted
+         << " pushout_exact_targets=" << rescue_diagnostics.pushout_exact_targets
+         << " pushout_economic_targets=" << rescue_diagnostics.pushout_economic_targets
+         << " pushout_repair_attempts=" << rescue_diagnostics.pushout_repair_attempts
+         << " pushout_destination_anchors=" << rescue_diagnostics.pushout_destination_anchors
+         << " pushout_destination_candidates="
+         << rescue_diagnostics.pushout_destination_candidates
+         << " pushout_beam_nodes=" << rescue_diagnostics.pushout_beam_nodes
+         << " pushout_rollout_policy_steps=" << rescue_diagnostics.pushout_rollout_policy_steps
+         << " pushout_moved_groups=" << rescue_diagnostics.pushout_moved_groups
+         << " pushout_moved_cells=" << rescue_diagnostics.pushout_moved_cells
+         << " pushout_arrival_fee=" << rescue_diagnostics.pushout_arrival_fee
+         << " pushout_movement_cost=" << rescue_diagnostics.pushout_movement_cost
+         << " pushout_relocation_fee_loss=" << rescue_diagnostics.pushout_relocation_fee_loss
+         << " pushout_direct_gain=" << rescue_diagnostics.pushout_direct_gain
+         << " pushout_scenario_0_future_delta="
+         << rescue_diagnostics.pushout_scenario_0_future_delta
+         << " pushout_scenario_1_future_delta="
+         << rescue_diagnostics.pushout_scenario_1_future_delta
+         << " pushout_screen_margin=" << fixed << setprecision(6)
+         << (double)rescue_diagnostics.pushout_screen_margin
+         << " pushout_cpu_ms=" << 1000.0 * rescue_diagnostics.pushout_cpu_seconds
+         << " pushout_maximum_turn_cpu_ms="
+         << 1000.0 * rescue_diagnostics.pushout_maximum_turn_cpu_seconds
+         << " pushout_helper_enabled=" << ENABLE_PUSHOUT_HELPER
+         << " pushout_helper_wide_enabled=" << ENABLE_WIDE_PUSHOUT_HELPER
+         << " pushout_helper_considered_turns="
+         << rescue_diagnostics.pushout_helper_considered_turns
+         << " pushout_helper_no_eligible_target_turns="
+         << rescue_diagnostics.pushout_helper_no_eligible_target_turns
+         << " pushout_helper_no_evidence_turns="
+         << rescue_diagnostics.pushout_helper_no_evidence_turns
+         << " pushout_helper_economic_rejected_turns="
+         << rescue_diagnostics.pushout_helper_economic_rejected_turns
+         << " pushout_helper_seeded_turns="
+         << rescue_diagnostics.pushout_helper_seeded_turns
+         << " pushout_helper_attempts=" << rescue_diagnostics.pushout_helper_attempts
+         << " pushout_helper_missing_destination="
+         << rescue_diagnostics.pushout_helper_missing_destination
+         << " pushout_helper_missing_blocker_destination="
+         << rescue_diagnostics.pushout_helper_missing_blocker_destination
+         << " pushout_helper_missing_helper_destination="
+         << rescue_diagnostics.pushout_helper_missing_helper_destination
+         << " pushout_helper_repair_failures="
+         << rescue_diagnostics.pushout_helper_repair_failures
+         << " pushout_helper_validation_failures="
+         << rescue_diagnostics.pushout_helper_validation_failures
+         << " pushout_helper_duplicate_plans="
+         << rescue_diagnostics.pushout_helper_duplicate_plans
+         << " pushout_helper_feasible_plans="
+         << rescue_diagnostics.pushout_helper_feasible_plans
+         << " pushout_helper_screen_rejected="
+         << rescue_diagnostics.pushout_helper_screen_rejected
+         << " pushout_helper_adopted=" << rescue_diagnostics.pushout_helper_adopted
+         << " pushout_helper_surveyed_turns="
+         << rescue_diagnostics.pushout_helper_surveyed_turns
+         << " pushout_helper_surveyed_targets="
+         << rescue_diagnostics.pushout_helper_surveyed_targets
+         << " pushout_helper_large_blocker_targets="
+         << rescue_diagnostics.pushout_helper_large_blocker_targets
+         << " pushout_helper_probe_limit_exhausted="
+         << rescue_diagnostics.pushout_helper_probe_limit_exhausted
+         << " pushout_helper_feasible_limit_exhausted="
+         << rescue_diagnostics.pushout_helper_feasible_limit_exhausted
+         << " pushout_helper_two_feasible_turns="
+         << rescue_diagnostics.pushout_helper_two_feasible_turns
+         << " pushout_helper_maximum_movers="
+         << rescue_diagnostics.pushout_helper_maximum_movers
+         << " pushout_helper_feasible_1_blocker="
+         << rescue_diagnostics.pushout_helper_feasible_by_blocker_count[0]
+         << " pushout_helper_feasible_2_blockers="
+         << rescue_diagnostics.pushout_helper_feasible_by_blocker_count[1]
+         << " pushout_helper_feasible_3_blockers="
+         << rescue_diagnostics.pushout_helper_feasible_by_blocker_count[2]
+         << " pushout_helper_adopted_1_blocker="
+         << rescue_diagnostics.pushout_helper_adopted_by_blocker_count[0]
+         << " pushout_helper_adopted_2_blockers="
+         << rescue_diagnostics.pushout_helper_adopted_by_blocker_count[1]
+         << " pushout_helper_adopted_3_blockers="
+         << rescue_diagnostics.pushout_helper_adopted_by_blocker_count[2]
+         << " pushout_helper_obstruction_probes="
+         << rescue_diagnostics.pushout_helper_obstruction_probes
+         << " pushout_helper_single_owner_regions="
+         << rescue_diagnostics.pushout_helper_single_owner_regions
+         << " pushout_helper_overlap_cells="
+         << rescue_diagnostics.pushout_helper_overlap_cells
+         << " pushout_helper_evidenced_groups="
+         << rescue_diagnostics.pushout_helper_evidenced_groups
+         << " pushout_helper_recorded_witnesses="
+         << rescue_diagnostics.pushout_helper_recorded_witnesses
+         << " pushout_helper_shortlisted_choices="
+         << rescue_diagnostics.pushout_helper_shortlisted_choices
+         << " pushout_helper_destination_anchors="
+         << rescue_diagnostics.pushout_helper_destination_anchors
+         << " pushout_helper_destination_candidates="
+         << rescue_diagnostics.pushout_helper_destination_candidates
+         << " pushout_helper_foreign_destination_candidates="
+         << rescue_diagnostics.pushout_helper_foreign_destination_candidates
+         << " pushout_helper_retained_foreign_destinations="
+         << rescue_diagnostics.pushout_helper_retained_foreign_destinations
+         << " pushout_helper_forced_witness_destinations="
+         << rescue_diagnostics.pushout_helper_forced_witness_destinations
+         << " pushout_helper_beam_nodes="
+         << rescue_diagnostics.pushout_helper_beam_nodes
+         << " pushout_helper_selected_covered_blockers="
+         << rescue_diagnostics.pushout_helper_selected_covered_blockers
+         << " pushout_helper_selected_unlocked_regions="
+         << rescue_diagnostics.pushout_helper_selected_unlocked_regions
+         << " pushout_helper_selected_overlap_cells="
+         << rescue_diagnostics.pushout_helper_selected_overlap_cells
+         << " pushout_helper_selected_movement_cost="
+         << rescue_diagnostics.pushout_helper_selected_movement_cost
+         << " pushout_helper_selected_departure_distance="
+         << rescue_diagnostics.pushout_helper_selected_departure_distance
+         << " pushout_helper_selected_adjusted_gain="
+         << rescue_diagnostics.pushout_helper_selected_adjusted_gain
+         << " pushout_helper_feasible_blocker_uses_helper="
+         << rescue_diagnostics.pushout_helper_feasible_blocker_uses_helper
+         << " pushout_helper_feasible_helper_uses_blocker="
+         << rescue_diagnostics.pushout_helper_feasible_helper_uses_blocker
+         << " pushout_helper_feasible_bidirectional_cross_use="
+         << rescue_diagnostics.pushout_helper_feasible_bidirectional_cross_use
+         << " pushout_helper_adopted_blocker_uses_helper="
+         << rescue_diagnostics.pushout_helper_adopted_blocker_uses_helper
+         << " pushout_helper_adopted_helper_uses_blocker="
+         << rescue_diagnostics.pushout_helper_adopted_helper_uses_blocker
+         << " pushout_helper_adopted_bidirectional_cross_use="
+         << rescue_diagnostics.pushout_helper_adopted_bidirectional_cross_use
+         << " pushout_helper_adopted_moved_groups="
+         << rescue_diagnostics.pushout_helper_adopted_moved_groups
+         << " pushout_helper_adopted_moved_cells="
+         << rescue_diagnostics.pushout_helper_adopted_moved_cells
+         << " pushout_helper_adopted_arrival_fee="
+         << rescue_diagnostics.pushout_helper_adopted_arrival_fee
+         << " pushout_helper_adopted_movement_cost="
+         << rescue_diagnostics.pushout_helper_adopted_movement_cost
+         << " pushout_helper_adopted_direct_gain="
+         << rescue_diagnostics.pushout_helper_adopted_direct_gain
+         << " pushout_helper_scenario_0_future_delta="
+         << rescue_diagnostics.pushout_helper_scenario_0_future_delta
+         << " pushout_helper_scenario_1_future_delta="
+         << rescue_diagnostics.pushout_helper_scenario_1_future_delta
+         << " pushout_helper_screen_margin=" << fixed << setprecision(6)
+         << (double)rescue_diagnostics.pushout_helper_screen_margin
+         << " pushout_helper_phase_cpu_ms="
+         << 1000.0 * rescue_diagnostics.pushout_helper_phase_cpu_seconds
+         << " pushout_helper_turn_funnel_error=" << pushout_helper_turn_funnel_error
+         << " pushout_helper_attempt_funnel_error="
+         << pushout_helper_attempt_funnel_error
+         << " pushout_helper_missing_partition_error="
+         << pushout_helper_missing_partition_error
+         << " pushout_helper_feasible_funnel_error="
+         << pushout_helper_feasible_funnel_error
+         << " pushout_helper_feasible_histogram_error="
+         << pushout_helper_feasible_histogram_error
+         << " pushout_helper_adopted_histogram_error="
+         << pushout_helper_adopted_histogram_error
+         << " pushout_helper_direct_identity_error="
+         << pushout_helper_direct_identity_error
+         << " pushout_helper_work_cap_error=" << pushout_helper_work_cap_error
+         << " pushout_helper_disabled_error=" << pushout_helper_disabled_error
+         << " pushout_status_identity_error=" << pushout_status_identity_error
+         << " pushout_feasible_histogram_error=" << pushout_feasible_histogram_error
+         << " pushout_adopted_histogram_error=" << pushout_adopted_histogram_error
+         << " pushout_funnel_identity_error=" << pushout_funnel_identity_error
+         << " pushout_direct_identity_error=" << pushout_direct_identity_error
+         << " compact_rescue_feasible_turns="
+         << rescue_diagnostics.feasible_turns - rescue_diagnostics.pushout_feasible_turns
+         << " compact_rescue_feasible_plans="
+         << rescue_diagnostics.feasible_plans - rescue_diagnostics.pushout_feasible_plans
+         << " compact_rescue_successes="
+         << rescue_diagnostics.successes - rescue_diagnostics.pushout_adopted
+         << " compact_rescue_target_anchors="
+         << rescue_diagnostics.target_anchors - rescue_diagnostics.pushout_target_anchors
+         << " compact_rescue_destination_anchors="
+         << rescue_diagnostics.destination_anchors - rescue_diagnostics.pushout_destination_anchors
+         << " compact_rescue_rollout_turns="
+         << rescue_diagnostics.rollout_turns - rescue_diagnostics.pushout_rollout_turns
+         << " compact_rescue_moved_groups="
+         << rescue_diagnostics.moved_groups - rescue_diagnostics.pushout_moved_groups
+         << " compact_rescue_movement_cost="
+         << rescue_diagnostics.movement_cost - rescue_diagnostics.pushout_movement_cost
+         << " compact_rescue_immediate_gain="
+         << rescue_diagnostics.immediate_gain - rescue_diagnostics.pushout_direct_gain
          << " rescue_eligible_fallbacks=" << rescue_diagnostics.eligible_fallbacks
          << " rescue_feasible_turns=" << rescue_diagnostics.feasible_turns
          << " rescue_feasible_plans=" << rescue_diagnostics.feasible_plans
@@ -3385,6 +7800,25 @@ int main() {
          << rescue_diagnostics.root_alternative_scenario_0_future_delta
          << " root_alternative_scenario_1_future_delta="
          << rescue_diagnostics.root_alternative_scenario_1_future_delta
+         << " sampled_dlp_enabled=" << ENABLE_SAMPLED_DLP
+         << " sampled_dlp_rebuilds=" << dlp_diagnostics.rebuilds
+         << " sampled_dlp_initial_rebuilds=" << dlp_diagnostics.initial_rebuilds
+         << " sampled_dlp_scheduled_rebuilds=" << dlp_diagnostics.scheduled_rebuilds
+         << " sampled_dlp_boundary_rebuilds=" << dlp_diagnostics.boundary_rebuilds
+         << " sampled_dlp_real_price_calls=" << dlp_diagnostics.real_price_calls
+         << " sampled_dlp_rollout_price_calls=" << dlp_diagnostics.rollout_price_calls
+         << " sampled_dlp_zero_future_calls=" << dlp_diagnostics.zero_future_calls
+         << " sampled_dlp_generated_requests=" << dlp_diagnostics.generated_requests
+         << " sampled_dlp_coordinate_updates=" << dlp_diagnostics.coordinate_updates
+         << " sampled_dlp_positive_price_buckets=" << dlp_diagnostics.positive_price_buckets
+         << " sampled_dlp_sample_hash="
+         << (dlp_diagnostics.rebuilds == 0 ? 0ULL : dlp_diagnostics.sample_hash)
+         << " sampled_dlp_invalid_model_errors=" << dlp_diagnostics.invalid_model_errors
+         << " sampled_dlp_nonfinite_errors=" << dlp_diagnostics.nonfinite_errors
+         << " sampled_dlp_request_count_error=" << sampled_dlp_request_count_error
+         << " sampled_dlp_trigger_partition_error=" << sampled_dlp_trigger_partition_error
+         << " sampled_dlp_real_call_error=" << sampled_dlp_real_call_error
+         << " sampled_dlp_rollout_call_error=" << sampled_dlp_rollout_call_error
          << " shadow_considered=" << shadow_diagnostics.considered
          << " shadow_upper_rejected=" << shadow_diagnostics.upper_bound_rejected
          << " shadow_actual_rejected=" << shadow_diagnostics.actual_fee_rejected
@@ -3394,6 +7828,10 @@ int main() {
          << " placement_compact_successes=" << placement_diagnostics.compact_successes
          << " placement_extended_template_successes=" << placement_diagnostics.extended_template_successes
          << " placement_fallback_successes=" << placement_diagnostics.fallback_successes
+         << " placement_actual_rejected_candidate_perimeter_sum="
+         << placement_diagnostics.actual_rejected_candidate_perimeter
+         << " placement_actual_rejected_candidate_fee_sum="
+         << placement_diagnostics.actual_rejected_candidate_fee
          << " placement_future_fit_turns=" << placement_diagnostics.future_fit_evaluated_turns
          << " placement_future_fit_changes=" << placement_diagnostics.future_fit_changed_placements
          << " placement_incremental_changes_from_absolute=" << placement_diagnostics.incremental_changed_from_absolute
@@ -3401,8 +7839,163 @@ int main() {
          << " placement_anchors_checked=" << placement_diagnostics.anchors_checked
          << " placement_legal_compact_candidates=" << placement_diagnostics.legal_compact_candidates
          << " placement_growth_candidates=" << placement_diagnostics.connected_growth_candidates
+         << " grow_and_trim_enabled=" << ENABLE_GROW_AND_TRIM
+         << " grow_and_trim_base_candidates="
+         << placement_diagnostics.grow_and_trim_base_candidates
+         << " grow_and_trim_growth_failures="
+         << placement_diagnostics.grow_and_trim_growth_failures
+         << " grow_and_trim_full_growths=" << placement_diagnostics.grow_and_trim_full_growths
+         << " grow_and_trim_trim_failures=" << placement_diagnostics.grow_and_trim_trim_failures
+         << " grow_and_trim_duplicate_candidates="
+         << placement_diagnostics.grow_and_trim_duplicate_candidates
+         << " grow_and_trim_candidates=" << placement_diagnostics.grow_and_trim_candidates
+         << " grow_and_trim_grown_cells=" << placement_diagnostics.grow_and_trim_grown_cells
+         << " grow_and_trim_trimmed_cells=" << placement_diagnostics.grow_and_trim_trimmed_cells
+         << " grow_and_trim_perimeter_improvement="
+         << placement_diagnostics.grow_and_trim_perimeter_improvement
+         << " grow_and_trim_perimeter_improved_candidates="
+         << placement_diagnostics.grow_and_trim_perimeter_improved_candidates
+         << " grow_and_trim_perimeter_equal_candidates="
+         << placement_diagnostics.grow_and_trim_perimeter_equal_candidates
+         << " grow_and_trim_perimeter_worsened_candidates="
+         << placement_diagnostics.grow_and_trim_perimeter_worsened_candidates
+         << " grow_and_trim_shortlisted_candidates="
+         << placement_diagnostics.grow_and_trim_shortlisted_candidates
+         << " grow_and_trim_choices=" << placement_diagnostics.grow_and_trim_successes
          << " placement_shortlisted_candidates=" << placement_diagnostics.shortlisted_candidates
-         << " placement_future_fit_snapshots=" << placement_diagnostics.future_fit_snapshots << fixed << setprecision(6)
+         << " placement_future_fit_snapshots=" << placement_diagnostics.future_fit_snapshots
+         << " decomp_static_largest_component=" << static_largest_component
+         << " decomp_observed=" << loss_diagnostics.observed
+         << " decomp_accepted=" << loss_diagnostics.accepted
+         << " decomp_finalized_accepted=" << loss_diagnostics.finalized_accepted
+         << " decomp_upper_rejected=" << loss_diagnostics.upper_rejected
+         << " decomp_actual_rejected=" << loss_diagnostics.actual_rejected
+         << " decomp_no_region_rejected=" << loss_diagnostics.no_region_rejected
+         << " decomp_rejected_status_mismatch=" << loss_diagnostics.rejected_status_mismatch
+         << " decomp_rejected_feasible=" << loss_diagnostics.rejected_feasible
+         << " decomp_rejected_unplaceable=" << loss_diagnostics.rejected_unplaceable
+         << " decomp_upper_rejected_feasible=" << loss_diagnostics.upper_rejected_feasible
+         << " decomp_upper_rejected_unplaceable=" << loss_diagnostics.upper_rejected_unplaceable
+         << " decomp_unplaceable_static=" << loss_diagnostics.unplaceable_static
+         << " decomp_unplaceable_capacity=" << loss_diagnostics.unplaceable_capacity
+         << " decomp_unplaceable_fragmentation=" << loss_diagnostics.unplaceable_fragmentation
+         << " decomp_feasibility_mismatches=" << loss_diagnostics.feasibility_mismatches
+         << " decomp_accepted_status_mismatches=" << loss_diagnostics.accepted_status_mismatches
+         << " decomp_accepted_plan_mismatches=" << loss_diagnostics.accepted_plan_mismatches
+         << " decomp_accepted_source_mismatches=" << loss_diagnostics.accepted_source_mismatches
+         << " decomp_rejected_move_plans=" << loss_diagnostics.rejected_move_plans
+         << " decomp_offered_ideal_fee=" << loss_diagnostics.offered_ideal_fee
+         << " decomp_offered_cell_time=" << loss_diagnostics.offered_cell_time
+         << " decomp_accepted_ideal_fee=" << loss_diagnostics.accepted_ideal_fee
+         << " decomp_accepted_initial_fee=" << loss_diagnostics.accepted_initial_fee
+         << " decomp_accepted_final_fee=" << loss_diagnostics.accepted_final_fee
+         << " decomp_accepted_initial_shape_loss=" << loss_diagnostics.accepted_initial_shape_loss
+         << " decomp_accepted_relocation_fee_loss=" << loss_diagnostics.accepted_relocation_fee_loss
+         << " decomp_accepted_cell_time=" << loss_diagnostics.accepted_cell_time
+         << " decomp_movement_cost=" << loss_diagnostics.movement_cost_paid
+         << " decomp_reconstructed_raw_score=" << reconstructed_raw_score
+         << " decomp_reconstructed_absolute_score=" << reconstructed_absolute_score
+         << " decomp_rejected_ideal_fee=" << loss_diagnostics.rejected_ideal_fee
+         << " decomp_rejected_cell_time=" << loss_diagnostics.rejected_cell_time
+         << " decomp_upper_rejected_ideal_fee=" << loss_diagnostics.upper_rejected_ideal_fee
+         << " decomp_upper_rejected_cell_time=" << loss_diagnostics.upper_rejected_cell_time
+         << " decomp_actual_rejected_ideal_fee=" << loss_diagnostics.actual_rejected_ideal_fee
+         << " decomp_actual_rejected_cell_time=" << loss_diagnostics.actual_rejected_cell_time
+         << " decomp_actual_rejected_candidate_fee=" << loss_diagnostics.actual_rejected_candidate_fee
+         << " decomp_actual_rejected_geometry_loss=" << loss_diagnostics.actual_rejected_geometry_loss
+         << " decomp_no_region_ideal_fee=" << loss_diagnostics.no_region_ideal_fee
+         << " decomp_no_region_cell_time=" << loss_diagnostics.no_region_cell_time
+         << " decomp_rejected_status_mismatch_ideal_fee="
+         << loss_diagnostics.rejected_status_mismatch_ideal_fee
+         << " decomp_rejected_status_mismatch_cell_time="
+         << loss_diagnostics.rejected_status_mismatch_cell_time
+         << " decomp_rejected_feasible_ideal_fee=" << loss_diagnostics.rejected_feasible_ideal_fee
+         << " decomp_rejected_feasible_cell_time=" << loss_diagnostics.rejected_feasible_cell_time
+         << " decomp_rejected_unplaceable_ideal_fee=" << loss_diagnostics.rejected_unplaceable_ideal_fee
+         << " decomp_rejected_unplaceable_cell_time=" << loss_diagnostics.rejected_unplaceable_cell_time
+         << " decomp_unplaceable_static_ideal_fee=" << loss_diagnostics.unplaceable_static_ideal_fee
+         << " decomp_unplaceable_static_cell_time=" << loss_diagnostics.unplaceable_static_cell_time
+         << " decomp_unplaceable_capacity_ideal_fee=" << loss_diagnostics.unplaceable_capacity_ideal_fee
+         << " decomp_unplaceable_capacity_cell_time=" << loss_diagnostics.unplaceable_capacity_cell_time
+         << " decomp_unplaceable_fragmentation_ideal_fee="
+         << loss_diagnostics.unplaceable_fragmentation_ideal_fee
+         << " decomp_unplaceable_fragmentation_cell_time="
+         << loss_diagnostics.unplaceable_fragmentation_cell_time
+         << " decomp_accepted_minimum_count=" << loss_diagnostics.accepted_by_source[0]
+         << " decomp_accepted_extended_count=" << loss_diagnostics.accepted_by_source[1]
+         << " decomp_accepted_growth_count=" << loss_diagnostics.accepted_by_source[2]
+         << " decomp_accepted_grow_and_trim_count=" << loss_diagnostics.accepted_grow_and_trim
+         << " decomp_accepted_unclassified_count=" << loss_diagnostics.accepted_by_source[3]
+         << " decomp_accepted_minimum_ideal_fee=" << loss_diagnostics.accepted_source_ideal_fee[0]
+         << " decomp_accepted_extended_ideal_fee=" << loss_diagnostics.accepted_source_ideal_fee[1]
+         << " decomp_accepted_growth_ideal_fee=" << loss_diagnostics.accepted_source_ideal_fee[2]
+         << " decomp_accepted_grow_and_trim_ideal_fee="
+         << loss_diagnostics.accepted_grow_and_trim_ideal_fee
+         << " decomp_accepted_unclassified_ideal_fee="
+         << loss_diagnostics.accepted_source_ideal_fee[3]
+         << " decomp_accepted_minimum_initial_fee=" << loss_diagnostics.accepted_source_initial_fee[0]
+         << " decomp_accepted_extended_initial_fee=" << loss_diagnostics.accepted_source_initial_fee[1]
+         << " decomp_accepted_growth_initial_fee=" << loss_diagnostics.accepted_source_initial_fee[2]
+         << " decomp_accepted_grow_and_trim_initial_fee="
+         << loss_diagnostics.accepted_grow_and_trim_initial_fee
+         << " decomp_accepted_unclassified_initial_fee="
+         << loss_diagnostics.accepted_source_initial_fee[3]
+         << " decomp_accepted_perimeter_excess=" << loss_diagnostics.accepted_perimeter_excess
+         << " decomp_accepted_decision_fee_error="
+         << loss_diagnostics.accepted_decision_fee_error
+         << " decomp_accepted_decision_perimeter_error="
+         << loss_diagnostics.accepted_decision_perimeter_error
+         << " decomp_accepted_minimum_perimeter_excess="
+         << loss_diagnostics.accepted_source_perimeter_excess[0]
+         << " decomp_accepted_extended_perimeter_excess="
+         << loss_diagnostics.accepted_source_perimeter_excess[1]
+         << " decomp_accepted_growth_perimeter_excess="
+         << loss_diagnostics.accepted_source_perimeter_excess[2]
+         << " decomp_accepted_grow_and_trim_perimeter_excess="
+         << loss_diagnostics.accepted_grow_and_trim_perimeter_excess
+         << " decomp_accepted_unclassified_perimeter_excess="
+         << loss_diagnostics.accepted_source_perimeter_excess[3]
+         << " decomp_accepted_free_cells_sum=" << loss_diagnostics.accepted_free_cells_sum
+         << " decomp_rejected_feasible_free_cells_sum="
+         << loss_diagnostics.rejected_feasible_free_cells_sum
+         << " decomp_rejected_unplaceable_free_cells_sum="
+         << loss_diagnostics.rejected_unplaceable_free_cells_sum
+         << " decomp_offered_identity_error=" << offered_identity_error
+         << " decomp_cell_time_identity_error=" << cell_time_identity_error
+         << " decomp_accepted_initial_identity_error=" << accepted_initial_identity_error
+         << " decomp_accepted_final_identity_error=" << accepted_final_identity_error
+         << " decomp_gap_identity_error=" << gap_identity_error
+         << " decomp_observed_count_error=" << observed_count_error
+         << " decomp_total_count_partition_error=" << total_count_partition_error
+         << " decomp_accepted_count_error=" << accepted_count_error
+         << " decomp_finalized_count_error=" << finalized_count_error
+         << " decomp_rejected_count_error=" << rejected_count_error
+         << " decomp_rejected_status_count_error=" << rejected_status_count_error
+         << " decomp_upper_count_partition_error=" << upper_count_partition_error
+         << " decomp_unplaceable_count_partition_error=" << unplaceable_count_partition_error
+         << " decomp_accepted_source_count_error=" << accepted_source_count_error
+         << " decomp_rejected_fee_partition_error=" << rejected_fee_partition_error
+         << " decomp_rejected_cell_time_partition_error="
+         << rejected_cell_time_partition_error
+         << " decomp_rejected_status_fee_error=" << rejected_status_fee_error
+         << " decomp_rejected_status_cell_time_error=" << rejected_status_cell_time_error
+         << " decomp_unplaceable_fee_partition_error=" << unplaceable_fee_partition_error
+         << " decomp_unplaceable_cell_time_partition_error="
+         << unplaceable_cell_time_partition_error
+         << " decomp_accepted_source_ideal_fee_error=" << accepted_source_ideal_fee_error
+         << " decomp_accepted_source_initial_fee_error=" << accepted_source_initial_fee_error
+         << " decomp_accepted_source_perimeter_error=" << accepted_source_perimeter_error
+         << " decomp_actual_candidate_fee_identity_error="
+         << actual_candidate_fee_identity_error
+         << " grow_and_trim_growth_funnel_error=" << grow_and_trim_growth_funnel_error
+         << " grow_and_trim_completion_funnel_error=" << grow_and_trim_completion_funnel_error
+         << " grow_and_trim_perimeter_partition_error=" << grow_and_trim_perimeter_partition_error
+         << " grow_and_trim_source_error=" << grow_and_trim_source_error
+         << fixed << setprecision(6)
+         << " decomp_accepted_opportunity=" << loss_diagnostics.accepted_opportunity_cost
+         << " decomp_upper_rejected_opportunity=" << loss_diagnostics.upper_rejected_opportunity_cost
+         << " decomp_actual_rejected_opportunity=" << loss_diagnostics.actual_rejected_opportunity_cost
+         << " decomp_no_region_opportunity=" << loss_diagnostics.no_region_opportunity_cost
          << " rescue_rollout_adopted_direct_gain=" << rescue_diagnostics.rollout_adopted_direct_gain
          << " rescue_rollout_adopted_future_mean=" << rescue_diagnostics.rollout_adopted_future_mean
          << " rescue_rollout_adopted_margin=" << rescue_diagnostics.rollout_adopted_margin
@@ -3429,8 +8022,27 @@ int main() {
          << " shadow_mean_rejected_fraction=" << mean_rejected_fraction
          << " shadow_max_rejected_fraction=" << shadow_diagnostics.maximum_rejected_fraction
          << " shadow_priced_buckets=" << shadow_diagnostics.priced_buckets
+         << " sampled_dlp_dual_objective_sum=" << dlp_diagnostics.dual_objective_sum
+         << " sampled_dlp_capacity_sum=" << dlp_diagnostics.capacity_sum
+         << " sampled_dlp_offered_load_sum=" << dlp_diagnostics.offered_load_sum
+         << " sampled_dlp_opportunity_sum=" << dlp_diagnostics.opportunity_cost_sum
+         << " sampled_dlp_maximum_price=" << dlp_diagnostics.maximum_price
+         << " sampled_dlp_rebuild_cpu_ms=" << dlp_diagnostics.rebuild_cpu_ms
+         << " sampled_dlp_maximum_rebuild_cpu_ms="
+         << dlp_diagnostics.maximum_rebuild_cpu_ms
          << " model_expected_p=" << density_model.expected_group_size
-         << " elapsed=" << setprecision(3) << timer.elapsed() << '\n';
+         << " timing_process_cpu_ms=" << runtime.process_cpu_ms
+         << " timing_solver_cpu_ms=" << runtime.solver_cpu_ms
+         << " timing_diagnostic_cpu_ms=" << runtime.diagnostic_cpu_ms
+         << " timing_solver_wall_ms=" << runtime.solver_wall_ms
+         << " timing_diagnostic_wall_ms=" << runtime.diagnostic_wall_ms
+         << " timing_input_wall_ms=" << runtime.input_wall_ms
+         << " timing_output_wall_ms=" << runtime.output_wall_ms
+         << " timing_protocol_wall_ms=" << runtime.protocol_wall_ms
+         << " timing_unaccounted_wall_ms=" << runtime.unaccounted_wall_ms
+         << " timing_preprocess_wall_ms=" << runtime.preprocess_wall_ms
+         << " timing_max_solver_turn_wall_ms=" << runtime.maximum_solver_turn_wall_ms
+         << " elapsed=" << setprecision(3) << runtime.protocol_wall_ms / 1000.0 << '\n';
 
     return 0;
 }
