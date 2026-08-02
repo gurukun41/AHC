@@ -1,4 +1,20 @@
 #include <bits/stdc++.h>
+
+/*
+ * AHC069 解法の全体像
+ *
+ * 1. これまでに観測した滞在時間から、テストケース固有の分布パラメータ theta を推定する。
+ * 2. sampled DLP で未来256組を決定的に生成し、16個の時間帯ごとのセル価格を求める。
+ * 3. 到着組を置いたときに失う未来価値（機会損失）と、今回得る料金を比較して入場を判定する。
+ * 4. 配置候補は矩形テンプレート、連結成長、grow-and-trimから作り、
+ *    退去時刻の近さと未来に残る空き形状で順位付けする。
+ * 5. 通常配置が悪い、または断片化で置けない場合だけ、既存組の再配置を検討する。
+ * 6. 再配置候補は短い共通乱数rolloutで通常案と比べ、改善が確認できた場合だけ採用する。
+ *
+ * コメント中の「root action」は、現在ターンで比較する行動候補
+ * （通常案、再配置案、通常配置の次点案）を指す。
+ */
+
 using namespace std;
 using ll = long long;
 using ld = long double;
@@ -30,6 +46,8 @@ bool inside(int x, int y, int h, int w) { return 0 <= x && x < h && 0 <= y && y 
 
 using Cell = pair<int, int>;
 
+// 対話入出力の待機時間を除いて、解法本体に使った時間を測る。
+// スコア計算には一切使わず、最後のstderr診断にのみ出力する。
 struct RuntimeDiagnostics {
     using WallClock = chrono::steady_clock;
 
@@ -115,29 +133,19 @@ RuntimeSnapshot snapshot_runtime(const RuntimeDiagnostics &diagnostics) {
     return result;
 }
 
+// ---------- 未来分布・shadow price ----------
 constexpr ll ARRIVAL_TIME_HORIZON = 100000;
 constexpr int TIME_BUCKET_COUNT = 64;
 constexpr int SAMPLED_DLP_BUCKET_COUNT = 16;
 constexpr int SAMPLED_DLP_REQUEST_COUNT = 256;
 constexpr int SAMPLED_DLP_COORDINATE_SWEEPS = 8;
 constexpr long double SAMPLED_DLP_PRICE_QUANTIZATION = 1000000000.0L;
-constexpr int PREDICTIVE_DP_BUCKET_COUNT = 8;
-constexpr int PREDICTIVE_DP_CAPACITY_LEVELS = 65535;
-constexpr int PREDICTIVE_DP_FRONTIER_LIMIT = 512;
-constexpr int PREDICTIVE_DP_BOX_TABLE_SIZE = 2048;
-constexpr array<int, PREDICTIVE_DP_BUCKET_COUNT + 1> PREDICTIVE_DP_REFERENCE_CUTS = {
-    0, 1, 2, 3, 4, 6, 8, 12, 16,
-};
-static_assert(PREDICTIVE_DP_CAPACITY_LEVELS == numeric_limits<uint16_t>::max());
-static_assert(PREDICTIVE_DP_BUCKET_COUNT == 8);
-static_assert((PREDICTIVE_DP_BOX_TABLE_SIZE &
-               (PREDICTIVE_DP_BOX_TABLE_SIZE - 1)) == 0);
-static_assert(PREDICTIVE_DP_BOX_TABLE_SIZE >=
-              4 * PREDICTIVE_DP_FRONTIER_LIMIT);
 constexpr int THETA_MIN = 2000;
 constexpr int THETA_MAX = 8000;
 constexpr int THETA_STEP = 100;
 constexpr int THETA_QUADRATURE_STEPS = 48;
+
+// ---------- 通常配置 ----------
 constexpr int COMPACT_PERIMETER_MARGIN = 4;
 constexpr int PLACEMENT_GLOBAL_SHORTLIST = 3;
 constexpr int PLACEMENT_SHORTLIST_LIMIT = 6;
@@ -146,9 +154,11 @@ constexpr int GROW_AND_TRIM_EXTRA_CELLS = 8;
 constexpr int GROW_AND_TRIM_CANDIDATE_LIMIT = 8;
 constexpr int FUTURE_FIT_SNAPSHOT_COUNT = 3;
 constexpr array<int, 8> FUTURE_FIT_SIDES = {2, 3, 4, 5, 6, 8, 10, 12};
-// Every minimum-perimeter target is cheap-scanned.  Exact blocker sets are
-// recovered only for the union of two shortlists, then repaired in economic
-// upper-bound order.  These are work limits, not limits on blocker count.
+
+// ---------- 受入済み配置を整えるCompact rescue ----------
+// 最小周長テンプレートの全アンカーを安価に走査し、「衝突セル数」と
+// 「概算移動費」の2基準で上位だけを残す。その後に正確な衝突組を復元する。
+// 以下は探索量の上限であり、同時に動かせる組数の上限ではない。
 constexpr int RESCUE_TARGET_SHORTLIST_PER_METRIC = 160;
 constexpr int RESCUE_TARGET_REPAIR_LIMIT = 8;
 constexpr int RESCUE_DESTINATION_ANCHOR_LIMIT = 4096;
@@ -158,9 +168,10 @@ constexpr int RESCUE_DESTINATION_LIMIT = 10;
 constexpr int RESCUE_BEAM_WIDTH = 32;
 constexpr int RESCUE_REPAIR_NODE_LIMIT = 2048;
 constexpr int RESCUE_ROLLOUT_CANDIDATE_LIMIT = 2;
-// NoRegion is far more frequent than Accepted compact rescue.  Use the same
-// unrestricted-blocker search with smaller deterministic work caps so the
-// added repair path remains viable under the contest time limit.
+
+// ---------- 断片化で置けない到着を救うNoRegion Push-out ----------
+// NoRegionはCompact rescueより発生しやすいため、同じ探索を小さい上限で回す。
+// 面積不足は再配置では直せないので、この探索の対象にはしない。
 constexpr int PUSHOUT_TARGET_SHORTLIST_PER_METRIC = 96;
 constexpr int PUSHOUT_TARGET_REPAIR_LIMIT = 4;
 constexpr int PUSHOUT_DESTINATION_ANCHOR_LIMIT = 2048;
@@ -168,39 +179,17 @@ constexpr int PUSHOUT_DESTINATION_ANCHOR_GLOBAL_LIMIT = 16000;
 constexpr int PUSHOUT_DESTINATION_LEGAL_LIMIT = 40;
 constexpr int PUSHOUT_DESTINATION_LIMIT = 8;
 constexpr int PUSHOUT_REPAIR_NODE_LIMIT = 1024;
-// Deadline-layer reconstruction has no semantic limit on the number of moved
-// groups.  Every limit below counts deterministic work instead; an arbitrarily
-// deep closure remains eligible when its required work fits these budgets.
-constexpr int DEADLINE_GRAPH_BUILD_CASE_LIMIT = 8;
-constexpr int DEADLINE_WINDOW_ATTEMPT_LIMIT = 1;
-constexpr int DEADLINE_CLOSURE_EXPANSION_TURN_LIMIT = 64;
-constexpr int DEADLINE_CLOSURE_EXPANSION_CASE_LIMIT = 256;
-constexpr int DEADLINE_CLOSURE_KEEP_LIMIT = 2;
-constexpr int DEADLINE_CORE_ROOT_LIMIT = 2;
-constexpr int DEADLINE_LAYOUT_BEAM_WIDTH = 6;
-constexpr int DEADLINE_REGION_CANDIDATE_LIMIT = 3;
-constexpr int DEADLINE_LAYOUT_NODE_WORKSPACE_LIMIT = 384;
-constexpr int DEADLINE_LAYOUT_NODE_TURN_LIMIT = 768;
-constexpr int DEADLINE_LAYOUT_NODE_CASE_LIMIT = 3072;
-constexpr int DEADLINE_TEMPLATE_PROBE_TURN_LIMIT = 4096;
-constexpr int DEADLINE_TEMPLATE_PROBE_CASE_LIMIT = 16384;
-constexpr int DEADLINE_GROWTH_STEP_TURN_LIMIT = 1024;
-constexpr int DEADLINE_GROWTH_STEP_CASE_LIMIT = 4096;
-constexpr int DEADLINE_CONNECTIVITY_CALL_TURN_LIMIT = 512;
-constexpr int DEADLINE_CONNECTIVITY_CALL_CASE_LIMIT = 2048;
-constexpr int DEADLINE_CONNECTIVITY_VISIT_TURN_LIMIT = 750000;
-constexpr int DEADLINE_CONNECTIVITY_VISIT_CASE_LIMIT = 3000000;
-constexpr int DEADLINE_COMPLETE_PLAN_TURN_LIMIT = 2;
-constexpr int DEADLINE_COMPLETE_PLAN_CASE_LIMIT = 16;
-constexpr int DEADLINE_ROLLOUT_CANDIDATE_LIMIT = 2;
-constexpr int DEADLINE_CONFIRMATION_CASE_LIMIT = 1;
+
+// ---------- root actionを比較する未来rollout ----------
+// screenは2シナリオ×4到着、confirmationは独立な8シナリオ×12到着を使う。
 constexpr int ROOT_SCREEN_SCENARIO_COUNT = 2;
 constexpr int ROOT_SCREEN_ROLLOUT_LENGTH = 4;
 constexpr int ROOT_CONFIRM_SCENARIO_COUNT = 8;
 constexpr int ROOT_CONFIRM_ROLLOUT_LENGTH = 12;
 constexpr int ROOT_CONFIRMATION_TURN_LIMIT = 4;
 constexpr int ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT = 2;
-constexpr bool ENABLE_DEADLINE_LAYER = false;
+
+// 比較実験用のコンパイルスイッチ。通常提出では全機能を有効にする。
 #ifdef AHC069_DISABLE_NO_REGION_PUSHOUT
 constexpr bool ENABLE_NO_REGION_PUSHOUT = false;
 #else
@@ -216,11 +205,6 @@ constexpr bool ENABLE_SAMPLED_DLP = false;
 #else
 constexpr bool ENABLE_SAMPLED_DLP = true;
 #endif
-#ifdef AHC069_DISABLE_PREDICTIVE_DP
-constexpr bool ENABLE_PREDICTIVE_DP = false;
-#else
-constexpr bool ENABLE_PREDICTIVE_DP = ENABLE_SAMPLED_DLP;
-#endif
 #ifdef AHC069_PROTECTED_ONLY
 constexpr bool ROOT_PROTECTED_ONLY = true;
 #else
@@ -228,8 +212,7 @@ constexpr bool ROOT_PROTECTED_ONLY = false;
 #endif
 constexpr int ROOT_SCREEN_MAX_ACTIONS =
     1 + RESCUE_ROLLOUT_CANDIDATE_LIMIT + ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT;
-// Compatibility aliases keep the existing screen implementation intact while
-// the root driver is split into screen and confirmation stages.
+// screen用の既存関数ではRescueという名前を使うため、同じ値を別名で参照する。
 constexpr int RESCUE_ROLLOUT_SCENARIO_COUNT = ROOT_SCREEN_SCENARIO_COUNT;
 constexpr int RESCUE_ROLLOUT_LENGTH = ROOT_SCREEN_ROLLOUT_LENGTH;
 constexpr int ROOT_ROLLOUT_MAX_ACTIONS = ROOT_SCREEN_MAX_ACTIONS;
@@ -237,6 +220,7 @@ constexpr uint64_t ROOT_ROLLOUT_SEQUENCE_BLOCK_SIZE = 1000003ULL;
 constexpr int ROOT_ROLLOUT_SEQUENCE_BLOCKS_PER_BATCH = ROOT_CONFIRM_SCENARIO_COUNT / 2;
 constexpr int BOARD_MASK_WORDS = (50 * 50 + 63) / 64;
 
+// テンプレートは「主矩形」と、面積の端数を埋める「追加の1行または1列」で表す。
 struct Rect {
     int x;
     int y;
@@ -252,6 +236,9 @@ struct Shape {
     int perimeter;
 };
 
+// 受入済みの1組の状態。
+// max_perimeterは、その組がこれまで経験した最大周長である。
+// 料金は最大周長で決まり、一度悪化した料金は後で整形しても戻らないため履歴を保持する。
 struct GroupState {
     bool active = false;
     ll s = 0;
@@ -262,12 +249,15 @@ struct GroupState {
     vector<Cell> cells;
 };
 
+// 既存組1つの移動先。全MovePlanの旧領域を消してから、新領域をまとめて配置する。
 struct MovePlan {
     int id;
     vector<Cell> cells;
     int perimeter;
 };
 
+// 1ターンに出力する行動。movesは既存組の再配置、arrivalは新規組の配置である。
+// immediate_gainは再配置候補の「到着料金 - 移動費 - 既存料金の悪化」を保持する。
 struct TurnPlan {
     vector<MovePlan> moves;
     optional<vector<Cell>> arrival;
@@ -275,9 +265,8 @@ struct TurnPlan {
     ll immediate_gain = numeric_limits<ll>::min();
 };
 
-// P cells arranged as a rectangle plus, if necessary, one partial row/column.
-// The full ladder is used when an already-admitted group is repaired: any
-// template preserving its confirmed fee is a valid destination.
+// 面積pを「矩形＋端数の1行/1列」で表せる全テンプレートを列挙する。
+// 既存組の移動先では、確定済み料金を悪化させない周長までの全形状を利用する。
 vector<Shape> make_template_shapes(int p, int n) {
     vector<Shape> shapes;
 
@@ -298,7 +287,7 @@ vector<Shape> make_template_shapes(int p, int n) {
 
         int perimeter = 2 * (full + width) + 2;
 
-        // full x width rectangle + a partial row above/below it.
+        // full×widthの主矩形に、端数行を上または下から付ける。
         for (int below = 0; below < 2; below++) {
             for (int right = 0; right < 2; right++) {
                 Rect main_rect{below ? 0 : 1, 0, full, width};
@@ -307,7 +296,7 @@ vector<Shape> make_template_shapes(int p, int n) {
             }
         }
 
-        // Transposes of the above: a partial column to the left/right.
+        // 上の転置形。端数列を左または右から付ける。
         for (int right = 0; right < 2; right++) {
             for (int bottom = 0; bottom < 2; bottom++) {
                 Rect main_rect{0, right ? 0 : 1, width, full};
@@ -340,6 +329,7 @@ vector<Shape> make_template_shapes(int p, int n) {
     return shapes;
 }
 
+// テンプレートを左上(base_x, base_y)へ置き、実際のセル列へ展開する。
 vector<Cell> materialize_shape(const Shape &shape, int base_x, int base_y, int p) {
     vector<Cell> region;
     region.reserve(p);
@@ -355,6 +345,8 @@ vector<Cell> materialize_shape(const Shape &shape, int base_x, int base_y, int p
     return region;
 }
 
+// 池または既存組で使用中のセルを1とした二次元累積和。
+// テンプレートの合法性を矩形2個の和としてO(1)で調べるために使う。
 vector<vi> make_blocked_prefix(const vs &park, const vvi &owner) {
     int n = park.size();
     vector<vi> prefix(n + 1, vi(n + 1));
@@ -372,19 +364,14 @@ int rectangle_sum(const vector<vi> &prefix, int x, int y, int h, int w) {
     return prefix[x + h][y + w] - prefix[x][y + w] - prefix[x + h][y] + prefix[x][y];
 }
 
-ll rectangle_sum(const vector<vector<ll>> &prefix, int x, int y, int h, int w) {
-    if (h == 0 || w == 0) return 0;
-    return prefix[x + h][y + w] - prefix[x][y + w] - prefix[x + h][y] + prefix[x][y];
-}
-
 long double rectangle_sum(const vector<vector<long double>> &prefix, int x, int y, int h, int w) {
     if (h == 0 || w == 0) return 0.0L;
     return prefix[x + h][y + w] - prefix[x][y + w] - prefix[x + h][y] + prefix[x][y];
 }
 
-// If no compact template fits, inspect every free connected component.  The
-// first p vertices popped by BFS are themselves connected, so this finds a
-// legal region whenever a free component of size at least p exists.
+// テンプレートが1つも置けない場合の完全なフォールバック。
+// 各空き連結成分をBFSし、先頭pセルを取る。BFSのprefixは常に連結なので、
+// pセル以上の空き連結成分が存在すれば必ず合法領域を返せる。
 optional<vector<Cell>> find_connected_region(const vs &park, const vvi &owner, int p) {
     int n = park.size();
     vvb visited(n, vb(n));
@@ -452,6 +439,9 @@ int calc_perimeter(const vector<Cell> &cells, int n) {
 
 using i128 = __int128_t;
 
+// 公式の料金 round(4*V*sqrt(P)/周長) を整数演算で確定する。
+// sqrtによる近似値を初期値にし、丸め境界を128bit整数で前後補正することで
+// 浮動小数点誤差による1円のずれを防ぐ。
 ll round_payment(ll v, int p, int perimeter) {
     if (perimeter <= 0) return 0;
 
@@ -472,6 +462,7 @@ ll round_payment(ll v, int p, int perimeter) {
     return payment;
 }
 
+// 1回の再配置で支払う費用 round(R*V)。Rは入力時に1000倍の整数へ変換済み。
 ll move_cost(ll v, int r_milli) {
     const i128 numerator = (i128)2 * v * r_milli + 1000;
     return max((ll)(numerator / 2000), 1LL);
@@ -489,9 +480,8 @@ void place_cells(vvi &owner, const vector<Cell> &cells, int id) {
     }
 }
 
-// Read-only geometry observation used only after the turn action is fixed.
-// Keeping it out of the placement path makes the loss diagnosis independent
-// of the candidate generator that it is intended to audit.
+// 行動確定後にだけ空き最大連結成分を測る診断関数。
+// 配置候補の生成には使わないため、診断対象のアルゴリズムへ影響しない。
 __attribute__((noinline)) int largest_free_component(const vs &park, const vvi &owner) {
     int n = park.size();
     vector<char> visited(n * n, false);
@@ -538,15 +528,16 @@ enum class PlacementSource {
     GrowAndTrim,
 };
 
+// 通常配置がどの候補生成器から選ばれたかを、診断用に保持する。
 struct NormalPlacementChoice {
     vector<Cell> cells;
     int perimeter;
     PlacementSource source;
 };
 
-// The hidden duration scale is shared by all groups in one test case.  Besides
-// observed durations, the likelihood below uses the fact that every unseen
-// group must start after the current order statistic S.
+// 1ケース内で共有される未知の滞在時間スケールthetaをベイズ推定する。
+// 観測済みの滞在時間だけでなく、「未到着の全組は現在時刻Sより後に開始する」
+// という打ち切り情報も尤度へ入れる。thetaは2000..8000の61点で離散化する。
 struct ThetaEstimator {
     static constexpr int PARTICLE_COUNT = (THETA_MAX - THETA_MIN) / THETA_STEP + 1;
 
@@ -571,9 +562,9 @@ struct ThetaEstimator {
         const long double horizon = ARRIVAL_TIME_HORIZON;
         const long double last_start_without_duration = horizon - 1.0L;
         const long double upper = (last_start_without_duration - current_s) / theta;
-        // y = 1-exp(-x) absorbs the exponential measure.  Uniform steps in x
-        // are inaccurate near S=0 because the integration range can be about
-        // 50 while almost all probability mass is near x=0.
+        // y=1-exp(-x)へ変数変換し、指数分布の重みを積分幅へ吸収する。
+        // xを等間隔にするとSが小さいときだけ積分区間が極端に長くなり、
+        // 確率質量が集中するx=0付近の精度が落ちるため、この形を使う。
         const long double y_upper = -expm1l(-upper);
         const long double dy = y_upper / THETA_QUADRATURE_STEPS;
         long double integral = 0.0L;
@@ -615,10 +606,9 @@ struct ThetaEstimator {
     }
 
     long double estimate(ll current_s, int remaining_groups) const {
-        // Keep the legacy v3/v4 accumulation path byte-compatible.  Computing
-        // the particles in make_posterior() and reducing them in a second
-        // function changed the generated floating-point reduction (including
-        // FMA use), and tiny theta differences could change placement ties.
+        // make_posterior()と式が重複しているが、意図的に統合しない。
+        // 関数を分けると加算順やFMAの有無が変わり、thetaの微小差が配置の同点判定を
+        // 変えたことがあるため、提出挙動を固定できるこの計算順を保つ。
         array<long double, PARTICLE_COUNT> log_weights{};
         long double max_log_weight = -numeric_limits<long double>::infinity();
 
@@ -648,8 +638,7 @@ struct ThetaEstimator {
         PosteriorParticles posterior = make_posterior(current_s, remaining_groups);
         long double target = clamp(probability, 0.0L, 1.0L) * posterior.weight_sum;
         long double cumulative = 0.0L;
-        // The posterior itself is the fixed 61-point theta grid, so use its
-        // left-continuous inverse CDF rather than interpolating new particles.
+        // 事後分布そのものが61点の離散分布なので、点間補間はせず左連続の逆CDFを使う。
         for (int k = 0; k < PARTICLE_COUNT; k++) {
             cumulative += posterior.weights[k];
             if (cumulative >= target) return THETA_MIN + THETA_STEP * k;
@@ -659,7 +648,7 @@ struct ThetaEstimator {
 };
 
 long double inverse_standard_normal(long double probability) {
-    // Peter J. Acklam's rational approximation.
+    // Peter J. Acklamの有理関数近似による標準正規分布の逆CDF。
     static constexpr array<long double, 6> A = {
         -3.969683028665376e+01L, 2.209460984245205e+02L,  -2.759285104469687e+02L,
         1.383577518672690e+02L,  -3.066479806614716e+01L, 2.506628277459239e+00L,
@@ -699,6 +688,8 @@ long double inverse_standard_normal(long double probability) {
            (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0L);
 }
 
+// sampled DLPを無効化した比較ビルドで使う旧shadow-priceモデル。
+// 通常提出ではSampledDlpShadowModelを使用するが、A/B比較用に残している。
 struct DensityModel {
     long double expected_group_size = 0.0L;
     long double mean_log2_compactness = 0.0L;
@@ -751,11 +742,10 @@ struct FutureBucketDemand {
     long double variance_log_duration = 0.0L;
 };
 
-// Distribution of one unseen group conditional on its start being after S.
-// The generator samples l from the exponential distribution, then uses stay
-// duration D=l+1 and H-l possible integer start times.  The exponential
-// density is absorbed by y=1-exp(-l/theta); its truncation normalizer cancels
-// between the overlap integral and Q(S, theta).
+// 「未観測の1組は現在時刻Sより後に始まる」という条件付き未来分布。
+// 指数分布からlを取り滞在時間をD=l+1とし、開始時刻はH-l個の整数から一様に選ばれる。
+// y=1-exp(-l/theta)への変数変換で指数密度を吸収し、正規化定数は分子・分母で相殺する。
+// この構造体はsampled DLPを無効化した旧64時間帯モデルだけで使う。
 struct ConditionalFutureDemand {
     struct Node {
         long double stay_duration;
@@ -840,6 +830,7 @@ struct ConditionalFutureDemand {
 };
 
 struct ShadowEvaluation {
+    // 今回の組がセル時間を占有することで、将来受け入れられなくなる料金の推定値。
     long double opportunity_cost = 0.0L;
     long double duration_weighted_rejected_fraction = 0.0L;
     long double maximum_rejected_fraction = 0.0L;
@@ -867,44 +858,6 @@ struct SampledDlpDiagnostics {
     double rebuild_cpu_ms = 0.0;
     double maximum_rebuild_cpu_ms = 0.0;
     uint64_t sample_hash = 1469598103934665603ULL;
-
-    int predictive_dp_solves = 0;
-    int predictive_dp_prune_steps = 0;
-    int predictive_dp_maximum_frontier = 0;
-    int predictive_dp_maximum_shift = 0;
-    int predictive_dp_positive_queries = 0;
-    int predictive_dp_zero_queries = 0;
-    int predictive_dp_frontier_cap_errors = 0;
-    int predictive_dp_duplicate_errors = 0;
-    int predictive_dp_capacity_errors = 0;
-    int predictive_dp_query_order_errors = 0;
-    int predictive_dp_nonfinite_errors = 0;
-    int predictive_dp_zero_state_errors = 0;
-    int predictive_dp_frontier_order_errors = 0;
-    int predictive_dp_query_upper_bound_errors = 0;
-    long long predictive_dp_transitions = 0;
-    long long predictive_dp_feasible_transitions = 0;
-    long long predictive_dp_infeasible_transitions = 0;
-    long long predictive_dp_items_processed = 0;
-    long long predictive_dp_prune_input_states = 0;
-    long long predictive_dp_frontier_output_states = 0;
-    long long predictive_dp_exact_duplicates = 0;
-    long long predictive_dp_width_pruned = 0;
-    long long predictive_dp_terminal_states = 0;
-    long long predictive_dp_zero_load_items = 0;
-    long long predictive_dp_capacity_level_sum = 0;
-    long long predictive_dp_item_load_level_sum = 0;
-    long long predictive_dp_query_load_level_sum = 0;
-    long long predictive_dp_query_calls = 0;
-    long long predictive_dp_base_value_sum = 0;
-    long long predictive_dp_reduced_value_sum = 0;
-    long double predictive_dp_opportunity_cost_sum = 0.0L;
-    array<long long, 17> predictive_dp_shift_histogram{};
-    double predictive_dp_rebuild_cpu_ms = 0.0;
-    double predictive_dp_maximum_rebuild_cpu_ms = 0.0;
-    double predictive_dp_query_cpu_ms = 0.0;
-    double predictive_dp_maximum_query_cpu_ms = 0.0;
-    uint64_t predictive_dp_frontier_hash = 1469598103934665603ULL;
 };
 
 long double sampled_dlp_radical_inverse(uint64_t index, int base) {
@@ -919,10 +872,11 @@ long double sampled_dlp_radical_inverse(uint64_t index, int base) {
     return clamp(result, 1e-12L, 1.0L - 1e-12L);
 }
 
-// A common deterministic future sample feeds two interchangeable valuations:
-// the old linear-program dual and an eight-dimensional sparse knapsack DP.
-// Both price pooled cell-time only; geometry remains the responsibility of the
-// unchanged placement and Push-out layers.
+// sampled DLP（deterministic linear programming）による機会損失モデル。
+// 現在から時刻上限までを最大16区間に分け、各区間の「1セル・1時間」の価格を求める。
+// 未来256組を低食い違い列から決定的に生成し、空き容量と未来需要が釣り合うよう
+// 双対価格を座標降下で更新する。ここでは総セル時間だけを価格付けし、
+// 盤面の連結性や形状は後段の配置・Push-outが扱う。
 struct SampledDlpShadowModel {
     struct Request {
         ll s = 0;
@@ -930,23 +884,6 @@ struct SampledDlpShadowModel {
         int p = 0;
         ll ideal_fee = 0;
         array<long double, SAMPLED_DLP_BUCKET_COUNT> load{};
-    };
-
-    struct PredictiveDpItem {
-        array<uint32_t, PREDICTIVE_DP_BUCKET_COUNT> load{};
-        ll reward = 0;
-    };
-
-    struct PredictiveDpState {
-        array<uint16_t, PREDICTIVE_DP_BUCKET_COUNT> used{};
-        ll reward = 0;
-    };
-
-    struct PredictiveDpBoxSlot {
-        uint64_t low_key = 0;
-        uint64_t high_key = 0;
-        int best_index = -1;
-        int generation = 0;
     };
 
     enum class RebuildTrigger {
@@ -960,29 +897,19 @@ struct SampledDlpShadowModel {
     vector<float> exact_future_survival;
     array<ll, SAMPLED_DLP_BUCKET_COUNT + 1> boundaries{};
     array<long double, SAMPLED_DLP_BUCKET_COUNT> prices{};
-    array<int, PREDICTIVE_DP_BUCKET_COUNT + 1> predictive_dp_cuts{};
-    array<ll, PREDICTIVE_DP_BUCKET_COUNT> predictive_dp_full_cell_time{};
-    array<uint16_t, PREDICTIVE_DP_BUCKET_COUNT> predictive_dp_capacity{};
-    vector<PredictiveDpState> predictive_dp_frontier;
-    array<PredictiveDpBoxSlot, PREDICTIVE_DP_BOX_TABLE_SIZE>
-        predictive_dp_box_table{};
-    int predictive_dp_box_generation = 0;
-    ll predictive_dp_base_reward = 0;
-    int predictive_dp_bucket_count = 0;
-    int predictive_dp_snapshot_remaining_groups = 0;
-    bool predictive_dp_ready = false;
     int bucket_count = 0;
     bool ready = false;
     SampledDlpDiagnostics diagnostics;
 
+    // 61個のtheta候補それぞれについて、公式の丸め後分布から
+    // Q_theta(s)=Pr(未来の開始時刻>S)を全時刻分前計算する。
     void initialize(const vector<vector<Shape>> &compact_shapes) {
         for (int p = 4; p <= 150; p++) {
             minimum_perimeter[p] = compact_shapes[p].front().perimeter;
         }
 
-        // Q_theta(s)=Pr(S_future>s | theta) for the official rounded
-        // duration distribution.  The backward recurrence is exact up to
-        // floating point and needs one 61 x 100000 float table (about 24 MB).
+        // 後ろ向き漸化式なので浮動小数点誤差を除けば厳密。
+        // 61×100000個のfloatを使い、メモリは約24MB。
         exact_future_survival.assign(
             (size_t)ThetaEstimator::PARTICLE_COUNT * ARRIVAL_TIME_HORIZON,
             0.0F);
@@ -1062,6 +989,8 @@ struct SampledDlpShadowModel {
     }
 
     RebuildTrigger rebuild_trigger(int turn, ll current_s) const {
+        // 初回、4/8/16ターン、その後16ターンごとに再計算する。
+        // さらに、前回の時間区間境界を2本以上通過した場合も価格を更新する。
         if (!ready) return RebuildTrigger::Initial;
         if (turn == 4 || turn == 8 || turn == 16 || (turn > 16 && turn % 16 == 0)) {
             return RebuildTrigger::Scheduled;
@@ -1119,6 +1048,8 @@ struct SampledDlpShadowModel {
 
     vector<Request> build_requests(ll current_s, int remaining_groups,
                                    const ThetaEstimator &theta_estimator) {
+        // thetaの10/30/50/70/90%点を均等に使い、base 2/3/5/7のradical inverseで
+        // 滞在時間・開始時刻・面積・価値を生成する。乱数を使わないため毎回再現可能。
         array<int, 5> theta_values =
             exact_posterior_quantiles(theta_estimator, current_s, remaining_groups);
 
@@ -1141,9 +1072,8 @@ struct SampledDlpShadowModel {
         const long double size_width = sqrtl(150.0L) - 2.0L;
         for (int sample = 0; sample < SAMPLED_DLP_REQUEST_COUNT; sample++) {
             uint64_t index = sample + 1;
-            // The centered first coordinate gives the five posterior strata
-            // counts 51, 51, 52, 51, 51 without correlating theta with P's
-            // base-5 radical inverse.
+            // 中点を使って5つのtheta層へ51,51,52,51,51件を割り当てる。
+            // 面積生成のbase-5列とは独立にし、thetaと面積の人工的な相関を避ける。
             long double theta_quantile = (sample + 0.5L) / SAMPLED_DLP_REQUEST_COUNT;
             int theta_slot = min(4, (int)floorl(5.0L * theta_quantile));
             const vector<long double> &cdf = duration_cdfs[cdf_index[theta_slot]];
@@ -1184,6 +1114,8 @@ struct SampledDlpShadowModel {
 
     void solve_dual(const vector<Request> &requests, int remaining_groups,
                     const vector<GroupState> &groups, int grass_cells) {
+        // 各時間帯の容量から、現在盤面の既知の占有セル時間を引く。
+        // 未来sampleには「残り組数/256」の重みを掛け、実際の総需要へ換算する。
         array<long double, SAMPLED_DLP_BUCKET_COUNT> capacity{};
         array<long double, SAMPLED_DLP_BUCKET_COUNT> offered_load{};
         long double sample_weight = (long double)remaining_groups / SAMPLED_DLP_REQUEST_COUNT;
@@ -1210,6 +1142,8 @@ struct SampledDlpShadowModel {
         };
         vector<Breakpoint> breakpoints;
         breakpoints.reserve(requests.size());
+        // 1座標ずつ価格を更新するGauss-Seidel型の座標降下。
+        // 他時間帯の価格を引いた残余価値/当該負荷が、そのrequestの離脱価格になる。
         for (int sweep = 0; sweep < SAMPLED_DLP_COORDINATE_SWEEPS; sweep++) {
             for (int b = 0; b < bucket_count; b++) {
                 breakpoints.clear();
@@ -1249,8 +1183,7 @@ struct SampledDlpShadowModel {
             }
         }
 
-        // Quantize only the completed solve.  Quantizing every coordinate
-        // would perturb the later Gauss-Seidel breakpoints within each sweep.
+        // 量子化は全sweep終了後だけ行う。途中で丸めると、後続座標の離脱価格が変わる。
         for (int b = 0; b < bucket_count; b++) {
             prices[b] = roundl(prices[b] * SAMPLED_DLP_PRICE_QUANTIZATION) /
                         SAMPLED_DLP_PRICE_QUANTIZATION;
@@ -1277,494 +1210,11 @@ struct SampledDlpShadowModel {
         diagnostics.dual_objective_sum += dual_objective;
     }
 
-    static bool same_predictive_dp_usage(const PredictiveDpState &lhs,
-                                         const PredictiveDpState &rhs) {
-        return lhs.used == rhs.used;
-    }
-
-    static int predictive_dp_total_usage(const PredictiveDpState &state) {
-        return accumulate(state.used.begin(), state.used.end(), 0);
-    }
-
-    static bool better_predictive_dp_state(const PredictiveDpState &lhs,
-                                           const PredictiveDpState &rhs) {
-        if (lhs.reward != rhs.reward) return lhs.reward > rhs.reward;
-        int lhs_total = predictive_dp_total_usage(lhs);
-        int rhs_total = predictive_dp_total_usage(rhs);
-        if (lhs_total != rhs_total) return lhs_total < rhs_total;
-        return lhs.used < rhs.used;
-    }
-
-    static pair<uint64_t, uint64_t> predictive_dp_usage_key(
-        const PredictiveDpState &state) {
-        pair<uint64_t, uint64_t> result{};
-        for (int d = 0; d < 4; d++) {
-            result.first |= (uint64_t)state.used[d] << (16 * d);
-            result.second |= (uint64_t)state.used[d + 4] << (16 * d);
-        }
-        return result;
-    }
-
-    static pair<uint64_t, uint64_t> predictive_dp_box_key(
-        const PredictiveDpState &state, int shift) {
-        pair<uint64_t, uint64_t> result{};
-        for (int d = 0; d < 4; d++) {
-            result.first |= (uint64_t)(state.used[d] >> shift) << (16 * d);
-            result.second |=
-                (uint64_t)(state.used[d + 4] >> shift) << (16 * d);
-        }
-        return result;
-    }
-
-    void build_predictive_dp_cuts() {
-        predictive_dp_cuts.fill(0);
-        if (bucket_count <= PREDICTIVE_DP_BUCKET_COUNT) {
-            predictive_dp_bucket_count = bucket_count;
-            for (int d = 0; d <= predictive_dp_bucket_count; d++) {
-                predictive_dp_cuts[d] = d;
-            }
-            return;
-        }
-
-        predictive_dp_bucket_count = PREDICTIVE_DP_BUCKET_COUNT;
-        predictive_dp_cuts[0] = 0;
-        predictive_dp_cuts[predictive_dp_bucket_count] = bucket_count;
-        for (int d = 1; d < predictive_dp_bucket_count; d++) {
-            int proposed =
-                (PREDICTIVE_DP_REFERENCE_CUTS[d] * bucket_count +
-                 SAMPLED_DLP_BUCKET_COUNT / 2) /
-                SAMPLED_DLP_BUCKET_COUNT;
-            int lower = predictive_dp_cuts[d - 1] + 1;
-            int upper = bucket_count - (predictive_dp_bucket_count - d);
-            predictive_dp_cuts[d] = clamp(proposed, lower, upper);
-        }
-    }
-
-    vector<PredictiveDpItem> build_predictive_dp_items(
-        const vector<Request> &requests, int remaining_groups,
-        const vector<GroupState> &groups, int grass_cells) {
-        build_predictive_dp_cuts();
-        predictive_dp_full_cell_time.fill(0);
-        predictive_dp_capacity.fill(0);
-
-        for (int d = 0; d < predictive_dp_bucket_count; d++) {
-            ll begin = boundaries[predictive_dp_cuts[d]];
-            ll end = boundaries[predictive_dp_cuts[d + 1]];
-            ll full_cell_time = (ll)grass_cells * (end - begin);
-            predictive_dp_full_cell_time[d] = full_cell_time;
-            if (full_cell_time <= 0) {
-                diagnostics.predictive_dp_capacity_errors++;
-                continue;
-            }
-
-            ll committed_cell_time = 0;
-            for (const GroupState &group : groups) {
-                if (!group.active) continue;
-                ll overlap = max(0LL, min(group.t, end) - max(group.s, begin));
-                committed_cell_time += (ll)group.p * overlap;
-            }
-            ll available_cell_time = clamp(full_cell_time - committed_cell_time,
-                                           0LL, full_cell_time);
-            int capacity = (int)((i128)available_cell_time *
-                                 PREDICTIVE_DP_CAPACITY_LEVELS /
-                                 full_cell_time);
-            if (capacity < 0 || capacity > PREDICTIVE_DP_CAPACITY_LEVELS) {
-                diagnostics.predictive_dp_capacity_errors++;
-                capacity = clamp(capacity, 0, PREDICTIVE_DP_CAPACITY_LEVELS);
-            }
-            predictive_dp_capacity[d] = capacity;
-            diagnostics.predictive_dp_capacity_level_sum += capacity;
-        }
-
-        vector<PredictiveDpItem> items;
-        items.reserve(requests.size());
-        for (const Request &request : requests) {
-            PredictiveDpItem item;
-            item.reward = request.ideal_fee;
-            bool has_load = false;
-            for (int d = 0; d < predictive_dp_bucket_count; d++) {
-                ll begin = boundaries[predictive_dp_cuts[d]];
-                ll end = boundaries[predictive_dp_cuts[d + 1]];
-                ll overlap = max(0LL, min(request.t, end) - max(request.s, begin));
-                ll cell_time = (ll)request.p * overlap;
-                ll full_cell_time = predictive_dp_full_cell_time[d];
-                if (cell_time == 0 || full_cell_time <= 0) continue;
-                i128 numerator = (i128)remaining_groups * cell_time *
-                                 PREDICTIVE_DP_CAPACITY_LEVELS;
-                i128 denominator = (i128)SAMPLED_DLP_REQUEST_COUNT * full_cell_time;
-                i128 rounded = (numerator + denominator / 2) / denominator;
-                uint32_t load =
-                    rounded > numeric_limits<uint32_t>::max()
-                        ? numeric_limits<uint32_t>::max()
-                        : (uint32_t)rounded;
-                item.load[d] = load;
-                diagnostics.predictive_dp_item_load_level_sum += load;
-                has_load |= load != 0;
-            }
-            if (!has_load && item.reward > 0) diagnostics.predictive_dp_zero_load_items++;
-            items.push_back(std::move(item));
-        }
-        return items;
-    }
-
-    vector<PredictiveDpState> prune_predictive_dp_frontier(
-        vector<PredictiveDpState> skipped,
-        vector<PredictiveDpState> taken) {
-        diagnostics.predictive_dp_prune_input_states +=
-            skipped.size() + taken.size();
-
-        // Both inputs are already in exact usage order: adding one item's
-        // fixed load preserves the order of every feasible parent state.
-        // Merge them directly instead of sorting up to 1024 states per item.
-        vector<PredictiveDpState> unique_states;
-        unique_states.reserve(skipped.size() + taken.size());
-        int skipped_index = 0;
-        int taken_index = 0;
-        while (skipped_index < (int)skipped.size() ||
-               taken_index < (int)taken.size()) {
-            if (taken_index == (int)taken.size() ||
-                (skipped_index < (int)skipped.size() &&
-                 skipped[skipped_index].used < taken[taken_index].used)) {
-                unique_states.push_back(std::move(skipped[skipped_index++]));
-            } else if (skipped_index == (int)skipped.size() ||
-                       taken[taken_index].used < skipped[skipped_index].used) {
-                unique_states.push_back(std::move(taken[taken_index++]));
-            } else {
-                diagnostics.predictive_dp_exact_duplicates++;
-                if (better_predictive_dp_state(taken[taken_index],
-                                               skipped[skipped_index])) {
-                    unique_states.push_back(std::move(taken[taken_index]));
-                } else {
-                    unique_states.push_back(std::move(skipped[skipped_index]));
-                }
-                skipped_index++;
-                taken_index++;
-            }
-        }
-        if ((int)unique_states.size() <= PREDICTIVE_DP_FRONTIER_LIMIT) {
-            diagnostics.predictive_dp_frontier_output_states +=
-                unique_states.size();
-            chmax(diagnostics.predictive_dp_maximum_frontier,
-                  (int)unique_states.size());
-            return unique_states;
-        }
-
-        int zero_index = -1;
-        for (int index = 0; index < (int)unique_states.size(); index++) {
-            if (all_of(unique_states[index].used.begin(),
-                       unique_states[index].used.end(),
-                       [](uint16_t value) { return value == 0; })) {
-                zero_index = index;
-                break;
-            }
-        }
-
-        array<vector<int>, 17> cached_box_winners;
-        array<char, 17> box_winners_ready{};
-        auto box_winners = [&](int shift) -> const vector<int> & {
-            vector<int> &winners = cached_box_winners[shift];
-            if (box_winners_ready[shift]) return winners;
-            box_winners_ready[shift] = true;
-
-            if (predictive_dp_box_generation == numeric_limits<int>::max()) {
-                for (PredictiveDpBoxSlot &slot : predictive_dp_box_table) {
-                    slot.generation = 0;
-                }
-                predictive_dp_box_generation = 1;
-            } else {
-                predictive_dp_box_generation++;
-            }
-            int generation = predictive_dp_box_generation;
-            vector<int> occupied_slots;
-            occupied_slots.reserve(unique_states.size());
-            for (int index = 0; index < (int)unique_states.size(); index++) {
-                auto [low_key, high_key] =
-                    predictive_dp_box_key(unique_states[index], shift);
-                uint64_t hash = mix_hash(1469598103934665603ULL, low_key);
-                hash = mix_hash(hash, high_key);
-                int slot_index = hash & (PREDICTIVE_DP_BOX_TABLE_SIZE - 1);
-                while (true) {
-                    PredictiveDpBoxSlot &slot =
-                        predictive_dp_box_table[slot_index];
-                    if (slot.generation != generation) {
-                        slot.low_key = low_key;
-                        slot.high_key = high_key;
-                        slot.best_index = index;
-                        slot.generation = generation;
-                        occupied_slots.push_back(slot_index);
-                        break;
-                    }
-                    if (slot.low_key == low_key && slot.high_key == high_key) {
-                        if (better_predictive_dp_state(
-                                unique_states[index],
-                                unique_states[slot.best_index])) {
-                            slot.best_index = index;
-                        }
-                        break;
-                    }
-                    slot_index =
-                        (slot_index + 1) & (PREDICTIVE_DP_BOX_TABLE_SIZE - 1);
-                }
-            }
-            winners.reserve(occupied_slots.size());
-            for (int slot_index : occupied_slots) {
-                winners.push_back(
-                    predictive_dp_box_table[slot_index].best_index);
-            }
-            return winners;
-        };
-
-        int low = 0;
-        int high = 16;
-        while (low < high) {
-            int middle = (low + high) / 2;
-            if ((int)box_winners(middle).size() <=
-                PREDICTIVE_DP_FRONTIER_LIMIT) {
-                high = middle;
-            } else {
-                low = middle + 1;
-            }
-        }
-        int shift = low;
-        vector<int> winners;
-        while (true) {
-            winners = box_winners(shift);
-            bool zero_is_winner =
-                zero_index == -1 ||
-                find(winners.begin(), winners.end(), zero_index) != winners.end();
-            int required_states = winners.size() + (zero_is_winner ? 0 : 1);
-            if (required_states <= PREDICTIVE_DP_FRONTIER_LIMIT) {
-                break;
-            }
-            shift++;
-        }
-        diagnostics.predictive_dp_prune_steps++;
-        diagnostics.predictive_dp_shift_histogram[shift]++;
-        chmax(diagnostics.predictive_dp_maximum_shift, shift);
-
-        auto better_index = [&](int lhs, int rhs) {
-            return better_predictive_dp_state(unique_states[lhs], unique_states[rhs]);
-        };
-
-        vector<char> selected(unique_states.size(), false);
-        int retained_count = 0;
-        auto add = [&](int index) {
-            if (selected[index] ||
-                retained_count == PREDICTIVE_DP_FRONTIER_LIMIT) {
-                return;
-            }
-            selected[index] = true;
-            retained_count++;
-        };
-
-        if (zero_index != -1) add(zero_index);
-        for (int index : winners) add(index);
-
-        int needed = PREDICTIVE_DP_FRONTIER_LIMIT - retained_count;
-        if (needed > 0) {
-            vector<int> fillers;
-            fillers.reserve(unique_states.size() - retained_count);
-            for (int index = 0; index < (int)unique_states.size(); index++) {
-                if (!selected[index]) fillers.push_back(index);
-            }
-            if (needed < (int)fillers.size()) {
-                nth_element(fillers.begin(), fillers.begin() + needed,
-                            fillers.end(), better_index);
-                fillers.resize(needed);
-            }
-            for (int index : fillers) add(index);
-        }
-
-        vector<PredictiveDpState> result;
-        result.reserve(retained_count);
-        for (int index = 0; index < (int)unique_states.size(); index++) {
-            if (selected[index]) {
-                result.push_back(std::move(unique_states[index]));
-            }
-        }
-        diagnostics.predictive_dp_width_pruned +=
-            unique_states.size() - result.size();
-        diagnostics.predictive_dp_frontier_output_states += result.size();
-        chmax(diagnostics.predictive_dp_maximum_frontier, (int)result.size());
-        return result;
-    }
-
-    void solve_predictive_dp(const vector<Request> &requests, int remaining_groups,
-                             const vector<GroupState> &groups, int grass_cells) {
-        clock_t cpu_begin = clock();
-        predictive_dp_ready = false;
-        predictive_dp_snapshot_remaining_groups = remaining_groups;
-        vector<PredictiveDpItem> items = build_predictive_dp_items(
-            requests, remaining_groups, groups, grass_cells);
-
-        predictive_dp_frontier.assign(1, PredictiveDpState{});
-        for (const PredictiveDpItem &item : items) {
-            diagnostics.predictive_dp_items_processed++;
-            vector<PredictiveDpState> taken;
-            taken.reserve(predictive_dp_frontier.size());
-            for (const PredictiveDpState &state : predictive_dp_frontier) {
-                diagnostics.predictive_dp_transitions++;
-                bool feasible = true;
-                PredictiveDpState child = state;
-                for (int d = 0; d < predictive_dp_bucket_count; d++) {
-                    uint32_t used = (uint32_t)state.used[d] + item.load[d];
-                    if (used > predictive_dp_capacity[d]) {
-                        feasible = false;
-                        break;
-                    }
-                    child.used[d] = used;
-                }
-                if (!feasible) {
-                    diagnostics.predictive_dp_infeasible_transitions++;
-                    continue;
-                }
-                diagnostics.predictive_dp_feasible_transitions++;
-                child.reward += item.reward;
-                taken.push_back(std::move(child));
-            }
-            predictive_dp_frontier = prune_predictive_dp_frontier(
-                std::move(predictive_dp_frontier), std::move(taken));
-            if ((int)predictive_dp_frontier.size() > PREDICTIVE_DP_FRONTIER_LIMIT) {
-                diagnostics.predictive_dp_frontier_cap_errors++;
-            }
-        }
-
-        predictive_dp_base_reward = 0;
-        bool has_zero_usage_state = false;
-        for (int index = 0; index < (int)predictive_dp_frontier.size(); index++) {
-            const PredictiveDpState &state = predictive_dp_frontier[index];
-            chmax(predictive_dp_base_reward, state.reward);
-            has_zero_usage_state |=
-                all_of(state.used.begin(), state.used.end(),
-                       [](uint16_t value) { return value == 0; });
-            for (int d = 0; d < predictive_dp_bucket_count; d++) {
-                if (state.used[d] > predictive_dp_capacity[d]) {
-                    diagnostics.predictive_dp_capacity_errors++;
-                }
-            }
-            if (index > 0 &&
-                same_predictive_dp_usage(predictive_dp_frontier[index - 1], state)) {
-                diagnostics.predictive_dp_duplicate_errors++;
-            }
-            if (index > 0 &&
-                state.used < predictive_dp_frontier[index - 1].used) {
-                diagnostics.predictive_dp_frontier_order_errors++;
-            }
-        }
-        if (!has_zero_usage_state) diagnostics.predictive_dp_zero_state_errors++;
-        diagnostics.predictive_dp_solves++;
-        diagnostics.predictive_dp_terminal_states += predictive_dp_frontier.size();
-        chmax(diagnostics.predictive_dp_maximum_frontier,
-              (int)predictive_dp_frontier.size());
-
-        uint64_t frontier_hash = mix_hash(1469598103934665603ULL,
-                                          predictive_dp_bucket_count);
-        frontier_hash = mix_hash(frontier_hash, remaining_groups);
-        for (int d = 0; d < predictive_dp_bucket_count; d++) {
-            frontier_hash = mix_hash(frontier_hash, predictive_dp_cuts[d]);
-            frontier_hash = mix_hash(frontier_hash, predictive_dp_capacity[d]);
-        }
-        frontier_hash = mix_hash(frontier_hash,
-                                 predictive_dp_cuts[predictive_dp_bucket_count]);
-        for (const PredictiveDpState &state : predictive_dp_frontier) {
-            auto [low_key, high_key] = predictive_dp_usage_key(state);
-            frontier_hash = mix_hash(frontier_hash, low_key);
-            frontier_hash = mix_hash(frontier_hash, high_key);
-            frontier_hash = mix_hash(frontier_hash, state.reward);
-        }
-        diagnostics.predictive_dp_frontier_hash =
-            mix_hash(diagnostics.predictive_dp_frontier_hash, frontier_hash);
-        predictive_dp_ready = true;
-
-        double cpu_ms = 1000.0 * (double)(clock() - cpu_begin) / CLOCKS_PER_SEC;
-        diagnostics.predictive_dp_rebuild_cpu_ms += cpu_ms;
-        chmax(diagnostics.predictive_dp_maximum_rebuild_cpu_ms, cpu_ms);
-    }
-
-    ShadowEvaluation evaluate_predictive_dp(ll current_s, ll arrival_t, int p) {
-        clock_t cpu_begin = clock();
-        auto record_query_cpu = [&]() {
-            double cpu_ms =
-                1000.0 * (double)(clock() - cpu_begin) / CLOCKS_PER_SEC;
-            diagnostics.predictive_dp_query_cpu_ms += cpu_ms;
-            chmax(diagnostics.predictive_dp_maximum_query_cpu_ms, cpu_ms);
-        };
-        ShadowEvaluation result;
-        diagnostics.predictive_dp_query_calls++;
-        if (!predictive_dp_ready || predictive_dp_frontier.empty() ||
-            predictive_dp_snapshot_remaining_groups <= 0) {
-            diagnostics.invalid_model_errors++;
-            record_query_cpu();
-            return result;
-        }
-
-        array<uint16_t, PREDICTIVE_DP_BUCKET_COUNT> reduced_capacity =
-            predictive_dp_capacity;
-        int occupied_buckets = 0;
-        for (int d = 0; d < predictive_dp_bucket_count; d++) {
-            ll begin = boundaries[predictive_dp_cuts[d]];
-            ll end = boundaries[predictive_dp_cuts[d + 1]];
-            ll overlap = max(0LL, min(arrival_t, end) - max(current_s, begin));
-            ll cell_time = (ll)p * overlap;
-            ll full_cell_time = predictive_dp_full_cell_time[d];
-            if (cell_time == 0 || full_cell_time <= 0) continue;
-            i128 numerator = (i128)cell_time * PREDICTIVE_DP_CAPACITY_LEVELS;
-            uint32_t query_load =
-                (uint32_t)((numerator + full_cell_time - 1) / full_cell_time);
-            diagnostics.predictive_dp_query_load_level_sum += query_load;
-            reduced_capacity[d] =
-                query_load >= reduced_capacity[d]
-                    ? 0
-                    : (uint16_t)(reduced_capacity[d] - query_load);
-            occupied_buckets++;
-        }
-
-        ll reduced_reward = 0;
-        for (const PredictiveDpState &state : predictive_dp_frontier) {
-            bool feasible = true;
-            for (int d = 0; d < predictive_dp_bucket_count; d++) {
-                if (state.used[d] > reduced_capacity[d]) {
-                    feasible = false;
-                    break;
-                }
-            }
-            if (feasible) chmax(reduced_reward, state.reward);
-        }
-        if (reduced_reward > predictive_dp_base_reward) {
-            diagnostics.predictive_dp_query_order_errors++;
-            reduced_reward = predictive_dp_base_reward;
-        }
-
-        ll value_delta = predictive_dp_base_reward - reduced_reward;
-        result.opportunity_cost =
-            (long double)predictive_dp_snapshot_remaining_groups * value_delta /
-            SAMPLED_DLP_REQUEST_COUNT;
-        long double upper_bound =
-            (long double)predictive_dp_snapshot_remaining_groups *
-            predictive_dp_base_reward / SAMPLED_DLP_REQUEST_COUNT;
-        if (result.opportunity_cost > upper_bound) {
-            diagnostics.predictive_dp_query_upper_bound_errors++;
-        }
-        if (!isfinite(result.opportunity_cost) || result.opportunity_cost < 0.0L) {
-            diagnostics.predictive_dp_nonfinite_errors++;
-            diagnostics.nonfinite_errors++;
-            result = ShadowEvaluation{};
-        } else if (result.opportunity_cost > 0.0L) {
-            diagnostics.predictive_dp_positive_queries++;
-            result.priced_buckets = occupied_buckets;
-        } else {
-            diagnostics.predictive_dp_zero_queries++;
-        }
-        diagnostics.predictive_dp_base_value_sum += predictive_dp_base_reward;
-        diagnostics.predictive_dp_reduced_value_sum += reduced_reward;
-        diagnostics.predictive_dp_opportunity_cost_sum += result.opportunity_cost;
-        record_query_cpu();
-        return result;
-    }
-
     void rebuild(int turn, ll current_s, int remaining_groups,
                  const vector<GroupState> &groups, int grass_cells,
                  const ThetaEstimator &theta_estimator, RebuildTrigger trigger) {
+        // bucket境界、未来sample、双対価格を一括して更新する。
+        // sample hashは決定性確認用で、意思決定には使わない。
         clock_t cpu_begin = clock();
         build_buckets(current_s);
         vector<Request> requests = build_requests(current_s, remaining_groups, theta_estimator);
@@ -1788,17 +1238,8 @@ struct SampledDlpShadowModel {
         if ((int)requests.size() != SAMPLED_DLP_REQUEST_COUNT) {
             diagnostics.invalid_model_errors++;
             prices.fill(0.0L);
-            predictive_dp_ready = false;
-            predictive_dp_frontier.clear();
         } else {
-            if constexpr (ENABLE_PREDICTIVE_DP) {
-                solve_predictive_dp(requests, remaining_groups, groups,
-                                    grass_cells);
-            } else {
-                solve_dual(requests, remaining_groups, groups, grass_cells);
-                predictive_dp_ready = false;
-                predictive_dp_frontier.clear();
-            }
+            solve_dual(requests, remaining_groups, groups, grass_cells);
         }
         ready = true;
         double cpu_ms = 1000.0 * (double)(clock() - cpu_begin) / CLOCKS_PER_SEC;
@@ -1808,6 +1249,8 @@ struct SampledDlpShadowModel {
 
     ShadowEvaluation evaluate_cached(ll current_s, ll arrival_t, int p, bool rollout,
                                      int remaining_groups = -1) {
+        // 凍結した価格に「pセル×各時間帯との重なり」を掛け、今回の機会損失を求める。
+        // rollout中も価格を再学習せず、実ターンと同じ情報だけで全branchを比較する。
         ShadowEvaluation result;
         if (rollout) {
             diagnostics.rollout_price_calls++;
@@ -1822,16 +1265,12 @@ struct SampledDlpShadowModel {
             diagnostics.invalid_model_errors++;
             return result;
         }
-        if constexpr (ENABLE_PREDICTIVE_DP) {
-            result = evaluate_predictive_dp(current_s, arrival_t, p);
-        } else {
-            for (int b = 0; b < bucket_count; b++) {
-                ll overlap = max(0LL, min(arrival_t, boundaries[b + 1]) -
-                                          max(current_s, boundaries[b]));
-                if (overlap <= 0) continue;
-                result.opportunity_cost += (long double)p * overlap * prices[b];
-                if (prices[b] > 0.0L) result.priced_buckets++;
-            }
+        for (int b = 0; b < bucket_count; b++) {
+            ll overlap = max(0LL, min(arrival_t, boundaries[b + 1]) -
+                                      max(current_s, boundaries[b]));
+            if (overlap <= 0) continue;
+            result.opportunity_cost += (long double)p * overlap * prices[b];
+            if (prices[b] > 0.0L) result.priced_buckets++;
         }
         if (!isfinite(result.opportunity_cost) || result.opportunity_cost < 0.0L) {
             diagnostics.nonfinite_errors++;
@@ -1857,9 +1296,9 @@ struct SampledDlpShadowModel {
     }
 };
 
-// Price the candidate's occupied cell-time by the fee density of future groups
-// that would be crowded out.  Compact rescue is considered only after this
-// ordinary admission decision has accepted the fallback placement.
+// sampled DLPを無効化した比較ビルド用の旧機会損失計算。
+// 各64時間帯で、今回占有するセル時間に、容量不足で押し出される未来組の
+// 料金密度を掛ける。通常提出ではこの関数を通らない。
 ShadowEvaluation evaluate_shadow_cost(const vector<GroupState> &groups, ll current_s, ll arrival_t, int p,
                                       int remaining_groups, int grass_cells, long double theta,
                                       const DensityModel &density_model) {
@@ -1943,6 +1382,9 @@ struct PlacementCandidate {
     vector<Cell> cells;
     uint64_t region_hash = 0;
     int perimeter = 0;
+    // incremental_cost: 現在盤面へ候補を足したことで増える退去時刻境界コスト。
+    // absolute_cost: 候補を足した後の境界コストそのもの。
+    // どちらも、退去時刻が近い組同士が接するほど小さくなる。
     long double incremental_cost = 0.0L;
     long double absolute_cost = 0.0L;
     long long enumeration_order = 0;
@@ -1978,6 +1420,9 @@ bool placement_absolute_less(const PlacementCandidate &lhs, const PlacementCandi
     return placement_increment_less(lhs, rhs);
 }
 
+// 全合法候補を高価なfuture-fitへ渡さず、性質の異なる最大6候補へ圧縮する。
+// 内訳はincremental上位3、absolute最良、列挙順の最初、別象限の最良。
+// 同一領域はhashで安価に絞った後、セル集合を比較して重複除去する。
 struct PlacementShortlistBuilder {
     int best_perimeter = numeric_limits<int>::max();
     vector<PlacementCandidate> global_best;
@@ -2081,11 +1526,10 @@ struct PlacementShortlistBuilder {
 
 bool validate_connected_region(const vector<Cell> &cells, int n);
 
-// A greedy connected prefix can end with an avoidable spike merely because it
-// stops at exactly P cells.  Continue the same growth for eight cells, then
-// peel non-articulation boundary cells.  This is only a candidate generator:
-// admission, shadow, future-fit, relocation, and every downstream evaluator
-// remain unchanged.
+// grow-and-trimの「trim」部分。
+// 貪欲成長をちょうどpセルで止めると、最後の数セルだけが突起になることがある。
+// そこで一度p+8セルまで育て、連結性を壊す関節点を避けながら境界セルを削る。
+// 削除後の周長変化が良いセルを優先し、pセルへ戻した領域を追加候補として返す。
 optional<vector<Cell>> trim_grown_connected_region(const vs &park, const vvi &owner,
                                                    const vector<Cell> &grown, int p,
                                                    TemporalPlacementDiagnostics &diagnostics) {
@@ -2193,6 +1637,12 @@ vector<vector<Cell>> make_connected_growth_candidates(
     const vs &park, const vvi &owner, int p,
     vector<vector<Cell>> &grow_and_trim_candidates,
     TemporalPlacementDiagnostics &diagnostics) {
+    // 処理順:
+    // 1. 空き連結成分を抽出する。
+    // 2. 障害物・盤面端からの距離を求める。
+    // 3. 各成分の端・対角・障害物距離から最大16個のseedを選ぶ。
+    // 4. 選択済み隣接数が多いセルを優先し、連結なままpセルへ成長させる。
+    // 5. 一部のseedではさらに8セル育て、trimした候補も作る。
     int n = park.size();
     constexpr int DX[4] = {-1, 1, 0, 0};
     constexpr int DY[4] = {0, 0, -1, 1};
@@ -2209,6 +1659,7 @@ vector<vector<Cell>> make_connected_growth_candidates(
     };
     add_candidate(find_connected_region(park, owner, p));
 
+    // pセル以上を含む空き連結成分だけを候補にする。
     vvb visited(n, vb(n));
     vector<vector<Cell>> components;
     for (int start_x = 0; start_x < n; start_x++) {
@@ -2243,6 +1694,7 @@ vector<vector<Cell>> make_connected_growth_candidates(
     sort(component_order.begin(), component_order.end(),
          [&](int lhs, int rhs) { return components[lhs].size() > components[rhs].size(); });
 
+    // 障害物や盤面端に近いseed・遠いseedの両方を作るための多点BFS。
     const int INF_DISTANCE = n * n + 1;
     vvi obstacle_distance(n, vi(n, INF_DISTANCE));
     queue<Cell> distance_queue;
@@ -2272,6 +1724,7 @@ vector<vector<Cell>> make_connected_growth_candidates(
         }
     }
 
+    // 上下左右・4対角・障害物最近/最遠という10種類の特徴点を取る。
     constexpr int SEED_FEATURE_COUNT = 10;
     vector<array<Cell, SEED_FEATURE_COUNT>> feature_seeds(components.size());
     auto feature_key = [&](int feature, const Cell &cell) {
@@ -2329,6 +1782,8 @@ vector<vector<Cell>> make_connected_growth_candidates(
         }
     }
 
+    // 隣接済みセルが多いほど優先し、同点では障害物距離、seedからの向き、座標で固定する。
+    // frontierへ同じセルが複数回入るため、pop時に隣接数を再計算する。
     struct GrowthEntry {
         int cell;
         int selected_neighbors;
@@ -2402,9 +1857,8 @@ vector<vector<Cell>> make_connected_growth_candidates(
         grow_until(p);
         if ((int)region.size() == p) {
             if constexpr (ENABLE_GROW_AND_TRIM) {
-                // Preserve the legacy P-cell candidate and its enumeration
-                // order.  The refined candidate is an addition, never a
-                // replacement.
+                // 元のpセル候補も必ず残し、trim版は置換ではなく追加候補にする。
+                // これによりgrow-and-trimが悪い場合は従来形状へ戻れる。
                 add_candidate(optional<vector<Cell>>(region));
                 if (grow_and_trim_attempts < GROW_AND_TRIM_CANDIDATE_LIMIT) {
                     grow_and_trim_attempts++;
@@ -2482,6 +1936,9 @@ int placement_quadrant(const vector<Cell> &cells, int n) {
 
 long double compact_fit_utility(const vs &park, const vvi &owner, const vector<GroupState> &groups,
                                 const vector<char> &in_candidate, ll snapshot_time) {
+    // DPの各値は「そのセルを右下端とする最大空き正方形の一辺」。
+    // 2,3,4,...,12四方を置ける位置数を数え、大きい正方形ほどside^2で重く評価する。
+    // snapshot_timeまでに退去する既存組は空きとみなし、今回の候補領域は占有扱いにする。
     int n = park.size();
     constexpr int MAX_SIDE = FUTURE_FIT_SIDES.back();
     array<int, MAX_SIDE + 2> histogram{};
@@ -2518,6 +1975,8 @@ long double compact_fit_utility(const vs &park, const vvi &owner, const vector<G
 
 array<ll, FUTURE_FIT_SNAPSHOT_COUNT> make_future_fit_snapshots(const ConditionalFutureDemand &future_demand,
                                                                ll current_s, ll arrival_t) {
+    // 今回の滞在中に始まる未来組の確率質量を、1/6・3/6・5/6分位で3時点に切る。
+    // 等間隔の時刻ではなく到着分布の分位点を使い、未来到着が多い期間を細かく見る。
     array<ll, FUTURE_FIT_SNAPSHOT_COUNT> snapshots{};
     long double total_mass = future_demand.future_start_cdf(arrival_t);
     for (int index = 0; index < FUTURE_FIT_SNAPSHOT_COUNT; index++) {
@@ -2551,6 +2010,7 @@ long double evaluate_compact_fit(const vs &park, const vvi &owner, const vector<
         sum += utility;
         chmin(minimum, utility);
     }
+    // 平均だけでなく最悪snapshotも25%混ぜ、途中で空き形状が崩れる候補を避ける。
     long double average = sum / FUTURE_FIT_SNAPSHOT_COUNT;
     return 0.75L * average + 0.25L * minimum;
 }
@@ -2561,8 +2021,12 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
                                                                   int remaining_groups, const vector<Shape> &shapes,
                                                                   TemporalPlacementDiagnostics &diagnostics,
                                                                   vector<NormalPlacementChoice> *root_alternatives = nullptr) {
-    // Prefer boundaries next to groups with similar release timing.  Only a
-    // small spatial shortlist proceeds to the more expensive future-fit test.
+    // 通常配置の選択手順:
+    // 1. 置ける最小周長テンプレートを全走査する。
+    // 2. なければ次の周長tier、connected growth、grow-and-trimを追加する。
+    // 3. 退去時刻の近い領域が接するように、境界コストで最大6候補へ絞る。
+    // 4. 未来3時点に残る空き正方形を評価して最終候補を選ぶ。
+    // 5. 実ターンではrollout比較用に通常配置の次点も最大2件返す。
     if (root_alternatives) root_alternatives->clear();
     diagnostics.attempts++;
     int n = park.size();
@@ -2579,6 +2043,8 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
     vector<long double> group_arrival_level(groups.size(), -1.0L);
     vector<long double> group_release_level(groups.size(), -1.0L);
 
+    // incremental_cellは候補追加による境界コストの増分、absolute_cellは
+    // 配置後に残る境界の不整合そのものを表す。後者もshortlistへ1件必ず残す。
     vector<vector<long double>> incremental_cell(n, vector<long double>(n));
     vector<vector<long double>> absolute_cell(n, vector<long double>(n));
     constexpr int DX[4] = {-1, 1, 0, 0};
@@ -2684,9 +2150,7 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
     }
 
     if (!found_minimum_template) {
-        // Shapes are sorted by perimeter.  Once one extended tier has a
-        // legal placement, every later tier is strictly worse in immediate
-        // perimeter, so it cannot survive the minimum-perimeter collector.
+        // shapesは周長順。置ける周長tierが見つかった後のtierは必ず料金が悪いため調べない。
         for (size_t first = 0; first < shapes.size();) {
             size_t last = first + 1;
             while (last < shapes.size() && shapes[last].perimeter == shapes[first].perimeter) {
@@ -2788,9 +2252,8 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
     if (!same_region(candidates[best_index].cells, candidates[absolute_best].cells)) {
         diagnostics.final_changed_from_absolute++;
     }
-    // The real-arrival caller may compare a few ordinary runner-ups at the
-    // root.  Reuse the evaluated shortlist and apply the exact same ranking;
-    // synthetic rollout arrivals do not request this list.
+    // 実ターンだけは、同じ評価済みshortlistから通常配置の次点も返す。
+    // 仮想未来では再帰的にroot比較しないため、次点候補は要求されない。
     if (root_alternatives && candidates.size() >= 2) {
         vector<char> chosen(candidates.size(), false);
         chosen[best_index] = true;
@@ -2841,13 +2304,11 @@ struct ShadowDiagnostics {
     long long priced_buckets = 0;
 };
 
-bool validate_connected_region(const vector<Cell> &cells, int n);
-
 enum class ArrivalStatus {
-    UpperBoundRejected,
-    NoRegion,
-    ActualFeeRejected,
-    Accepted,
+    UpperBoundRejected,  // 最小周長でも料金が機会損失以下
+    NoRegion,            // 空き総面積とは別に、連結なpセルを確保できない
+    ActualFeeRejected,   // 配置は可能だが、実際の周長での料金が機会損失以下
+    Accepted,            // 料金比較と配置可能性の両方を通過
 };
 
 struct ArrivalDecision {
@@ -2916,6 +2377,11 @@ void replace_selected_placement_success(TemporalPlacementDiagnostics &diagnostic
     }
 }
 
+// 到着組の通常入場判定。高価な配置探索の前後で料金と機会損失を比較する。
+// 1. 最小周長でも料金<=機会損失なら、どう置いても得しないため即拒否。
+// 2. 連結なpセルを作れなければNoRegion。
+// 3. 実際に選んだ周長での料金<=機会損失なら拒否。
+// 3段階を全て通過した場合だけAcceptedとする。
 ArrivalDecision evaluate_arrival_decision(const vs &park, const vvi &decision_owner,
                                           const vector<GroupState> &groups, int arrival_id, ll current_s,
                                           int remaining_groups, long double theta, long double opportunity_cost,
@@ -2973,10 +2439,10 @@ TurnPlan make_arrival_plan(const ArrivalDecision &decision) {
     return plan;
 }
 
-// This is a deliberately infeasible upper bound: every offered group is
-// assumed to be accepted at its minimum possible perimeter, with no capacity
-// conflict.  Its gap from the realized money is nevertheless an exact way to
-// separate geometry loss, rejected value, and movement cost.
+// スコア悪化の原因を分解するための診断値。
+// 「全到着を衝突なし・最小周長で受け入れる」という実現不能な上界を基準にすると、
+// 実スコアとの差を、拒否した価値・形状損・再配置後の料金損・移動費へ厳密に分解できる。
+// 意思決定には使わず、最終stderrへ出すだけである。
 struct LossDiagnostics {
     int observed = 0;
     int accepted = 0;
@@ -2997,7 +2463,7 @@ struct LossDiagnostics {
     int accepted_source_mismatches = 0;
     int rejected_move_plans = 0;
     int finalized_accepted = 0;
-    // minimum template, extended template, connected growth, unclassified
+    // 最小テンプレート、拡張テンプレート、連結成長、分類不能の順。
     array<int, 4> accepted_by_source{};
     int accepted_grow_and_trim = 0;
 
@@ -3198,6 +2664,7 @@ __attribute__((noinline)) void finalize_loss_diagnostics(
     }
 }
 
+// 再配置探索中の領域を最大50×50bitで表す。重複判定をword単位で行える。
 using BoardMask = array<uint64_t, BOARD_MASK_WORDS>;
 
 BoardMask make_board_mask(const vector<Cell> &cells, int n) {
@@ -3244,11 +2711,17 @@ vector<vi> make_flag_prefix(const vector<char> &flag, int n) {
     return prefix;
 }
 
+// ---------- 再配置探索の診断値 ----------
+// Compact rescueとNoRegion Push-outは探索本体を共有するため、共通値と個別値をまとめて持つ。
+// いずれも最終stderr用で、候補の採否条件には使わない。
 struct RescueDiagnostics {
+    // rescueを検討・構築・採用できたターン数。
     int eligible_fallbacks = 0;
     int feasible_turns = 0;
     int feasible_plans = 0;
     int successes = 0;
+
+    // 2シナリオscreenの結果と、最大2候補の比較状況。
     int rollout_turns = 0;
     int rollout_generation_failures = 0;
     int rollout_adopted = 0;
@@ -3262,6 +2735,8 @@ struct RescueDiagnostics {
     int rollout_candidate_0_disagreements = 0;
     int rollout_candidate_1_disagreements = 0;
     int rollout_same_blocker_sets = 0;
+
+    // rescueのscreenへ通常配置次点も同席させた拡張root比較。
     int root_alternative_available_turns = 0;
     int root_selected_primary = 0;
     int root_selected_alternative = 0;
@@ -3271,6 +2746,8 @@ struct RescueDiagnostics {
     int root_v3_winner_overridden = 0;
     array<int, ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT> root_selected_alternative_rank{};
     array<int, ROOT_ROLLOUT_MAX_ACTIONS + 1> root_turns_by_action_count{};
+
+    // rescueが発生しないターンで、通常配置次点だけをbaselineと比較した結果。
     int normal_root_gate_turns = 0;
     int normal_root_rollout_turns = 0;
     int normal_root_generation_failures = 0;
@@ -3280,6 +2757,8 @@ struct RescueDiagnostics {
     int normal_root_selected_alternative = 0;
     array<int, ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT> normal_root_selected_alternative_rank{};
     array<int, 1 + ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT + 1> normal_root_turns_by_action_count{};
+
+    // screen勝者を独立8シナリオで再確認するholdout。
     int root_confirmation_attempts = 0;
     int root_confirmation_approved = 0;
     int root_confirmation_rejected = 0;
@@ -3288,6 +2767,8 @@ struct RescueDiagnostics {
     int root_confirmation_full_horizon = 0;
     int root_confirmation_short_horizon = 0;
     int root_confirmation_pair_disagreements = 0;
+
+    // 候補生成・移動先修復・最終検証の失敗理由。
     int no_economic_target = 0;
     int no_repair = 0;
     int target_limit_exhausted = 0;
@@ -3297,6 +2778,8 @@ struct RescueDiagnostics {
     int maximum_blockers = 0;
     array<int, 4> feasible_by_blocker_count{};
     array<int, 4> successes_by_blocker_count{};
+
+    // 探索量。速度低下が候補走査・移動先列挙・beam・rolloutのどこ由来かを分解する。
     long long target_anchors = 0;
     long long target_shortlisted = 0;
     long long exact_targets = 0;
@@ -3322,6 +2805,8 @@ struct RescueDiagnostics {
     long long root_confirmation_policy_steps = 0;
     long long root_confirmation_scenarios = 0;
     long long root_confirmation_positive_scenarios = 0;
+
+    // 現在ターンの料金・移動費と、2本のscreen未来で生じた料金差。
     long long moved_groups = 0;
     ll feasible_direct_gain = 0;
     ll arrival_fee_gain = 0;
@@ -3333,6 +2818,8 @@ struct RescueDiagnostics {
     ll root_alternative_scenario_1_future_delta = 0;
     array<ll, RESCUE_ROLLOUT_CANDIDATE_LIMIT> rollout_slot_scenario_0_future_delta{};
     array<ll, RESCUE_ROLLOUT_CANDIDATE_LIMIT> rollout_slot_scenario_1_future_delta{};
+
+    // 採用/不採用別の予測marginと、screenからholdoutまでの改善量。
     long double rollout_adopted_direct_gain = 0.0L;
     long double rollout_adopted_future_mean = 0.0L;
     long double rollout_adopted_margin = 0.0L;
@@ -3350,9 +2837,8 @@ struct RescueDiagnostics {
     long double root_confirmation_approved_margin = 0.0L;
     long double root_confirmation_rejected_margin = 0.0L;
 
-    // NoRegion Push-out is a Reject-vs-relocation decision, unlike the
-    // Accepted-vs-compact rescue above.  Keep its funnel separate so the two
-    // mechanisms can be judged independently even though they share search.
+    // Compact rescueは「受入可能な通常案 vs 再配置案」、Push-outは「拒否 vs 再配置案」
+    // の比較で意味が異なるため、同じ探索を使っても集計は分離する。
     int pushout_eligible = 0;
     int pushout_area_insufficient = 0;
     int pushout_no_economic_target = 0;
@@ -3393,86 +2879,8 @@ struct RescueDiagnostics {
 
 };
 
-struct DeadlineLayerDiagnostics {
-    int eligible = 0;
-    int no_region_eligible = 0;
-    int noncompact_eligible = 0;
-    int area_insufficient = 0;
-    int economic_upper_bound_rejected = 0;
-    int case_budget_skips = 0;
-    int window_budget_skips = 0;
-    int attempts = 0;
-    array<int, 4> attempts_by_window{};
-    array<int, 4> no_region_attempts_by_window{};
-    array<int, 4> noncompact_attempts_by_window{};
-    int graph_builds = 0;
-    int graph_failures = 0;
-    int closure_failures = 0;
-    int workspaces_searched = 0;
-    int layout_failures = 0;
-    int validation_failures = 0;
-    int feasible_turns = 0;
-    int feasible_plans = 0;
-    int complete_plan_attempts = 0;
-    int zero_move_candidates_filtered = 0;
-    int direct_gate_rejected = 0;
-    int rollout_generation_failures = 0;
-    int rollout_turns = 0;
-    int screen_rejected = 0;
-    int confirmation_rejected = 0;
-    int confirmation_attempts = 0;
-    int adopted = 0;
-    int adopted_with_move = 0;
-    int adopted_from_no_region = 0;
-    int closure_limit_exhausted = 0;
-    int layout_limit_exhausted = 0;
-    int template_limit_exhausted = 0;
-    int growth_limit_exhausted = 0;
-    int connectivity_limit_exhausted = 0;
-    int complete_plan_limit_exhausted = 0;
-    int partition_errors = 0;
-    int prefix_connectivity_errors = 0;
-    int direct_identity_errors = 0;
-    long long closure_expansions = 0;
-    long long closure_states = 0;
-    long long completed_closures = 0;
-    long long global_closures = 0;
-    long long layout_nodes = 0;
-    long long region_candidates = 0;
-    long long template_probes = 0;
-    long long growth_steps = 0;
-    long long connectivity_visits = 0;
-    long long connectivity_calls = 0;
-    long long rollout_policy_steps = 0;
-    long long moved_groups = 0;
-    long long moved_cells = 0;
-    ll arrival_fee = 0;
-    ll movement_cost = 0;
-    ll relocation_fee_loss = 0;
-    ll direct_gain = 0;
-    ll scenario_0_future_delta = 0;
-    ll scenario_1_future_delta = 0;
-    long double screen_margin = 0.0L;
-    double cpu_seconds = 0.0;
-    double maximum_turn_cpu_seconds = 0.0;
-};
-
-struct DeadlineLayerCpuScope {
-    DeadlineLayerDiagnostics &diagnostics;
-    clock_t begin;
-
-    explicit DeadlineLayerCpuScope(DeadlineLayerDiagnostics &diagnostics)
-        : diagnostics(diagnostics), begin(clock()) {}
-
-    ~DeadlineLayerCpuScope() {
-        clock_t end = clock();
-        if (begin == (clock_t)-1 || end == (clock_t)-1) return;
-        double seconds = (double)(end - begin) / CLOCKS_PER_SEC;
-        diagnostics.cpu_seconds += seconds;
-        chmax(diagnostics.maximum_turn_cpu_seconds, seconds);
-    }
-};
-
+// 共通rescue探索が増やしたカウンタ差分を、Push-out専用カウンタへ転記するRAII。
+// early returnが多い関数でも、scopeを抜ければ必ず正しい差分とCPU時間を記録できる。
 struct PushOutDiagnosticScope {
     RescueDiagnostics &diagnostics;
     bool active;
@@ -3541,6 +2949,8 @@ struct PushOutDiagnosticScope {
     }
 };
 
+// 全アンカーを累積和だけで安価に順位付けするための仮候補。
+// ここでは衝突セル数と按分移動費だけを持ち、shortlist後に正確なblocker集合へ展開する。
 struct RescueTargetSeed {
     int shape_index = -1;
     int base_x = 0;
@@ -3550,6 +2960,7 @@ struct RescueTargetSeed {
     long long order = 0;
 };
 
+// 到着組を最小周長で置く目標領域と、そのために退かす必要がある既存組。
 struct RescueTarget {
     vector<Cell> cells;
     uint64_t region_hash = 0;
@@ -3567,6 +2978,9 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
                                          bool no_region_pushout, int shortlist_per_metric,
                                          const vector<vector<Shape>> &compact_shapes,
                                          RescueDiagnostics &diagnostics) {
+    // 全最小周長アンカーをまずO(1)の累積和だけで評価する。
+    // 「衝突セル数が少ない」「セル按分した概算移動費が小さい」の2基準でtop-kを取り、
+    // その和集合についてだけ正確なblocker集合・移動費・直接利益を計算する。
     int n = park.size();
     const GroupState &arrival = groups[arrival_id];
     const vector<Shape> &shapes = compact_shapes[arrival.p];
@@ -3638,9 +3052,8 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
         }
     }
 
-    // Keep only the two bounded top-k heaps instead of materializing every
-    // pond-legal anchor and two full index arrays.  The unique enumeration
-    // order is the final key, so this retains exactly the old partial_sort set.
+    // 全アンカーを保存せず、2本の固定長heapだけを持ってメモリを抑える。
+    // 最後のtie-breakは一意な列挙順なので、2基準のtop-k和集合を正確に再現できる。
     vector<RescueTargetSeed> shortlisted;
     shortlisted.reserve(occupied_shortlist.size() + fractional_shortlist.size());
     shortlisted.insert(shortlisted.end(), occupied_shortlist.begin(), occupied_shortlist.end());
@@ -3670,8 +3083,7 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
                 blockers.push_back(id);
             }
         }
-        // A no-blocker minimum template would have been found by the normal
-        // compact enumeration, so it is not a relocation action.
+        // blocker 0の最小周長領域は通常配置ですでに発見されるため、再配置候補ではない。
         if (blockers.empty()) continue;
         sort(blockers.begin(), blockers.end());
         ll movement_cost_sum = 0;
@@ -3715,6 +3127,10 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
     return result;
 }
 
+// 既存組1つの移動先候補。
+// maskは他の移動先との重複判定に使う。fallback_overlapはCompact rescueなら元の到着領域、
+// Push-outなら再配置前から空いていた領域との重なりで、cleared_overlapは今回blockerを
+// 撤去して初めて空いた領域の再利用量、temporal_costは退去時刻境界の悪さを表す。
 struct RescueDestination {
     vector<Cell> cells;
     BoardMask mask{};
@@ -3726,6 +3142,9 @@ struct RescueDestination {
     long long order = 0;
 };
 
+// 移動先領域の外周について、隣接組との「現在から退去まで残る確率」の差を合計する。
+// 退去時刻が近い組を隣接させると同時期に大きな空きが生まれやすいため、この値を小さくする。
+// cell_maskで候補内部の辺は除き、空きセルの残存確率は0として扱う。
 long double rescue_destination_temporal_cost(const vector<Cell> &cells, const BoardMask &cell_mask,
                                              const vs &park, const vvi &base_owner,
                                              const vector<GroupState> &groups, int mover_id, int arrival_id,
@@ -3760,6 +3179,9 @@ vector<RescueDestination> make_rescue_destinations(
     const vector<vector<Shape>> &all_shapes, int &remaining_destination_anchors,
     int anchor_limit, int legal_limit, int destination_limit,
     RescueDiagnostics &diagnostics) {
+    // 1つのblockerについて移動先候補を作る。
+    // 「現在までに確定した料金」を悪化させない周長の形だけを許し、
+    // 到着組の通常配置との重なり、今回空ける領域の再利用、退去時刻境界で順位付けする。
     int n = park.size();
     const GroupState &group = groups[mover_id];
     vector<vi> blocked_prefix = make_blocked_prefix(park, base_owner);
@@ -3777,6 +3199,7 @@ vector<RescueDestination> make_rescue_destinations(
     }
     if (eligible_shapes.empty()) return {};
 
+    // 各shapeのアンカーを互いに素なstrideで巡回し、特定shapeだけで予算を使い切らない。
     vector<int> samples(eligible_shapes.size());
     vector<int> anchor_counts(eligible_shapes.size());
     vector<int> starts(eligible_shapes.size());
@@ -3894,6 +3317,9 @@ optional<vector<int>> repair_rescue_blockers(const vvi &base_owner, const vector
                                              const vector<int> &blockers,
                                              const vector<vector<RescueDestination>> &pools,
                                              int &remaining_nodes, RescueDiagnostics &diagnostics) {
+    // 複数blockerの移動先を、互いに重ならないよう同時に選ぶ。
+    // 候補数・面積・退去時刻で作った複数の挿入順についてgreedyを先に試し、
+    // greedyが衝突した場合だけbeam searchで組合せを修復する。
     int blocker_count = blockers.size();
     vector<vector<int>> orders;
     auto add_order = [&](vector<int> order) {
@@ -3927,9 +3353,8 @@ optional<vector<int>> repair_rescue_blockers(const vvi &base_owner, const vector
     add_order(indices);
 
     BoardMask base_mask = make_occupied_mask(base_owner);
-    // Try every deterministic spine before spending any beam nodes.  Thus an
-    // exhausted first beam cannot hide an easy arbitrary-depth solution under
-    // a different insertion order.
+    // beam予算を使う前に、全ての決定的な挿入順でgreedyを試す。
+    // ある順序のbeamが予算切れでも、別順序で簡単に置ける解を見逃さないためである。
     for (const vector<int> &insertion_order : orders) {
         BoardMask greedy_mask = base_mask;
         vector<int> greedy_choice(blocker_count, -1);
@@ -3952,8 +3377,7 @@ optional<vector<int>> repair_rescue_blockers(const vvi &base_owner, const vector
         if (greedy_complete) return greedy_choice;
     }
 
-    // The bounded beam only repairs greedy collisions; it is not the only path
-    // capable of reaching the full blocker depth.
+    // beamはgreedyの衝突を修復する補助であり、深いblocker数を最初から制限しない。
     long long state_order = 0;
     for (const vector<int> &insertion_order : orders) {
         vector<RescueBeamState> beam(1);
@@ -4004,6 +3428,9 @@ optional<vector<int>> repair_rescue_blockers(const vvi &base_owner, const vector
     return nullopt;
 }
 
+// rescue探索が作った計画を、探索時の近似値に依存せず最初から検証する。
+// 移動元を全て消してから、各移動先と到着領域について面積・連結性・池・重複・周長を確認し、
+// 既存組の料金損と実際の移動費も再計算する。ここを通った計画だけをrollout候補にする。
 bool validate_and_build_rescue_owner(const TurnPlan &plan, const vs &park, const vvi &owner,
                                      const vector<GroupState> &groups, int arrival_id, int r_milli,
                                      vvi &final_owner, ll &fee_loss, ll &movement_cost_sum) {
@@ -4056,6 +3483,7 @@ bool validate_and_build_rescue_owner(const TurnPlan &plan, const vs &park, const
     return expected_gain == plan.immediate_gain;
 }
 
+// rollout内だけで使う仮想到着。実入力のGroupStateとは分け、残り組数と再推定thetaも保持する。
 struct RescueSyntheticArrival {
     ll s = 0;
     ll t = 0;
@@ -4065,6 +3493,7 @@ struct RescueSyntheticArrival {
     int remaining_after = 0;
 };
 
+// 低食い違い列の1次元成分。base 2/3/5/7を滞在時間・開始時刻・面積・価値へ割り当てる。
 long double rescue_radical_inverse(uint64_t index, int base) {
     long double inverse_base = 1.0L / base;
     long double place = inverse_base;
@@ -4077,6 +3506,7 @@ long double rescue_radical_inverse(uint64_t index, int base) {
     return clamp(result, 1e-9L, 1.0L - 1e-9L);
 }
 
+// 同じ実ターンなら常に同じシナリオを作り、異なるターンでは列の開始位置をずらすためのhash。
 uint64_t rescue_sequence_offset(const vector<GroupState> &groups, int arrival_id, ll current_s) {
     uint64_t value = (uint64_t)(arrival_id + 1) * 0x9e3779b97f4a7c15ULL;
     value ^= (uint64_t)current_s + 0xbf58476d1ce4e5b9ULL;
@@ -4091,6 +3521,9 @@ struct RescueRolloutScenarios {
     bool complete = true;
 };
 
+// 現在までの観測だけから、root action間で共有する未来到着列を決定的に作る。
+// screenではthetaの点推定を使う反対変数2シナリオ、confirmationではthetaの事後分位点を使う
+// 反対変数8シナリオを生成する。batchを分けることで両者のサンプル列は重ならない。
 RescueRolloutScenarios make_rescue_rollout_scenarios(
     const vector<GroupState> &groups, int arrival_id, ll current_s, int remaining_groups, long double theta,
     const ThetaEstimator &theta_estimator, int scenario_count = ROOT_SCREEN_SCENARIO_COUNT,
@@ -4117,8 +3550,8 @@ RescueRolloutScenarios make_rescue_rollout_scenarios(
     for (int scenario = 0; scenario < scenario_count; scenario++) {
         int pair_index = scenario / 2;
         bool antithetic = scenario % 2 == 1;
-        // A sampled latent theta controls only future-input generation.  The
-        // online policy's theta stored in each spec is still re-estimated below.
+        // ここで選ぶ潜在thetaは未来入力の生成だけに使う。
+        // 仮想オンライン方策が見るthetaは、生成した到着を1件ずつ観測した体で下で再推定する。
         long double generation_theta = theta;
         if (posterior_predictive) {
             long double pair_quantile = (2.0L * pair_index + 1.0L) / scenario_count;
@@ -4126,8 +3559,8 @@ RescueRolloutScenarios make_rescue_rollout_scenarios(
                 theta_estimator.posterior_quantile(current_s, remaining_groups, pair_quantile);
         }
         ConditionalFutureDemand future_demand(current_s, generation_theta);
-        // Batch 0 / pair 0 is exactly the legacy screen sequence.  Confirmation
-        // uses batch 1 and four disjoint blocks, one per antithetic pair.
+        // screenの第1ペアはsequence block 0を使う。
+        // confirmationはbatch 1の互いに素な4区間を、反対変数の各組へ1区間ずつ割り当てる。
         uint64_t sequence_block =
             (uint64_t)batch * ROOT_ROLLOUT_SEQUENCE_BLOCKS_PER_BATCH + pair_index;
         uint64_t sequence_block_offset = sequence_block * ROOT_ROLLOUT_SEQUENCE_BLOCK_SIZE;
@@ -4191,8 +3624,9 @@ RescueRolloutScenarios make_rescue_rollout_scenarios(
             used_times.insert(end);
             generated.push_back({start, end, p, v, attempt});
         }
-        // The rollout needs the chronological prefix among all remaining
-        // groups.  A prefix of a partial sample would be biased toward later S.
+        // 必要なのは「残り全組を開始時刻で並べた先頭」である。
+        // 最初からrollout長だけ生成すると、遅い開始時刻の組を先頭と誤認して偏るため、
+        // いったん残り全組を生成・整列してから必要なprefixだけを取り出す。
         if ((int)generated.size() != remaining_groups) {
             result.complete = false;
             return result;
@@ -4217,6 +3651,7 @@ RescueRolloutScenarios make_rescue_rollout_scenarios(
     return result;
 }
 
+// 1つのroot actionを適用した直後から始まる、仮想未来専用の盤面状態。
 struct RescueRolloutState {
     vvi owner;
     vector<GroupState> groups;
@@ -4251,13 +3686,13 @@ struct RescueRolloutOutcome {
     int acceptances = 0;
 };
 
+// 1本の仮想到着列を、指定されたroot action後の盤面から通常方策だけで進める。
+// 未来ターンでは再配置探索を再帰的に呼ばず、受け入れた組の料金合計だけをbranch間で比較する。
 RescueRolloutOutcome evaluate_rescue_rollout_branch(
     const vs &park, const vvi &final_owner, const vector<GroupState> &groups, int arrival_id,
     const TurnPlan &plan, const vector<RescueSyntheticArrival> &scenario, int grass_cells,
     const DensityModel &density_model, SampledDlpShadowModel &sampled_dlp_model,
     const vector<vector<Shape>> &compact_shapes) {
-    // Future arrivals use the ordinary online policy and never recurse into
-    // rescue.  Only their realized fees are compared between the two roots.
     RescueRolloutState state =
         make_rescue_rollout_state(final_owner, groups, arrival_id, plan, scenario.size());
     RescueRolloutOutcome result;
@@ -4281,10 +3716,8 @@ RescueRolloutOutcome evaluate_rescue_rollout_branch(
 
         ShadowEvaluation shadow;
         if constexpr (ENABLE_SAMPLED_DLP) {
-            // Every root branch shares the real turn's frozen bid-price
-            // snapshot.  Re-solving from a sampled branch would give its
-            // synthetic future privileged information and would no longer be
-            // the isolated DLP-for-shadow replacement tested here.
+            // 全branchで実ターン時点のDLP価格を凍結して共有する。
+            // 仮想入力を見てDLPを解き直すと、実方策にはない未来情報をbranchへ与えてしまう。
             shadow = sampled_dlp_model.evaluate_cached(
                 spec.s, spec.t, spec.p, true, spec.remaining_after);
         } else {
@@ -4308,12 +3741,17 @@ RescueRolloutOutcome evaluate_rescue_rollout_branch(
     return result;
 }
 
+// confirmationへ渡す行動branchの軽量view。盤面はすでにその行動を適用済みで、
+// direct_vs_baselineには現在ターンだけのbaseline比を入れる。
 struct RootBranchView {
     const TurnPlan *plan = nullptr;
     const vvi *final_owner = nullptr;
     ll direct_vs_baseline = 0;
 };
 
+// 2シナリオの安いscreenで従来案を上回った挑戦案を、独立な8シナリオで再確認する。
+// 「現在ターンの直接差 + 未来12到着の料金差」の平均が正のときだけ上書きを許す。
+// ケース全体で最大4回に制限し、偶然screenへ適合した配置を採用しにくくする。
 bool confirm_root_override(
     const vs &park, const vector<GroupState> &groups, int arrival_id, ll current_s, int remaining_groups,
     long double theta, const ThetaEstimator &theta_estimator, int grass_cells,
@@ -4394,11 +3832,14 @@ bool confirm_root_override(
     return false;
 }
 
+// 拡張root探索が採用した、出力計画とその到着判定の組。
 struct RootActionResult {
     TurnPlan plan;
     ArrivalDecision arrival_decision;
 };
 
+// 現在ターンで比較する行動の種類。
+// Baselineは通常方策、Rescueは既存組を動かす案、NormalAlternativeは通常配置の次点案。
 enum class RootActionKind {
     Baseline,
     Rescue,
@@ -4406,10 +3847,13 @@ enum class RootActionKind {
 };
 
 enum class RescueMode {
+    // 通常案でも受入可能だが周長が悪い到着を、再配置により最小周長へ整える。
     CompactAccepted,
+    // 空き面積は足りるのに断片化で置けない到着を、既存組を押し出して受け入れる。
     NoRegionPushOut,
 };
 
+// 合法性を再検証済みのrescue案。direct_gainは通常案との差で、未来価値はまだ含まない。
 struct PreparedRescueCandidate {
     TurnPlan plan;
     vvi final_owner;
@@ -4419,6 +3863,13 @@ struct PreparedRescueCandidate {
     ll movement_cost = 0;
 };
 
+// Compact rescue / NoRegion Push-outを共通の探索器で作り、通常案と比較する中心関数。
+// 1. 最小周長テンプレートのうち、退かす既存組が少なく経済的な目標領域を絞る。
+// 2. blockerを一度全て消し、互いに重ならない移動先をgreedy + beamで組み合わせる。
+// 3. 完成計画を独立に合法性検証し、現在ターンだけでも通常案より得なものを最大2案残す。
+// 4. 共通の仮想到着列で通常案・rescue案・通常配置次点案をscreenする。
+// 5. baselineとrescueだけのscreen勝者を通常配置次点が上回った場合だけ、独立holdoutで再確認する。
+// 採用できる案がなければnulloptを返し、呼び出し元は通常案をそのまま使う。
 optional<RootActionResult> choose_root_action_with_rescue(
     const vs &park, const vvi &owner, const vector<GroupState> &groups, int arrival_id, ll current_s,
     int remaining_groups, int r_milli, long double theta, const ThetaEstimator &theta_estimator,
@@ -4451,8 +3902,8 @@ optional<RootActionResult> choose_root_action_with_rescue(
                 }
             }
         }
-        // Relocation preserves occupied area, so it cannot repair a capacity
-        // shortage.  Restrict Push-out to genuinely fragmented NoRegion turns.
+        // 再配置では占有セル総数が変わらないため、純粋な面積不足は直せない。
+        // Push-outは「総空き面積は足りるが連結領域がない」断片化だけを対象にする。
         if ((int)preexisting_free_cells.size() < arrival.p) {
             diagnostics.pushout_area_insufficient++;
             return nullopt;
@@ -4468,9 +3919,8 @@ optional<RootActionResult> choose_root_action_with_rescue(
             if (group.active) chmin(minimum_move_cost, move_cost(group.v, r_milli));
         }
         ll compact_fee = round_payment(arrival.v, arrival.p, minimum_perimeter);
-        // Every Push-out target has at least one blocker.  If even the
-        // cheapest possible single move fails the admission shadow, no exact
-        // target scan can produce an eligible action.
+        // Push-outでは必ず1組以上を動かす。最安の1回分の移動費を引いただけで
+        // 入場shadowを下回るなら、正確な目標領域を走査しても採用可能な案は存在しない。
         if (minimum_move_cost == numeric_limits<ll>::max() ||
             (long double)(compact_fee - minimum_move_cost) <= opportunity_cost) {
             diagnostics.no_economic_target++;
@@ -4478,9 +3928,9 @@ optional<RootActionResult> choose_root_action_with_rescue(
             return nullopt;
         }
     }
-    // Push-out must first satisfy the same full-horizon admission shadow as an
-    // ordinary arrival.  The short common-random-number rollout below is an
-    // additional veto for near-future geometry, not another score deduction.
+    // Push-outにも通常入場と同じ全期間shadowを課す。
+    // 後段の短い共通乱数rolloutは直近の盤面形状を見る追加の拒否判定であり、
+    // shadowをもう一度料金から差し引くものではない。
     long double direct_gain_threshold = no_region_pushout ? opportunity_cost : 0.0L;
     vector<RescueTarget> targets = make_rescue_targets(
         park, owner, groups, arrival_id, r_milli, baseline_score, direct_gain_threshold,
@@ -4514,6 +3964,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
     const vector<Cell> &preferred_destination_cells =
         mode == RescueMode::NoRegionPushOut ? preexisting_free_cells : *baseline.cells;
 
+    // shortlist順に目標領域を修復する。探索予算か候補2案のどちらかを使い切れば止める。
     for (const RescueTarget &target : targets) {
         if (attempted_targets == target_repair_limit || remaining_nodes == 0 ||
             (int)candidates.size() == RESCUE_ROLLOUT_CANDIDATE_LIMIT) {
@@ -4523,6 +3974,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
         diagnostics.repair_attempts++;
         chmax(diagnostics.maximum_blockers, (int)target.blockers.size());
 
+        // 到着領域に衝突するblockerを全て一時撤去し、到着組を先に固定した盤面を作る。
         vvi base_owner = owner;
         vector<char> cleared_mask(park.size() * park.size(), false);
         for (int id : target.blockers) {
@@ -4542,6 +3994,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
             continue;
         }
 
+        // blockerごとの移動先候補poolを作り、その直積から重ならない組合せを探す。
         vector<vector<RescueDestination>> pools;
         pools.reserve(target.blockers.size());
         bool missing_destination = false;
@@ -4573,6 +4026,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
         ll compact_fee = round_payment(arrival.v, arrival.p, target.perimeter);
         plan.immediate_gain = compact_fee - target.movement_cost;
 
+        // 探索中の差分更新を信用せず、完成計画を元盤面から再構築して検算する。
         vvi final_owner;
         ll fee_loss = 0;
         ll checked_movement_cost = 0;
@@ -4618,14 +4072,14 @@ optional<RootActionResult> choose_root_action_with_rescue(
             if (!generation_ok) {
                 diagnostics.rollout_generation_failures++;
                 if (no_region_pushout) {
-                    // Reject-to-Accept is a larger intervention.  Without the
-                    // common-random-number comparison, retain Reject.
+                    // RejectからAcceptへ変えるPush-outは影響が大きい。
+                    // 共通乱数比較を作れない場合は安全側に倒し、元のRejectを維持する。
                     diagnostics.pushout_rollout_generation_failures++;
                     diagnostics.pushout_screen_rejected++;
                     return nullopt;
                 }
-                // Scenario construction is only a filter for the existing
-                // Accepted rescue.  Preserve its legal positive-direct action.
+                // Compact rescueでは元々Acceptであり、rolloutは合法かつ直接得な再配置への追加filterである。
+                // シナリオ生成だけが失敗した場合は、現在ターンで得な第1候補を残す。
                 stop_after_primary = true;
                 break;
             }
@@ -4682,6 +4136,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
             }
         }
 
+        // 全行動を同じ2本の未来で評価するため、まず通常案の未来料金を基準値として計算する。
         vvi baseline_final_owner = owner;
         if (baseline.cells) place_cells(baseline_final_owner, *baseline.cells, arrival_id);
         TurnPlan baseline_plan = make_arrival_plan(baseline);
@@ -4699,6 +4154,8 @@ optional<RootActionResult> choose_root_action_with_rescue(
             array<ll, RESCUE_ROLLOUT_SCENARIO_COUNT> future_delta{};
             ll margin_twice = 0;
         };
+        // margin_twice = 2×現在の直接差 + 2シナリオの未来料金差。
+        // 除算せず整数のまま比較し、同点順序と丸め誤差を固定する。
         vector<CandidateRolloutEvaluation> evaluations(candidates.size());
         for (int candidate_index = 0; candidate_index < (int)candidates.size(); candidate_index++) {
             const PreparedRescueCandidate &candidate = candidates[candidate_index];
@@ -4765,9 +4222,9 @@ optional<RootActionResult> choose_root_action_with_rescue(
 
         ll best_root_margin_twice = 0;
         selected_kind = RootActionKind::Baseline;
-        // Establish the exact v3 winner first.  Every new action must beat
-        // this protected branch both on the cheap screen and on an independent
-        // posterior-predictive holdout.
+        // まずbaselineとrescue案だけでscreen勝者を決め、これを保護対象として確定する。
+        // 新しく追加した通常配置次点は、安いscreenと独立な事後予測holdoutの両方で
+        // この保護対象を上回った場合に限って採用する。
         for (int candidate_index = 0; candidate_index < (int)candidates.size(); candidate_index++) {
             if (evaluations[candidate_index].margin_twice > best_root_margin_twice) {
                 best_root_margin_twice = evaluations[candidate_index].margin_twice;
@@ -4915,8 +4372,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
     selected.cells = *chosen.plan.arrival;
     selected.perimeter = chosen.plan.arrival_perimeter;
     selected.fee = chosen.compact_fee;
-    // Whether the protected action was connected growth or Reject, the
-    // selected arrival is now a minimum-perimeter template.
+    // 元の通常案が連結成長でもRejectでも、採用したrescue案の到着領域は最小周長テンプレートである。
     replace_selected_placement_success(selected.diagnostics, PlacementSource::MinimumTemplate);
     diagnostics.successes++;
     diagnostics.successes_by_blocker_count[blocker_bucket]++;
@@ -4936,6 +4392,9 @@ optional<RootActionResult> choose_root_action_with_rescue(
     return RootActionResult{std::move(chosen.plan), std::move(selected)};
 }
 
+// 再配置を伴わない通常配置の次点案を、baselineと同じroot比較へ載せる。
+// 高価なので、呼び出し側が「各進行度区間で最大1回」に絞ったターンだけ実行する。
+// 2シナリオscreenで勝った後、独立holdoutでも勝った場合にだけ次点案を返す。
 optional<RootActionResult> choose_normal_root_action(
     const vs &park, const vvi &owner, const vector<GroupState> &groups, int arrival_id,
     ll current_s, int remaining_groups, long double theta, const ThetaEstimator &theta_estimator,
@@ -4982,6 +4441,7 @@ optional<RootActionResult> choose_normal_root_action(
     diagnostics.normal_root_actions_compared += action_count;
     diagnostics.normal_root_turns_by_action_count[action_count]++;
 
+    // baselineの未来料金を先に計算し、全次点案で同じ基準・同じシナリオを共有する。
     vvi baseline_owner = owner;
     place_cells(baseline_owner, *baseline.cells, arrival_id);
     TurnPlan baseline_plan = make_arrival_plan(baseline);
@@ -5005,6 +4465,7 @@ optional<RootActionResult> choose_normal_root_action(
     alternative_decisions.reserve(available_alternatives.size());
     alternative_owners.reserve(available_alternatives.size());
 
+    // 現在料金の差と未来料金の差を足し、平均が正になる最良の次点案をscreen勝者とする。
     RootActionKind selected_kind = RootActionKind::Baseline;
     int selected_alternative = -1;
     ll best_margin_twice = 0;
@@ -5072,1467 +4533,8 @@ optional<RootActionResult> choose_normal_root_action(
                             std::move(alternative_decisions[selected_alternative])};
 }
 
-// ---------------------------------------------------------------------------
-// Deadline-layer canonical rebuilding
-// ---------------------------------------------------------------------------
 
-bool deadline_mask_has(const BoardMask &mask, int index) {
-    return (mask[index >> 6] >> (index & 63)) & 1ULL;
-}
-
-void deadline_mask_set(BoardMask &mask, int index) {
-    mask[index >> 6] |= 1ULL << (index & 63);
-}
-
-void deadline_mask_reset(BoardMask &mask, int index) {
-    mask[index >> 6] &= ~(1ULL << (index & 63));
-}
-
-int deadline_mask_count(const BoardMask &mask) {
-    int result = 0;
-    for (uint64_t word : mask) result += __builtin_popcountll(word);
-    return result;
-}
-
-bool deadline_mask_subset(const BoardMask &part, const BoardMask &whole) {
-    for (int word = 0; word < BOARD_MASK_WORDS; word++) {
-        if (part[word] & ~whole[word]) return false;
-    }
-    return true;
-}
-
-BoardMask deadline_mask_difference(const BoardMask &whole, const BoardMask &part) {
-    BoardMask result{};
-    for (int word = 0; word < BOARD_MASK_WORDS; word++) {
-        result[word] = whole[word] & ~part[word];
-    }
-    return result;
-}
-
-BoardMask deadline_mask_union(const BoardMask &lhs, const BoardMask &rhs) {
-    BoardMask result = lhs;
-    merge_mask(result, rhs);
-    return result;
-}
-
-uint64_t deadline_mask_hash(const BoardMask &mask) {
-    uint64_t result = 0x9e3779b97f4a7c15ULL;
-    for (uint64_t word : mask) {
-        word += 0x9e3779b97f4a7c15ULL;
-        word = (word ^ (word >> 30)) * 0xbf58476d1ce4e5b9ULL;
-        word = (word ^ (word >> 27)) * 0x94d049bb133111ebULL;
-        word ^= word >> 31;
-        result ^= word + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
-    }
-    return result;
-}
-
-vector<Cell> deadline_mask_cells(const BoardMask &mask, int n) {
-    vector<Cell> cells;
-    cells.reserve(deadline_mask_count(mask));
-    for (int index = 0; index < n * n; index++) {
-        if (deadline_mask_has(mask, index)) cells.emplace_back(index / n, index % n);
-    }
-    return cells;
-}
-
-struct DeadlineAtom {
-    bool is_free = false;
-    int group_id = -1;
-    vector<Cell> cells;
-    vector<int> adjacent;
-};
-
-struct DeadlineQuotientGraph {
-    int n = 0;
-    vector<DeadlineAtom> atoms;
-    vector<int> cell_atom;
-    vector<int> free_atoms;
-};
-
-optional<DeadlineQuotientGraph> build_deadline_quotient_graph(
-    const vs &park, const vvi &owner, const vector<GroupState> &groups) {
-    int n = park.size();
-    DeadlineQuotientGraph graph;
-    graph.n = n;
-    graph.cell_atom.assign(n * n, -1);
-    graph.atoms.reserve(n * n);
-
-    // Active groups are owner-closed atoms: selecting one always selects its
-    // complete old region, which is essential for simultaneous swaps/cycles.
-    for (int id = 0; id < (int)groups.size(); id++) {
-        if (!groups[id].active) continue;
-        int atom_id = graph.atoms.size();
-        DeadlineAtom atom;
-        atom.group_id = id;
-        atom.cells = groups[id].cells;
-        if ((int)atom.cells.size() != groups[id].p) return nullopt;
-        for (auto [x, y] : atom.cells) {
-            if (!inside(x, y, n, n) || park[x][y] != '.' || owner[x][y] != id) return nullopt;
-            int cell = x * n + y;
-            if (graph.cell_atom[cell] != -1) return nullopt;
-            graph.cell_atom[cell] = atom_id;
-        }
-        graph.atoms.push_back(std::move(atom));
-    }
-
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-    array<int, 2500> que{};
-    for (int start = 0; start < n * n; start++) {
-        int sx = start / n;
-        int sy = start % n;
-        if (park[sx][sy] != '.' || owner[sx][sy] != -1 || graph.cell_atom[start] != -1) continue;
-        int atom_id = graph.atoms.size();
-        graph.atoms.push_back(DeadlineAtom{});
-        DeadlineAtom &atom = graph.atoms.back();
-        atom.is_free = true;
-        graph.free_atoms.push_back(atom_id);
-        int head = 0;
-        int tail = 0;
-        que[tail++] = start;
-        graph.cell_atom[start] = atom_id;
-        while (head < tail) {
-            int cell = que[head++];
-            int x = cell / n;
-            int y = cell % n;
-            atom.cells.emplace_back(x, y);
-            for (int dir = 0; dir < 4; dir++) {
-                int nx = x + DX[dir];
-                int ny = y + DY[dir];
-                if (!inside(nx, ny, n, n)) continue;
-                int next = nx * n + ny;
-                if (park[nx][ny] != '.' || owner[nx][ny] != -1 || graph.cell_atom[next] != -1) continue;
-                graph.cell_atom[next] = atom_id;
-                que[tail++] = next;
-            }
-        }
-    }
-
-    vector<pair<int, int>> edges;
-    edges.reserve(2 * n * n);
-    for (int x = 0; x < n; x++) {
-        for (int y = 0; y < n; y++) {
-            if (park[x][y] != '.') continue;
-            int from = graph.cell_atom[x * n + y];
-            if (from < 0) return nullopt;
-            if (x + 1 < n && park[x + 1][y] == '.') {
-                int to = graph.cell_atom[(x + 1) * n + y];
-                if (from != to) edges.emplace_back(min(from, to), max(from, to));
-            }
-            if (y + 1 < n && park[x][y + 1] == '.') {
-                int to = graph.cell_atom[x * n + y + 1];
-                if (from != to) edges.emplace_back(min(from, to), max(from, to));
-            }
-        }
-    }
-    sort(edges.begin(), edges.end());
-    edges.erase(unique(edges.begin(), edges.end()), edges.end());
-    for (auto [from, to] : edges) {
-        graph.atoms[from].adjacent.push_back(to);
-        graph.atoms[to].adjacent.push_back(from);
-    }
-    return graph;
-}
-
-struct DeadlineClosureState {
-    BoardMask atoms{};
-    int free_area = 0;
-    int total_area = 0;
-    ll proxy_move_cost = 0;
-    bool expanded_after_feasible = false;
-    uint64_t order = 0;
-};
-
-struct DeadlineClosureOrder {
-    int required_free = 0;
-
-    bool operator()(const DeadlineClosureState &lhs, const DeadlineClosureState &rhs) const {
-        auto key = [&](const DeadlineClosureState &state) {
-            int deficit = max(0, required_free - state.free_area);
-            return tuple<int, ll, int, int, uint64_t>{
-                deficit, state.proxy_move_cost, state.total_area, -state.free_area, state.order};
-        };
-        return key(lhs) > key(rhs);
-    }
-};
-
-DeadlineClosureState make_deadline_seed_closure(const DeadlineQuotientGraph &graph, int free_atom,
-                                                uint64_t order) {
-    DeadlineClosureState state;
-    deadline_mask_set(state.atoms, free_atom);
-    state.free_area = graph.atoms[free_atom].cells.size();
-    state.total_area = state.free_area;
-    state.order = order;
-    return state;
-}
-
-DeadlineClosureState extend_deadline_closure(
-    const DeadlineClosureState &parent, int group_atom, const DeadlineQuotientGraph &graph,
-    const vector<GroupState> &groups, int r_milli, uint64_t order) {
-    DeadlineClosureState child = parent;
-    child.order = order;
-    child.expanded_after_feasible = parent.free_area > 0 && parent.expanded_after_feasible;
-    if (!deadline_mask_has(child.atoms, group_atom)) {
-        deadline_mask_set(child.atoms, group_atom);
-        const DeadlineAtom &atom = graph.atoms[group_atom];
-        child.total_area += atom.cells.size();
-        ll candidate_cost = move_cost(groups[atom.group_id].v, r_milli);
-        child.proxy_move_cost = child.proxy_move_cost == 0
-                                    ? candidate_cost
-                                    : min(child.proxy_move_cost, candidate_cost);
-    }
-    // FreeClose: once a group is selected, take every adjacent current free
-    // component.  This prevents a workspace from arbitrarily cutting away the
-    // free reservoir exposed around that group.
-    for (int next : graph.atoms[group_atom].adjacent) {
-        const DeadlineAtom &atom = graph.atoms[next];
-        if (!atom.is_free || deadline_mask_has(child.atoms, next)) continue;
-        deadline_mask_set(child.atoms, next);
-        child.free_area += atom.cells.size();
-        child.total_area += atom.cells.size();
-    }
-    return child;
-}
-
-vector<DeadlineClosureState> enumerate_deadline_closures(
-    const DeadlineQuotientGraph &graph, const vector<GroupState> &groups, int required_free,
-    int r_milli, int &turn_expansions, DeadlineLayerDiagnostics &diagnostics) {
-    priority_queue<DeadlineClosureState, vector<DeadlineClosureState>, DeadlineClosureOrder> queue(
-        DeadlineClosureOrder{required_free});
-    set<BoardMask> seen;
-    uint64_t order = 0;
-    for (int atom : graph.free_atoms) {
-        DeadlineClosureState state = make_deadline_seed_closure(graph, atom, order++);
-        if (seen.insert(state.atoms).second) queue.push(std::move(state));
-    }
-
-    vector<DeadlineClosureState> complete;
-    while (!queue.empty()) {
-        DeadlineClosureState state = queue.top();
-        queue.pop();
-        diagnostics.closure_states++;
-        bool feasible = state.free_area >= required_free;
-        if (feasible) {
-            complete.push_back(state);
-            diagnostics.completed_closures++;
-            if ((int)complete.size() >= 2 * DEADLINE_CLOSURE_KEEP_LIMIT || state.expanded_after_feasible) {
-                continue;
-            }
-        }
-
-        vector<int> frontier;
-        for (int atom = 0; atom < (int)graph.atoms.size(); atom++) {
-            if (!deadline_mask_has(state.atoms, atom)) continue;
-            for (int next : graph.atoms[atom].adjacent) {
-                if (deadline_mask_has(state.atoms, next) || graph.atoms[next].is_free) continue;
-                frontier.push_back(next);
-            }
-        }
-        sort(frontier.begin(), frontier.end(), [&](int lhs, int rhs) {
-            auto key = [&](int atom_id) {
-                int free_gain = 0;
-                for (int next : graph.atoms[atom_id].adjacent) {
-                    if (graph.atoms[next].is_free && !deadline_mask_has(state.atoms, next)) {
-                        free_gain += graph.atoms[next].cells.size();
-                    }
-                }
-                int deficit = max(0, required_free - state.free_area - free_gain);
-                ll cost = move_cost(groups[graph.atoms[atom_id].group_id].v, r_milli);
-                return tuple<int, ll, int, int>{deficit, cost, -free_gain, atom_id};
-            };
-            return key(lhs) < key(rhs);
-        });
-        frontier.erase(unique(frontier.begin(), frontier.end()), frontier.end());
-        if (feasible && (int)frontier.size() > 4) frontier.resize(4);
-        for (int group_atom : frontier) {
-            if (turn_expansions >= DEADLINE_CLOSURE_EXPANSION_TURN_LIMIT ||
-                diagnostics.closure_expansions >= DEADLINE_CLOSURE_EXPANSION_CASE_LIMIT) {
-                diagnostics.closure_limit_exhausted++;
-                break;
-            }
-            turn_expansions++;
-            diagnostics.closure_expansions++;
-            DeadlineClosureState child = extend_deadline_closure(
-                state, group_atom, graph, groups, r_milli, order++);
-            if (feasible) child.expanded_after_feasible = true;
-            if (seen.insert(child.atoms).second) queue.push(std::move(child));
-        }
-        if (turn_expansions >= DEADLINE_CLOSURE_EXPANSION_TURN_LIMIT ||
-            diagnostics.closure_expansions >= DEADLINE_CLOSURE_EXPANSION_CASE_LIMIT) {
-            break;
-        }
-    }
-
-    auto closure_key = [](const DeadlineClosureState &state) {
-        return tuple<ll, int, int, uint64_t>{
-            state.proxy_move_cost, state.total_area, -state.free_area, state.order};
-    };
-    sort(complete.begin(), complete.end(), [&](const DeadlineClosureState &lhs,
-                                               const DeadlineClosureState &rhs) {
-        return closure_key(lhs) < closure_key(rhs);
-    });
-    vector<DeadlineClosureState> retained;
-    for (const DeadlineClosureState &state : complete) {
-        if ((int)retained.size() == DEADLINE_CLOSURE_KEEP_LIMIT - 1) break;
-        retained.push_back(state);
-    }
-
-    // Also expose one true global candidate: every atom in one quotient-graph
-    // component.  It is admitted only when even one node per item fits the
-    // remaining deterministic layout budget; there is no group-count rule.
-    vector<char> graph_seen(graph.atoms.size(), false);
-    optional<DeadlineClosureState> global;
-    for (int seed : graph.free_atoms) {
-        if (graph_seen[seed]) continue;
-        DeadlineClosureState state;
-        vector<int> stack{seed};
-        graph_seen[seed] = true;
-        int item_count = 0;
-        while (!stack.empty()) {
-            int atom_id = stack.back();
-            stack.pop_back();
-            const DeadlineAtom &atom = graph.atoms[atom_id];
-            deadline_mask_set(state.atoms, atom_id);
-            state.total_area += atom.cells.size();
-            if (atom.is_free) {
-                state.free_area += atom.cells.size();
-            } else {
-                item_count++;
-                ll candidate_cost = move_cost(groups[atom.group_id].v, r_milli);
-                state.proxy_move_cost = state.proxy_move_cost == 0
-                                            ? candidate_cost
-                                            : min(state.proxy_move_cost, candidate_cost);
-            }
-            for (int next : atom.adjacent) {
-                if (graph_seen[next]) continue;
-                graph_seen[next] = true;
-                stack.push_back(next);
-            }
-        }
-        long long object_count = item_count + 1LL;
-        long long minimum_layout_work = object_count * (object_count + 1) / 2;
-        if (state.free_area < required_free ||
-            minimum_layout_work > DEADLINE_LAYOUT_NODE_WORKSPACE_LIMIT ||
-            minimum_layout_work > DEADLINE_LAYOUT_NODE_CASE_LIMIT - diagnostics.layout_nodes) {
-            continue;
-        }
-        state.order = order++;
-        if (!global || closure_key(state) < closure_key(*global)) global = std::move(state);
-    }
-    if (global) {
-        bool duplicate = false;
-        for (const auto &state : retained) duplicate |= state.atoms == global->atoms;
-        if (!duplicate) {
-            retained.insert(retained.begin(), std::move(*global));
-            diagnostics.global_closures++;
-        }
-    }
-    if ((int)retained.size() > DEADLINE_CLOSURE_KEEP_LIMIT) {
-        retained.resize(DEADLINE_CLOSURE_KEEP_LIMIT);
-    }
-    return retained;
-}
-
-struct DeadlineTurnWork {
-    int closure_expansions = 0;
-    int layout_nodes = 0;
-    int template_probes = 0;
-    int growth_steps = 0;
-    int complete_plans = 0;
-    long long connectivity_visits = 0;
-    int connectivity_calls = 0;
-};
-
-bool deadline_connectivity_budget_exhausted(const DeadlineTurnWork &work,
-                                            const DeadlineLayerDiagnostics &diagnostics) {
-    return work.connectivity_calls >= DEADLINE_CONNECTIVITY_CALL_TURN_LIMIT ||
-           diagnostics.connectivity_calls >= DEADLINE_CONNECTIVITY_CALL_CASE_LIMIT ||
-           work.connectivity_visits >= DEADLINE_CONNECTIVITY_VISIT_TURN_LIMIT ||
-           diagnostics.connectivity_visits >= DEADLINE_CONNECTIVITY_VISIT_CASE_LIMIT;
-}
-
-bool deadline_begin_connectivity_call(DeadlineTurnWork &work,
-                                      DeadlineLayerDiagnostics &diagnostics) {
-    if (deadline_connectivity_budget_exhausted(work, diagnostics)) {
-        diagnostics.connectivity_limit_exhausted++;
-        return false;
-    }
-    work.connectivity_calls++;
-    diagnostics.connectivity_calls++;
-    return true;
-}
-
-bool deadline_consume_connectivity_visit(DeadlineTurnWork &work,
-                                         DeadlineLayerDiagnostics &diagnostics) {
-    if (work.connectivity_visits >= DEADLINE_CONNECTIVITY_VISIT_TURN_LIMIT ||
-        diagnostics.connectivity_visits >= DEADLINE_CONNECTIVITY_VISIT_CASE_LIMIT) {
-        diagnostics.connectivity_limit_exhausted++;
-        return false;
-    }
-    work.connectivity_visits++;
-    diagnostics.connectivity_visits++;
-    return true;
-}
-
-bool deadline_mask_connected(const BoardMask &mask, int expected_count, int n,
-                             DeadlineTurnWork &work, DeadlineLayerDiagnostics &diagnostics) {
-    if (expected_count <= 0 || deadline_mask_count(mask) != expected_count) return false;
-    if (!deadline_begin_connectivity_call(work, diagnostics)) return false;
-    int first = -1;
-    for (int word = 0; word < BOARD_MASK_WORDS && first < 0; word++) {
-        if (mask[word]) first = 64 * word + __builtin_ctzll(mask[word]);
-    }
-    if (first < 0 || first >= n * n) return false;
-    array<int, 2500> que{};
-    array<unsigned char, 2500> visited{};
-    int head = 0;
-    int tail = 0;
-    que[tail++] = first;
-    visited[first] = true;
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-    while (head < tail) {
-        if (!deadline_consume_connectivity_visit(work, diagnostics)) return false;
-        int cell = que[head++];
-        int x = cell / n;
-        int y = cell % n;
-        for (int dir = 0; dir < 4; dir++) {
-            int nx = x + DX[dir];
-            int ny = y + DY[dir];
-            if (!inside(nx, ny, n, n)) continue;
-            int next = nx * n + ny;
-            if (visited[next] || !deadline_mask_has(mask, next)) continue;
-            visited[next] = true;
-            que[tail++] = next;
-        }
-    }
-    return tail == expected_count;
-}
-
-optional<vector<int>> deadline_mask_distances(const BoardMask &mask, int root, int n,
-                                              DeadlineTurnWork &work,
-                                              DeadlineLayerDiagnostics &diagnostics) {
-    if (!deadline_mask_has(mask, root)) return nullopt;
-    if (!deadline_begin_connectivity_call(work, diagnostics)) return nullopt;
-    vector<int> distance(n * n, -1);
-    array<int, 2500> que{};
-    int head = 0;
-    int tail = 0;
-    que[tail++] = root;
-    distance[root] = 0;
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-    while (head < tail) {
-        if (!deadline_consume_connectivity_visit(work, diagnostics)) return nullopt;
-        int cell = que[head++];
-        int x = cell / n;
-        int y = cell % n;
-        for (int dir = 0; dir < 4; dir++) {
-            int nx = x + DX[dir];
-            int ny = y + DY[dir];
-            if (!inside(nx, ny, n, n)) continue;
-            int next = nx * n + ny;
-            if (distance[next] != -1 || !deadline_mask_has(mask, next)) continue;
-            distance[next] = distance[cell] + 1;
-            que[tail++] = next;
-        }
-    }
-    return distance;
-}
-
-optional<vector<int>> deadline_boundary_clearance(const BoardMask &mask, int n,
-                                                  DeadlineTurnWork &work,
-                                                  DeadlineLayerDiagnostics &diagnostics) {
-    if (!deadline_begin_connectivity_call(work, diagnostics)) return nullopt;
-    vector<int> clearance(n * n, -1);
-    array<int, 2500> que{};
-    int head = 0;
-    int tail = 0;
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-    for (int cell = 0; cell < n * n; cell++) {
-        if (!deadline_mask_has(mask, cell)) continue;
-        int x = cell / n;
-        int y = cell % n;
-        bool boundary = false;
-        for (int dir = 0; dir < 4; dir++) {
-            int nx = x + DX[dir];
-            int ny = y + DY[dir];
-            if (!inside(nx, ny, n, n) || !deadline_mask_has(mask, nx * n + ny)) {
-                boundary = true;
-            }
-        }
-        if (boundary) {
-            clearance[cell] = 0;
-            que[tail++] = cell;
-        }
-    }
-    while (head < tail) {
-        if (!deadline_consume_connectivity_visit(work, diagnostics)) return nullopt;
-        int cell = que[head++];
-        int x = cell / n;
-        int y = cell % n;
-        for (int dir = 0; dir < 4; dir++) {
-            int nx = x + DX[dir];
-            int ny = y + DY[dir];
-            if (!inside(nx, ny, n, n)) continue;
-            int next = nx * n + ny;
-            if (!deadline_mask_has(mask, next) || clearance[next] != -1) continue;
-            clearance[next] = clearance[cell] + 1;
-            que[tail++] = next;
-        }
-    }
-    return clearance;
-}
-
-int deadline_mask_perimeter(const BoardMask &mask, int n) {
-    int perimeter = 0;
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-    for (int cell = 0; cell < n * n; cell++) {
-        if (!deadline_mask_has(mask, cell)) continue;
-        int x = cell / n;
-        int y = cell % n;
-        for (int dir = 0; dir < 4; dir++) {
-            int nx = x + DX[dir];
-            int ny = y + DY[dir];
-            if (!inside(nx, ny, n, n) || !deadline_mask_has(mask, nx * n + ny)) perimeter++;
-        }
-    }
-    return perimeter;
-}
-
-struct DeadlineWorkspace {
-    BoardMask mask{};
-    BoardMask current_free{};
-    vector<int> group_ids;
-    int area = 0;
-    int free_area = 0;
-};
-
-optional<DeadlineWorkspace> materialize_deadline_workspace(
-    const DeadlineClosureState &closure, const DeadlineQuotientGraph &graph, int arrival_p,
-    DeadlineTurnWork &work, DeadlineLayerDiagnostics &diagnostics) {
-    DeadlineWorkspace workspace;
-    for (int atom_id = 0; atom_id < (int)graph.atoms.size(); atom_id++) {
-        if (!deadline_mask_has(closure.atoms, atom_id)) continue;
-        const DeadlineAtom &atom = graph.atoms[atom_id];
-        for (auto [x, y] : atom.cells) {
-            int cell = x * graph.n + y;
-            deadline_mask_set(workspace.mask, cell);
-            if (atom.is_free) deadline_mask_set(workspace.current_free, cell);
-        }
-        workspace.area += atom.cells.size();
-        if (atom.is_free) {
-            workspace.free_area += atom.cells.size();
-        } else {
-            workspace.group_ids.push_back(atom.group_id);
-        }
-    }
-    sort(workspace.group_ids.begin(), workspace.group_ids.end());
-    if (workspace.free_area < arrival_p + 1 || workspace.area != deadline_mask_count(workspace.mask) ||
-        workspace.free_area != deadline_mask_count(workspace.current_free)) {
-        diagnostics.partition_errors++;
-        return nullopt;
-    }
-    if (!deadline_mask_connected(workspace.mask, workspace.area, graph.n, work, diagnostics)) {
-        return nullopt;
-    }
-    return workspace;
-}
-
-vector<int> make_deadline_core_roots(const DeadlineWorkspace &workspace, int n,
-                                     DeadlineTurnWork &work,
-                                     DeadlineLayerDiagnostics &diagnostics) {
-    vector<int> free_cells;
-    free_cells.reserve(workspace.free_area);
-    for (int cell = 0; cell < n * n; cell++) {
-        if (deadline_mask_has(workspace.current_free, cell)) free_cells.push_back(cell);
-    }
-    if (free_cells.empty()) return {};
-
-    vector<int> roots;
-    optional<vector<int>> clearance = deadline_boundary_clearance(
-        workspace.mask, n, work, diagnostics);
-    if (!clearance) return {};
-    int first_root = free_cells.front();
-    for (int cell : free_cells) {
-        if ((*clearance)[cell] > (*clearance)[first_root] ||
-            ((*clearance)[cell] == (*clearance)[first_root] && cell < first_root)) {
-            first_root = cell;
-        }
-    }
-    roots.push_back(first_root);
-    if (DEADLINE_CORE_ROOT_LIMIT == 1) return roots;
-
-    optional<vector<int>> second_distance = deadline_mask_distances(
-        workspace.mask, first_root, n, work, diagnostics);
-    if (!second_distance) return roots;
-    int second_root = first_root;
-    for (int cell : free_cells) {
-        if ((*second_distance)[cell] > (*second_distance)[second_root] ||
-            ((*second_distance)[cell] == (*second_distance)[second_root] && cell < second_root)) {
-            second_root = cell;
-        }
-    }
-    if (second_root != first_root) roots.push_back(second_root);
-    return roots;
-}
-
-struct DeadlineLayerItem {
-    bool is_arrival = false;
-    int id = -1;
-    ll t = 0;
-    ll v = 0;
-    int p = 0;
-    int old_max_perimeter = 0;
-    BoardMask old_region{};
-};
-
-vector<DeadlineLayerItem> make_deadline_layer_items(
-    const DeadlineWorkspace &workspace, const vector<GroupState> &groups, int arrival_id,
-    int n) {
-    vector<DeadlineLayerItem> items;
-    items.reserve(workspace.group_ids.size() + 1);
-    for (int id : workspace.group_ids) {
-        const GroupState &group = groups[id];
-        items.push_back({false, id, group.t, group.v, group.p, group.max_perimeter,
-                         make_board_mask(group.cells, n)});
-    }
-    const GroupState &arrival = groups[arrival_id];
-    items.push_back({true, arrival_id, arrival.t, arrival.v, arrival.p, 0, BoardMask{}});
-    sort(items.begin(), items.end(), [](const DeadlineLayerItem &lhs,
-                                       const DeadlineLayerItem &rhs) {
-        if (lhs.t != rhs.t) return lhs.t > rhs.t;
-        if (lhs.p != rhs.p) return lhs.p > rhs.p;
-        if (lhs.is_arrival != rhs.is_arrival) return lhs.is_arrival < rhs.is_arrival;
-        return lhs.id < rhs.id;
-    });
-    return items;
-}
-
-vector<int> deadline_boundary_seeds(const BoardMask &remaining, int root,
-                                    const vector<int> &distance, int n, int limit) {
-    struct RankedCell {
-        int distance;
-        int outside_edges;
-        int cell;
-    };
-    vector<RankedCell> ranked;
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-    for (int cell = 0; cell < n * n; cell++) {
-        if (cell == root || !deadline_mask_has(remaining, cell)) continue;
-        int x = cell / n;
-        int y = cell % n;
-        int outside_edges = 0;
-        for (int dir = 0; dir < 4; dir++) {
-            int nx = x + DX[dir];
-            int ny = y + DY[dir];
-            if (!inside(nx, ny, n, n) || !deadline_mask_has(remaining, nx * n + ny)) {
-                outside_edges++;
-            }
-        }
-        if (outside_edges > 0) ranked.push_back({distance[cell], outside_edges, cell});
-    }
-    sort(ranked.begin(), ranked.end(), [](const RankedCell &lhs, const RankedCell &rhs) {
-        if (lhs.distance != rhs.distance) return lhs.distance > rhs.distance;
-        if (lhs.outside_edges != rhs.outside_edges) return lhs.outside_edges > rhs.outside_edges;
-        return lhs.cell < rhs.cell;
-    });
-    vector<int> result;
-    for (const RankedCell &entry : ranked) {
-        result.push_back(entry.cell);
-        if ((int)result.size() == limit) break;
-    }
-    return result;
-}
-
-struct DeadlineRegionCandidate {
-    BoardMask mask{};
-    int perimeter = 0;
-    ll local_direct = 0;
-    ll movement_cost = 0;
-    ll fee_loss = 0;
-    bool moved = false;
-    uint64_t order = 0;
-};
-
-DeadlineRegionCandidate score_deadline_region(
-    const BoardMask &region, int perimeter, const DeadlineLayerItem &item,
-    const vector<GroupState> &groups, int r_milli, uint64_t order) {
-    DeadlineRegionCandidate result;
-    result.mask = region;
-    result.perimeter = perimeter;
-    result.order = order;
-    if (item.is_arrival) {
-        result.local_direct = round_payment(item.v, item.p, perimeter);
-        return result;
-    }
-    result.moved = region != item.old_region;
-    if (!result.moved) return result;
-    const GroupState &group = groups[item.id];
-    result.movement_cost = move_cost(group.v, r_milli);
-    int next_max_perimeter = max(group.max_perimeter, perimeter);
-    result.fee_loss = round_payment(group.v, group.p, group.max_perimeter) -
-                      round_payment(group.v, group.p, next_max_perimeter);
-    result.local_direct = -result.movement_cost - result.fee_loss;
-    return result;
-}
-
-optional<DeadlineRegionCandidate> make_deadline_ear_growth(
-    const BoardMask &initial_remaining, int remaining_count, int root, int seed,
-    const vector<int> &distance, const DeadlineLayerItem &item,
-    const vector<GroupState> &groups, int r_milli, int n, uint64_t order,
-    bool preserve_every_step, DeadlineTurnWork &work,
-    DeadlineLayerDiagnostics &diagnostics) {
-    if (seed == root || !deadline_mask_has(initial_remaining, seed) || item.p >= remaining_count) {
-        return nullopt;
-    }
-    BoardMask remaining = initial_remaining;
-    BoardMask region{};
-    BoardMask frontier{};
-    deadline_mask_set(frontier, seed);
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-
-    for (int placed = 0; placed < item.p; placed++) {
-        if (work.growth_steps >= DEADLINE_GROWTH_STEP_TURN_LIMIT ||
-            diagnostics.growth_steps >= DEADLINE_GROWTH_STEP_CASE_LIMIT) {
-            diagnostics.growth_limit_exhausted++;
-            return nullopt;
-        }
-        work.growth_steps++;
-        diagnostics.growth_steps++;
-        struct Choice {
-            int shared_edges;
-            int distance;
-            int boundary_edges;
-            int cell;
-        };
-        vector<Choice> choices;
-        for (int word = 0; word < BOARD_MASK_WORDS; word++) {
-            uint64_t bits = frontier[word] & remaining[word];
-            while (bits) {
-                int bit = __builtin_ctzll(bits);
-                bits &= bits - 1;
-                int cell = 64 * word + bit;
-                if (cell >= n * n || cell == root) continue;
-            int x = cell / n;
-            int y = cell % n;
-            int shared_edges = 0;
-            int boundary_edges = 0;
-            for (int dir = 0; dir < 4; dir++) {
-                int nx = x + DX[dir];
-                int ny = y + DY[dir];
-                if (!inside(nx, ny, n, n)) {
-                    boundary_edges++;
-                    continue;
-                }
-                int next = nx * n + ny;
-                shared_edges += deadline_mask_has(region, next);
-                boundary_edges += !deadline_mask_has(initial_remaining, next);
-            }
-            choices.push_back({shared_edges, distance[cell], boundary_edges, cell});
-            }
-        }
-        sort(choices.begin(), choices.end(), [](const Choice &lhs, const Choice &rhs) {
-            if (lhs.shared_edges != rhs.shared_edges) return lhs.shared_edges > rhs.shared_edges;
-            if (lhs.distance != rhs.distance) return lhs.distance > rhs.distance;
-            if (lhs.boundary_edges != rhs.boundary_edges) return lhs.boundary_edges > rhs.boundary_edges;
-            return lhs.cell < rhs.cell;
-        });
-
-        int selected = -1;
-        int tries = 0;
-        for (const Choice &choice : choices) {
-            if (!preserve_every_step) {
-                selected = choice.cell;
-                break;
-            }
-            if (tries++ == 6) break;
-            BoardMask next_remaining = remaining;
-            deadline_mask_reset(next_remaining, choice.cell);
-            int next_count = remaining_count - placed - 1;
-            if (deadline_mask_connected(next_remaining, next_count, n, work, diagnostics)) {
-                selected = choice.cell;
-                break;
-            }
-        }
-        if (selected < 0) return nullopt;
-        deadline_mask_reset(remaining, selected);
-        deadline_mask_reset(frontier, selected);
-        deadline_mask_set(region, selected);
-        int x = selected / n;
-        int y = selected % n;
-        for (int dir = 0; dir < 4; dir++) {
-            int nx = x + DX[dir];
-            int ny = y + DY[dir];
-            if (!inside(nx, ny, n, n)) continue;
-            int next = nx * n + ny;
-            if (deadline_mask_has(remaining, next)) deadline_mask_set(frontier, next);
-        }
-    }
-    if (deadline_mask_count(region) != item.p) return nullopt;
-    if (!preserve_every_step &&
-        !deadline_mask_connected(remaining, remaining_count - item.p, n, work, diagnostics)) {
-        return nullopt;
-    }
-    int perimeter = deadline_mask_perimeter(region, n);
-    return score_deadline_region(region, perimeter, item, groups, r_milli, order);
-}
-
-vector<DeadlineRegionCandidate> make_deadline_region_candidates(
-    const BoardMask &remaining, int remaining_count, int root,
-    const DeadlineLayerItem &item, const vector<GroupState> &groups, int r_milli,
-    int n, const vector<vector<Shape>> &compact_shapes, DeadlineTurnWork &work,
-    DeadlineLayerDiagnostics &diagnostics, uint64_t &order) {
-    vector<DeadlineRegionCandidate> candidates;
-    set<BoardMask> seen;
-    auto try_region = [&](const BoardMask &region, int perimeter) {
-        if ((int)candidates.size() >= 2 * DEADLINE_REGION_CANDIDATE_LIMIT ||
-            deadline_mask_has(region, root) || deadline_mask_count(region) != item.p ||
-            !deadline_mask_subset(region, remaining) || !seen.insert(region).second) {
-            return;
-        }
-        BoardMask next_remaining = deadline_mask_difference(remaining, region);
-        if (!deadline_mask_connected(next_remaining, remaining_count - item.p, n, work, diagnostics)) {
-            return;
-        }
-        candidates.push_back(score_deadline_region(
-            region, perimeter, item, groups, r_milli, order++));
-        diagnostics.region_candidates++;
-    };
-
-    if (!item.is_arrival && deadline_mask_subset(item.old_region, remaining)) {
-        try_region(item.old_region, deadline_mask_perimeter(item.old_region, n));
-    }
-
-    optional<vector<int>> distance = deadline_mask_distances(
-        remaining, root, n, work, diagnostics);
-    if (!distance) return candidates;
-    vector<int> boundary = deadline_boundary_seeds(remaining, root, *distance, n, 8);
-    vector<int> shape_indices;
-    set<pair<int, int>> seen_dimensions;
-    auto add_shape_index = [&](int index) {
-        if (index < 0 || index >= (int)compact_shapes[item.p].size() ||
-            (int)shape_indices.size() == 4) {
-            return;
-        }
-        const Shape &shape = compact_shapes[item.p][index];
-        if (seen_dimensions.insert({shape.h, shape.w}).second) shape_indices.push_back(index);
-    };
-    add_shape_index(0);
-    for (int relation : {1, -1, 0}) {
-        for (int index = 0; index < (int)compact_shapes[item.p].size(); index++) {
-            const Shape &shape = compact_shapes[item.p][index];
-            int shape_relation = (shape.h > shape.w) - (shape.h < shape.w);
-            if (shape_relation == relation) {
-                add_shape_index(index);
-                break;
-            }
-        }
-    }
-    for (int index = 0; index < (int)compact_shapes[item.p].size(); index++) add_shape_index(index);
-    for (int seed : boundary) {
-        for (int shape_index : shape_indices) {
-            const Shape &shape = compact_shapes[item.p][shape_index];
-            array<pair<int, int>, 4> offsets = {
-                pair<int, int>{0, 0}, {shape.h - 1, 0},
-                {0, shape.w - 1}, {shape.h - 1, shape.w - 1}};
-            for (auto [dx, dy] : offsets) {
-                if (deadline_connectivity_budget_exhausted(work, diagnostics)) break;
-                if (work.template_probes >= DEADLINE_TEMPLATE_PROBE_TURN_LIMIT ||
-                    diagnostics.template_probes >= DEADLINE_TEMPLATE_PROBE_CASE_LIMIT) {
-                    diagnostics.template_limit_exhausted++;
-                    break;
-                }
-                work.template_probes++;
-                diagnostics.template_probes++;
-                int base_x = seed / n - dx;
-                int base_y = seed % n - dy;
-                if (base_x < 0 || base_y < 0 || base_x + shape.h > n || base_y + shape.w > n) {
-                    continue;
-                }
-                vector<Cell> cells = materialize_shape(shape, base_x, base_y, item.p);
-                BoardMask region{};
-                bool legal = true;
-                for (auto [x, y] : cells) {
-                    int cell = x * n + y;
-                    if (!deadline_mask_has(remaining, cell) || cell == root ||
-                        deadline_mask_has(region, cell)) {
-                        legal = false;
-                        break;
-                    }
-                    deadline_mask_set(region, cell);
-                }
-                if (legal) try_region(region, shape.perimeter);
-            }
-            if (work.template_probes >= DEADLINE_TEMPLATE_PROBE_TURN_LIMIT ||
-                diagnostics.template_probes >= DEADLINE_TEMPLATE_PROBE_CASE_LIMIT ||
-                deadline_connectivity_budget_exhausted(work, diagnostics)) {
-                break;
-            }
-        }
-        if (work.template_probes >= DEADLINE_TEMPLATE_PROBE_TURN_LIMIT ||
-            diagnostics.template_probes >= DEADLINE_TEMPLATE_PROBE_CASE_LIMIT ||
-            deadline_connectivity_budget_exhausted(work, diagnostics)) {
-            break;
-        }
-    }
-
-    vector<pair<int, bool>> growth_modes;
-    if (!boundary.empty()) {
-        growth_modes.push_back({0, true});
-        growth_modes.push_back({0, false});
-    }
-    if ((int)boundary.size() >= 2) growth_modes.push_back({1, false});
-    for (auto [index, preserve_every_step] : growth_modes) {
-        if (deadline_connectivity_budget_exhausted(work, diagnostics)) break;
-        optional<DeadlineRegionCandidate> growth = make_deadline_ear_growth(
-            remaining, remaining_count, root, boundary[index], *distance, item, groups,
-            r_milli, n, order++, preserve_every_step, work, diagnostics);
-        if (growth && seen.insert(growth->mask).second) {
-            candidates.push_back(std::move(*growth));
-            diagnostics.region_candidates++;
-        }
-    }
-
-    sort(candidates.begin(), candidates.end(), [](const DeadlineRegionCandidate &lhs,
-                                                   const DeadlineRegionCandidate &rhs) {
-        if (lhs.local_direct != rhs.local_direct) return lhs.local_direct > rhs.local_direct;
-        if (lhs.moved != rhs.moved) return lhs.moved < rhs.moved;
-        if (lhs.perimeter != rhs.perimeter) return lhs.perimeter < rhs.perimeter;
-        return lhs.order < rhs.order;
-    });
-    if ((int)candidates.size() > DEADLINE_REGION_CANDIDATE_LIMIT) {
-        candidates.resize(DEADLINE_REGION_CANDIDATE_LIMIT);
-    }
-    return candidates;
-}
-
-struct DeadlinePeelState {
-    BoardMask remaining{};
-    int remaining_count = 0;
-    vector<BoardMask> assignments;
-    ll direct_score = 0;
-    ll movement_cost = 0;
-    ll fee_loss = 0;
-    int moved_groups = 0;
-    int perimeter_sum = 0;
-    uint64_t order = 0;
-};
-
-struct DeadlineLayoutResult {
-    DeadlineWorkspace workspace;
-    vector<DeadlineLayerItem> items;
-    vector<BoardMask> assignments;
-    BoardMask core{};
-    ll direct_score = 0;
-    ll movement_cost = 0;
-    ll fee_loss = 0;
-    int moved_groups = 0;
-    uint64_t order = 0;
-};
-
-vector<DeadlineLayoutResult> search_deadline_layout(
-    const DeadlineWorkspace &workspace, const vector<GroupState> &groups, int arrival_id,
-    int r_milli, int n, const vector<vector<Shape>> &compact_shapes,
-    DeadlineTurnWork &work, DeadlineLayerDiagnostics &diagnostics) {
-    vector<DeadlineLayoutResult> results;
-    vector<DeadlineLayerItem> items = make_deadline_layer_items(workspace, groups, arrival_id, n);
-    vector<int> roots = make_deadline_core_roots(workspace, n, work, diagnostics);
-    uint64_t order = 0;
-    int workspace_layout_begin = work.layout_nodes;
-    for (int root : roots) {
-        vector<DeadlinePeelState> beam(1);
-        beam.front().remaining = workspace.mask;
-        beam.front().remaining_count = workspace.area;
-        bool exhausted = false;
-        for (int item_index = 0; item_index < (int)items.size(); item_index++) {
-            vector<DeadlinePeelState> next;
-            for (const DeadlinePeelState &state : beam) {
-                if (work.layout_nodes - workspace_layout_begin >= DEADLINE_LAYOUT_NODE_WORKSPACE_LIMIT ||
-                    work.layout_nodes >= DEADLINE_LAYOUT_NODE_TURN_LIMIT ||
-                    diagnostics.layout_nodes >= DEADLINE_LAYOUT_NODE_CASE_LIMIT) {
-                    diagnostics.layout_limit_exhausted++;
-                    exhausted = true;
-                    break;
-                }
-                vector<DeadlineRegionCandidate> regions = make_deadline_region_candidates(
-                    state.remaining, state.remaining_count, root, items[item_index], groups,
-                    r_milli, n, compact_shapes, work, diagnostics, order);
-                for (const DeadlineRegionCandidate &region : regions) {
-                    int node_work = (int)state.assignments.size() + 1;
-                    if (work.layout_nodes - workspace_layout_begin + node_work >
-                            DEADLINE_LAYOUT_NODE_WORKSPACE_LIMIT ||
-                        work.layout_nodes + node_work > DEADLINE_LAYOUT_NODE_TURN_LIMIT ||
-                        diagnostics.layout_nodes + node_work > DEADLINE_LAYOUT_NODE_CASE_LIMIT) {
-                        diagnostics.layout_limit_exhausted++;
-                        exhausted = true;
-                        break;
-                    }
-                    work.layout_nodes += node_work;
-                    diagnostics.layout_nodes += node_work;
-                    DeadlinePeelState child = state;
-                    child.remaining = deadline_mask_difference(state.remaining, region.mask);
-                    child.remaining_count -= items[item_index].p;
-                    child.assignments.push_back(region.mask);
-                    child.direct_score += region.local_direct;
-                    child.movement_cost += region.movement_cost;
-                    child.fee_loss += region.fee_loss;
-                    child.moved_groups += region.moved;
-                    child.perimeter_sum += region.perimeter;
-                    child.order = order++;
-                    next.push_back(std::move(child));
-                }
-                if (exhausted) break;
-            }
-            if (next.empty()) {
-                beam.clear();
-                break;
-            }
-            sort(next.begin(), next.end(), [](const DeadlinePeelState &lhs,
-                                              const DeadlinePeelState &rhs) {
-                if (lhs.direct_score != rhs.direct_score) return lhs.direct_score > rhs.direct_score;
-                if (lhs.moved_groups != rhs.moved_groups) return lhs.moved_groups < rhs.moved_groups;
-                if (lhs.perimeter_sum != rhs.perimeter_sum) return lhs.perimeter_sum < rhs.perimeter_sum;
-                return lhs.order < rhs.order;
-            });
-            if ((int)next.size() > DEADLINE_LAYOUT_BEAM_WIDTH) next.resize(DEADLINE_LAYOUT_BEAM_WIDTH);
-            beam = std::move(next);
-            if (exhausted) break;
-        }
-        if (exhausted) break;
-        for (const DeadlinePeelState &state : beam) {
-            if ((int)state.assignments.size() != (int)items.size()) continue;
-            if (!deadline_mask_connected(state.remaining, state.remaining_count, n, work, diagnostics)) {
-                continue;
-            }
-            results.push_back({workspace, items, state.assignments, state.remaining,
-                               state.direct_score, state.movement_cost, state.fee_loss,
-                               state.moved_groups, state.order});
-        }
-    }
-    sort(results.begin(), results.end(), [](const DeadlineLayoutResult &lhs,
-                                            const DeadlineLayoutResult &rhs) {
-        if (lhs.direct_score != rhs.direct_score) return lhs.direct_score > rhs.direct_score;
-        if (lhs.moved_groups != rhs.moved_groups) return lhs.moved_groups < rhs.moved_groups;
-        return lhs.order < rhs.order;
-    });
-    return results;
-}
-
-bool validate_and_build_deadline_owner(
-    const TurnPlan &plan, const vs &park, const vvi &owner,
-    const vector<GroupState> &groups, int arrival_id, int r_milli,
-    vvi &final_owner, ll &fee_loss, ll &movement_cost_sum) {
-    if (!plan.arrival || groups[arrival_id].active) return false;
-    int n = park.size();
-    vector<char> moved(groups.size(), false);
-    final_owner = owner;
-    for (const MovePlan &move : plan.moves) {
-        if (move.id < 0 || move.id >= (int)groups.size() || move.id == arrival_id ||
-            moved[move.id] || !groups[move.id].active) {
-            return false;
-        }
-        moved[move.id] = true;
-        const GroupState &group = groups[move.id];
-        if ((int)group.cells.size() != group.p) return false;
-        for (auto [x, y] : group.cells) {
-            if (!inside(x, y, n, n) || final_owner[x][y] != move.id) return false;
-        }
-    }
-    for (const MovePlan &move : plan.moves) clear_cells(final_owner, groups[move.id].cells);
-
-    auto region_is_legal = [&](const vector<Cell> &cells, int expected_size) {
-        if ((int)cells.size() != expected_size || !validate_connected_region(cells, n)) return false;
-        for (auto [x, y] : cells) {
-            if (!inside(x, y, n, n) || park[x][y] != '.' || final_owner[x][y] != -1) return false;
-        }
-        return true;
-    };
-
-    fee_loss = 0;
-    movement_cost_sum = 0;
-    for (const MovePlan &move : plan.moves) {
-        const GroupState &group = groups[move.id];
-        if (!region_is_legal(move.cells, group.p) || same_region(move.cells, group.cells)) return false;
-        int perimeter = calc_perimeter(move.cells, n);
-        if (perimeter != move.perimeter) return false;
-        ll previous_fee = round_payment(group.v, group.p, group.max_perimeter);
-        ll next_fee = round_payment(group.v, group.p, max(group.max_perimeter, perimeter));
-        fee_loss += previous_fee - next_fee;
-        movement_cost_sum += move_cost(group.v, r_milli);
-        place_cells(final_owner, move.cells, move.id);
-    }
-
-    const GroupState &arrival = groups[arrival_id];
-    if (!region_is_legal(*plan.arrival, arrival.p) ||
-        calc_perimeter(*plan.arrival, n) != plan.arrival_perimeter) {
-        return false;
-    }
-    ll arrival_fee = round_payment(arrival.v, arrival.p, plan.arrival_perimeter);
-    if (plan.immediate_gain != arrival_fee - movement_cost_sum) return false;
-    place_cells(final_owner, *plan.arrival, arrival_id);
-    return true;
-}
-
-bool validate_deadline_layout_invariant(const DeadlineLayoutResult &layout, int n,
-                                        DeadlineLayerDiagnostics &diagnostics) {
-    int arrival_p = 0;
-    for (const DeadlineLayerItem &item : layout.items) {
-        if (item.is_arrival) arrival_p = item.p;
-    }
-    if (layout.assignments.size() != layout.items.size() || arrival_p == 0 ||
-        deadline_mask_count(layout.core) != layout.workspace.free_area - arrival_p) {
-        diagnostics.partition_errors++;
-        return false;
-    }
-
-    BoardMask reconstructed = layout.core;
-    if (!validate_connected_region(deadline_mask_cells(reconstructed, n), n)) {
-        diagnostics.prefix_connectivity_errors++;
-        return false;
-    }
-    for (int item_index = (int)layout.items.size() - 1; item_index >= 0; item_index--) {
-        const BoardMask &region = layout.assignments[item_index];
-        if (deadline_mask_count(region) != layout.items[item_index].p ||
-            masks_overlap(reconstructed, region) ||
-            !validate_connected_region(deadline_mask_cells(region, n), n)) {
-            diagnostics.partition_errors++;
-            return false;
-        }
-        merge_mask(reconstructed, region);
-        if (!validate_connected_region(deadline_mask_cells(reconstructed, n), n)) {
-            diagnostics.prefix_connectivity_errors++;
-            return false;
-        }
-    }
-    if (reconstructed != layout.workspace.mask) {
-        diagnostics.partition_errors++;
-        return false;
-    }
-    return true;
-}
-
-struct PreparedDeadlineCandidate {
-    TurnPlan plan;
-    vvi final_owner;
-    ll arrival_fee = 0;
-    ll movement_cost = 0;
-    ll fee_loss = 0;
-    ll direct_score = 0;
-    int moved_groups = 0;
-    int moved_cells = 0;
-    uint64_t order = 0;
-};
-
-optional<PreparedDeadlineCandidate> prepare_deadline_candidate(
-    const DeadlineLayoutResult &layout, const vs &park, const vvi &owner,
-    const vector<GroupState> &groups, int arrival_id, int r_milli,
-    DeadlineLayerDiagnostics &diagnostics) {
-    int n = park.size();
-    if (!validate_deadline_layout_invariant(layout, n, diagnostics)) return nullopt;
-
-    PreparedDeadlineCandidate candidate;
-    candidate.order = layout.order;
-    for (int item_index = 0; item_index < (int)layout.items.size(); item_index++) {
-        const DeadlineLayerItem &item = layout.items[item_index];
-        vector<Cell> cells = deadline_mask_cells(layout.assignments[item_index], n);
-        int perimeter = calc_perimeter(cells, n);
-        if (item.is_arrival) {
-            candidate.plan.arrival = std::move(cells);
-            candidate.plan.arrival_perimeter = perimeter;
-            candidate.arrival_fee = round_payment(item.v, item.p, perimeter);
-        } else if (layout.assignments[item_index] != item.old_region) {
-            candidate.moved_groups++;
-            candidate.moved_cells += item.p;
-            candidate.plan.moves.push_back({item.id, std::move(cells), perimeter});
-        }
-    }
-    sort(candidate.plan.moves.begin(), candidate.plan.moves.end(),
-         [](const MovePlan &lhs, const MovePlan &rhs) { return lhs.id < rhs.id; });
-    candidate.plan.immediate_gain = candidate.arrival_fee - layout.movement_cost;
-
-    ll validated_fee_loss = 0;
-    ll validated_movement_cost = 0;
-    if (!validate_and_build_deadline_owner(
-            candidate.plan, park, owner, groups, arrival_id, r_milli,
-            candidate.final_owner, validated_fee_loss, validated_movement_cost)) {
-        diagnostics.validation_failures++;
-        return nullopt;
-    }
-    candidate.movement_cost = validated_movement_cost;
-    candidate.fee_loss = validated_fee_loss;
-    candidate.direct_score = candidate.arrival_fee - candidate.movement_cost - candidate.fee_loss;
-    if (candidate.moved_groups != (int)candidate.plan.moves.size() ||
-        candidate.moved_groups != layout.moved_groups ||
-        candidate.movement_cost != layout.movement_cost ||
-        candidate.fee_loss != layout.fee_loss ||
-        candidate.direct_score != layout.direct_score) {
-        diagnostics.direct_identity_errors++;
-        return nullopt;
-    }
-    return candidate;
-}
-
-optional<RootActionResult> choose_deadline_layer_root(
-    const vs &park, const vvi &owner, const vector<GroupState> &groups,
-    int arrival_id, int turn, int total_groups, ll current_s, int remaining_groups,
-    int free_cells_before, int r_milli, long double theta,
-    const ThetaEstimator &theta_estimator, const DensityModel &density_model,
-    SampledDlpShadowModel &sampled_dlp_model,
-    int grass_cells, long double opportunity_cost, const ArrivalDecision &baseline,
-    const vector<vector<Shape>> &compact_shapes, int &deadline_confirmations_used,
-    DeadlineLayerDiagnostics &diagnostics) {
-    if constexpr (!ENABLE_DEADLINE_LAYER) return nullopt;
-
-    const GroupState &arrival = groups[arrival_id];
-    int minimum_perimeter = compact_shapes[arrival.p].front().perimeter;
-    bool no_region = baseline.status == ArrivalStatus::NoRegion && !baseline.cells;
-    bool noncompact = baseline.status == ArrivalStatus::Accepted && baseline.cells &&
-                      baseline.perimeter > minimum_perimeter;
-    if (!no_region && !noncompact) return nullopt;
-
-    DeadlineLayerCpuScope cpu_scope(diagnostics);
-    diagnostics.eligible++;
-    diagnostics.no_region_eligible += no_region;
-    diagnostics.noncompact_eligible += noncompact;
-    if (free_cells_before < arrival.p + 1) {
-        diagnostics.area_insufficient++;
-        return nullopt;
-    }
-
-    if (no_region) {
-        ll minimum_move_cost = numeric_limits<ll>::max();
-        for (const GroupState &group : groups) {
-            if (group.active) chmin(minimum_move_cost, move_cost(group.v, r_milli));
-        }
-        ll compact_fee = round_payment(arrival.v, arrival.p, minimum_perimeter);
-        if (minimum_move_cost == numeric_limits<ll>::max() ||
-            (long double)(compact_fee - minimum_move_cost) <= opportunity_cost) {
-            diagnostics.economic_upper_bound_rejected++;
-            return nullopt;
-        }
-    }
-
-    if (diagnostics.graph_builds >= DEADLINE_GRAPH_BUILD_CASE_LIMIT ||
-        diagnostics.closure_expansions >= DEADLINE_CLOSURE_EXPANSION_CASE_LIMIT ||
-        diagnostics.layout_nodes >= DEADLINE_LAYOUT_NODE_CASE_LIMIT ||
-        diagnostics.template_probes >= DEADLINE_TEMPLATE_PROBE_CASE_LIMIT ||
-        diagnostics.growth_steps >= DEADLINE_GROWTH_STEP_CASE_LIMIT ||
-        diagnostics.connectivity_calls >= DEADLINE_CONNECTIVITY_CALL_CASE_LIMIT ||
-        diagnostics.connectivity_visits >= DEADLINE_CONNECTIVITY_VISIT_CASE_LIMIT ||
-        diagnostics.complete_plan_attempts >= DEADLINE_COMPLETE_PLAN_CASE_LIMIT) {
-        diagnostics.case_budget_skips++;
-        return nullopt;
-    }
-    int window = min(3, turn * 4 / total_groups);
-    array<int, 4> &mode_attempts =
-        no_region ? diagnostics.no_region_attempts_by_window
-                  : diagnostics.noncompact_attempts_by_window;
-    if (mode_attempts[window] >= DEADLINE_WINDOW_ATTEMPT_LIMIT) {
-        diagnostics.window_budget_skips++;
-        return nullopt;
-    }
-    diagnostics.attempts++;
-    diagnostics.attempts_by_window[window]++;
-    mode_attempts[window]++;
-    diagnostics.graph_builds++;
-
-    optional<DeadlineQuotientGraph> graph = build_deadline_quotient_graph(park, owner, groups);
-    if (!graph) {
-        diagnostics.graph_failures++;
-        return nullopt;
-    }
-    DeadlineTurnWork work;
-    vector<DeadlineClosureState> closures = enumerate_deadline_closures(
-        *graph, groups, arrival.p + 1, r_milli, work.closure_expansions, diagnostics);
-    if (closures.empty()) {
-        diagnostics.closure_failures++;
-        return nullopt;
-    }
-
-    vector<PreparedDeadlineCandidate> candidates;
-    for (const DeadlineClosureState &closure : closures) {
-        optional<DeadlineWorkspace> workspace = materialize_deadline_workspace(
-            closure, *graph, arrival.p, work, diagnostics);
-        if (!workspace) continue;
-        diagnostics.workspaces_searched++;
-        vector<DeadlineLayoutResult> layouts = search_deadline_layout(
-            *workspace, groups, arrival_id, r_milli, park.size(), compact_shapes,
-            work, diagnostics);
-        for (const DeadlineLayoutResult &layout : layouts) {
-            // Do not let arrival-only layouts consume the limited number of
-            // complete-plan validations reserved for real reconstructions.
-            if (layout.moved_groups == 0) {
-                diagnostics.zero_move_candidates_filtered++;
-                continue;
-            }
-            if (work.complete_plans >= DEADLINE_COMPLETE_PLAN_TURN_LIMIT ||
-                diagnostics.complete_plan_attempts >= DEADLINE_COMPLETE_PLAN_CASE_LIMIT) {
-                diagnostics.complete_plan_limit_exhausted++;
-                break;
-            }
-            work.complete_plans++;
-            diagnostics.complete_plan_attempts++;
-            optional<PreparedDeadlineCandidate> candidate = prepare_deadline_candidate(
-                layout, park, owner, groups, arrival_id, r_milli, diagnostics);
-            if (!candidate) break;
-            // The prepared output is validated independently from the layout.
-            if (candidate->moved_groups == 0) {
-                diagnostics.direct_identity_errors++;
-                continue;
-            }
-            if (no_region && (long double)candidate->direct_score <= opportunity_cost) {
-                diagnostics.direct_gate_rejected++;
-                break;
-            }
-            diagnostics.feasible_plans++;
-            candidates.push_back(std::move(*candidate));
-            break;
-        }
-        if (work.complete_plans >= DEADLINE_COMPLETE_PLAN_TURN_LIMIT ||
-            diagnostics.complete_plan_attempts >= DEADLINE_COMPLETE_PLAN_CASE_LIMIT) {
-            break;
-        }
-    }
-    if (candidates.empty()) {
-        diagnostics.layout_failures++;
-        return nullopt;
-    }
-    diagnostics.feasible_turns++;
-    sort(candidates.begin(), candidates.end(), [](const PreparedDeadlineCandidate &lhs,
-                                                   const PreparedDeadlineCandidate &rhs) {
-        if (lhs.direct_score != rhs.direct_score) return lhs.direct_score > rhs.direct_score;
-        if (lhs.moved_groups != rhs.moved_groups) return lhs.moved_groups < rhs.moved_groups;
-        return lhs.order < rhs.order;
-    });
-    if ((int)candidates.size() > DEADLINE_ROLLOUT_CANDIDATE_LIMIT) {
-        candidates.resize(DEADLINE_ROLLOUT_CANDIDATE_LIMIT);
-    }
-
-    TurnPlan baseline_plan = make_arrival_plan(baseline);
-    vvi baseline_owner = owner;
-    if (baseline_plan.arrival) place_cells(baseline_owner, *baseline_plan.arrival, arrival_id);
-    ll baseline_fee = baseline.status == ArrivalStatus::Accepted ? baseline.fee : 0;
-    int selected = -1;
-    i128 best_margin_twice = 0;
-    array<ll, ROOT_SCREEN_SCENARIO_COUNT> selected_future{};
-
-    if (remaining_groups == 0) {
-        for (int index = 0; index < (int)candidates.size(); index++) {
-            ll direct_delta = candidates[index].direct_score - baseline_fee;
-            if ((i128)2 * direct_delta > best_margin_twice) {
-                best_margin_twice = (i128)2 * direct_delta;
-                selected = index;
-            }
-        }
-    } else {
-        RescueRolloutScenarios scenarios = make_rescue_rollout_scenarios(
-            groups, arrival_id, current_s, remaining_groups, theta, theta_estimator);
-        int expected_length = min(ROOT_SCREEN_ROLLOUT_LENGTH, remaining_groups);
-        bool generation_ok = scenarios.complete &&
-                             (int)scenarios.arrivals.size() == ROOT_SCREEN_SCENARIO_COUNT;
-        if (generation_ok) {
-            for (const auto &scenario : scenarios.arrivals) {
-                if ((int)scenario.size() != expected_length) generation_ok = false;
-            }
-        }
-        if (!generation_ok) {
-            diagnostics.rollout_generation_failures++;
-            return nullopt;
-        }
-        diagnostics.rollout_turns++;
-        array<RescueRolloutOutcome, ROOT_SCREEN_SCENARIO_COUNT> baseline_outcomes;
-        for (int scenario = 0; scenario < ROOT_SCREEN_SCENARIO_COUNT; scenario++) {
-            baseline_outcomes[scenario] = evaluate_rescue_rollout_branch(
-                park, baseline_owner, groups, arrival_id, baseline_plan,
-                scenarios.arrivals[scenario], grass_cells, density_model,
-                sampled_dlp_model, compact_shapes);
-            diagnostics.rollout_policy_steps += scenarios.arrivals[scenario].size();
-        }
-        for (int index = 0; index < (int)candidates.size(); index++) {
-            array<ll, ROOT_SCREEN_SCENARIO_COUNT> future_delta{};
-            for (int scenario = 0; scenario < ROOT_SCREEN_SCENARIO_COUNT; scenario++) {
-                RescueRolloutOutcome outcome = evaluate_rescue_rollout_branch(
-                    park, candidates[index].final_owner, groups, arrival_id,
-                    candidates[index].plan, scenarios.arrivals[scenario], grass_cells,
-                    density_model, sampled_dlp_model, compact_shapes);
-                diagnostics.rollout_policy_steps += scenarios.arrivals[scenario].size();
-                future_delta[scenario] = outcome.fee - baseline_outcomes[scenario].fee;
-            }
-            ll direct_delta = candidates[index].direct_score - baseline_fee;
-            i128 margin_twice = (i128)ROOT_SCREEN_SCENARIO_COUNT * direct_delta +
-                                future_delta[0] + future_delta[1];
-            if (margin_twice > best_margin_twice) {
-                best_margin_twice = margin_twice;
-                selected = index;
-                selected_future = future_delta;
-            }
-        }
-    }
-    if (selected < 0) {
-        diagnostics.screen_rejected++;
-        return nullopt;
-    }
-
-    PreparedDeadlineCandidate &chosen = candidates[selected];
-    if (remaining_groups > 0) {
-        if (deadline_confirmations_used >= DEADLINE_CONFIRMATION_CASE_LIMIT) {
-            diagnostics.confirmation_rejected++;
-            return nullopt;
-        }
-        diagnostics.confirmation_attempts++;
-        RootBranchView protected_branch{&baseline_plan, &baseline_owner, 0};
-        RootBranchView challenger_branch{
-            &chosen.plan, &chosen.final_owner, chosen.direct_score - baseline_fee};
-        RescueDiagnostics confirmation_diagnostics;
-        if (!confirm_root_override(
-                park, groups, arrival_id, current_s, remaining_groups, theta,
-                theta_estimator, grass_cells, density_model, sampled_dlp_model, compact_shapes,
-                protected_branch, challenger_branch, deadline_confirmations_used,
-                confirmation_diagnostics)) {
-            diagnostics.rollout_policy_steps +=
-                confirmation_diagnostics.root_confirmation_policy_steps;
-            diagnostics.confirmation_rejected++;
-            return nullopt;
-        }
-        diagnostics.rollout_policy_steps +=
-            confirmation_diagnostics.root_confirmation_policy_steps;
-    }
-
-    ArrivalDecision selected_arrival = baseline;
-    selected_arrival.status = ArrivalStatus::Accepted;
-    selected_arrival.cells = *chosen.plan.arrival;
-    selected_arrival.perimeter = chosen.plan.arrival_perimeter;
-    selected_arrival.fee = chosen.arrival_fee;
-    replace_selected_placement_success(
-        selected_arrival.diagnostics,
-        chosen.plan.arrival_perimeter == minimum_perimeter
-            ? PlacementSource::MinimumTemplate
-            : PlacementSource::ConnectedGrowth);
-
-    diagnostics.adopted++;
-    diagnostics.adopted_with_move += chosen.moved_groups > 0;
-    diagnostics.adopted_from_no_region += no_region;
-    diagnostics.moved_groups += chosen.moved_groups;
-    diagnostics.moved_cells += chosen.moved_cells;
-    diagnostics.arrival_fee += chosen.arrival_fee;
-    diagnostics.movement_cost += chosen.movement_cost;
-    diagnostics.relocation_fee_loss += chosen.fee_loss;
-    diagnostics.direct_gain += chosen.direct_score;
-    diagnostics.scenario_0_future_delta += selected_future[0];
-    diagnostics.scenario_1_future_delta += selected_future[1];
-    diagnostics.screen_margin += (long double)best_margin_twice / ROOT_SCREEN_SCENARIO_COUNT;
-    if (chosen.arrival_fee - chosen.movement_cost - chosen.fee_loss != chosen.direct_score) {
-        diagnostics.direct_identity_errors++;
-    }
-    return RootActionResult{std::move(chosen.plan), std::move(selected_arrival)};
-}
-
+// セルの重複・盤外を拒否し、4近傍BFSで全セルへ到達できるかを厳密に確認する。
 bool validate_connected_region(const vector<Cell> &cells, int n) {
     if (cells.empty()) return false;
     vector<char> in_region(n * n, false);
@@ -6566,6 +4568,9 @@ bool validate_connected_region(const vector<Cell> &cells, int n) {
     return reached == (int)cells.size();
 }
 
+// 採用済み計画を実盤面へ反映する。
+// 複数組の場所交換も許すため、移動元を全て消してから移動先を一括配置する。
+// max_perimeterは料金履歴なので、再配置後の周長との最大値を保存する。
 void apply_plan(int arrival_id, TurnPlan &plan, vvi &owner, vector<GroupState> &groups) {
     for (const MovePlan &move : plan.moves) {
         clear_cells(owner, groups[move.id].cells);
@@ -6586,6 +4591,8 @@ void apply_plan(int arrival_id, TurnPlan &plan, vvi &owner, vector<GroupState> &
     }
 }
 
+// 対話プロトコルどおりに「再配置数と各領域」「今回の受入可否と領域」を出力する。
+// flushまでを出力待機時間として別計測し、解法本体の実行時間から除外する。
 void emit_plan(const TurnPlan &plan) {
     cout << plan.moves.size() << '\n';
     for (const MovePlan &move : plan.moves) {
@@ -6611,6 +4618,7 @@ int main() {
     cin.tie(nullptr);
     RuntimeDiagnostics runtime_diagnostics;
 
+    // ---------- 初期入力と前計算 ----------
     auto initial_input_wall_begin = RuntimeDiagnostics::WallClock::now();
     int N, M;
     ld R;
@@ -6623,6 +4631,7 @@ int main() {
     auto preprocess_wall_begin = RuntimeDiagnostics::WallClock::now();
     clock_t preprocess_cpu_begin = clock();
 
+    // 面積ごとに全テンプレートと、通常配置で優先する最小周長+4以内のテンプレートを作る。
     vector<vector<Shape>> compact_shapes(151);
     vector<vector<Shape>> all_shapes(151);
     for (int p = 4; p <= 150; p++) {
@@ -6644,6 +4653,8 @@ int main() {
         grass_cells += count(row.begin(), row.end(), '.');
     }
 
+    // owner[x][y]は池・空きセルを-1、占有セルを組IDで表す。
+    // 退去queueは終了時刻の小さい順に、現在盤面から消す組を管理する。
     vvi owner(N, vi(N, -1));
     vector<GroupState> groups(M);
     priority_queue<pair<ll, int>, vector<pair<ll, int>>, greater<pair<ll, int>>> departures;
@@ -6652,10 +4663,8 @@ int main() {
     ShadowDiagnostics shadow_diagnostics;
     TemporalPlacementDiagnostics placement_diagnostics;
     RescueDiagnostics rescue_diagnostics;
-    DeadlineLayerDiagnostics deadline_diagnostics;
     LossDiagnostics loss_diagnostics;
     int root_confirmations_used = 0;
-    int deadline_confirmations_used = 0;
     array<bool, 4> normal_root_window_used{};
     int occupied_cells = 0;
     runtime_diagnostics.add_preprocess(preprocess_wall_begin, preprocess_cpu_begin);
@@ -6665,6 +4674,7 @@ int main() {
     int static_largest_component = largest_free_component(park, owner);
     runtime_diagnostics.add_diagnostic(static_geometry_wall_begin, static_geometry_cpu_begin);
 
+    // ---------- 各到着ターン ----------
     for (int turn = 0; turn < M; turn++) {
         auto input_wall_begin = RuntimeDiagnostics::WallClock::now();
         int i, P;
@@ -6675,6 +4685,7 @@ int main() {
         auto turn_wall_begin = RuntimeDiagnostics::WallClock::now();
         clock_t turn_cpu_begin = clock();
 
+        // 観測した滞在時間をtheta推定へ追加し、この時点での未来分布を更新する。
         groups[i].s = S;
         groups[i].t = T;
         groups[i].v = V;
@@ -6683,8 +4694,8 @@ int main() {
         int remaining_groups = M - i - 1;
         long double theta = theta_estimator.estimate(S, remaining_groups);
 
-        // A departure at exactly S is still present by the problem's ordering;
-        // only t < S is removed before this arrival is handled.
+        // 問題のイベント順では、終了時刻がちょうどSの組も今回の到着処理中はまだ存在する。
+        // したがって、この時点で消すのは t < S の組だけである。
         while (!departures.empty() && departures.top().first < S) {
             int j = departures.top().second;
             departures.pop();
@@ -6696,6 +4707,8 @@ int main() {
         }
         int free_cells_before = grass_cells - occupied_cells;
 
+        // 今回Pセルを[S,T]で使うことによる未来価値の損失を計算する。
+        // 通常提出ではsampled DLP、比較ビルドでは旧64時間帯モデルを使う。
         ShadowEvaluation shadow;
         if constexpr (ENABLE_SAMPLED_DLP) {
             shadow = sampled_dlp_model.evaluate_real_turn(
@@ -6711,28 +4724,23 @@ int main() {
         chmax(shadow_diagnostics.maximum_rejected_fraction, shadow.maximum_rejected_fraction);
         shadow_diagnostics.priced_buckets += shadow.priced_buckets;
 
-        // The ordinary primary remains the protected counterfactual.  Rescue
-        // roots are screened first; a small deterministic set of non-compact
-        // normal turns may use the same root machinery without relocation.
+        // まず通常方策だけでbaselineを作る。これは必ず残す比較基準である。
+        // 条件を満たす場合はrescue案を同じ未来でscreenし、さらに少数の非最小周長ターンでは
+        // 再配置なしの通常配置次点も同じroot比較へ追加する。
         vector<NormalPlacementChoice> baseline_alternatives;
         ArrivalDecision baseline_arrival = evaluate_arrival_decision(
             park, owner, groups, i, S, remaining_groups, theta, shadow.opportunity_cost,
             compact_shapes, &baseline_alternatives);
         bool rescue_root_screen_evaluated = false;
-        optional<RootActionResult> expanded_action = choose_deadline_layer_root(
-            park, owner, groups, i, turn, M, S, remaining_groups, free_cells_before,
-            r_milli, theta, theta_estimator, density_model, sampled_dlp_model, grass_cells,
-            shadow.opportunity_cost, baseline_arrival, compact_shapes,
-            deadline_confirmations_used, deadline_diagnostics);
-        if (!expanded_action) {
-            expanded_action = choose_root_action_with_rescue(
-                park, owner, groups, i, S, remaining_groups, r_milli, theta,
-                theta_estimator, density_model, sampled_dlp_model,
-                grass_cells, shadow.opportunity_cost,
-                baseline_arrival, baseline_alternatives, compact_shapes, all_shapes,
-                root_confirmations_used, rescue_root_screen_evaluated, rescue_diagnostics);
-        }
+        optional<RootActionResult> expanded_action = choose_root_action_with_rescue(
+            park, owner, groups, i, S, remaining_groups, r_milli, theta,
+            theta_estimator, density_model, sampled_dlp_model,
+            grass_cells, shadow.opportunity_cost,
+            baseline_arrival, baseline_alternatives, compact_shapes, all_shapes,
+            root_confirmations_used, rescue_root_screen_evaluated, rescue_diagnostics);
 
+        // rescueが候補を出さずscreenもしていない場合だけ、通常配置次点の単独比較を行う。
+        // コンテスト進行度を4区間に分け、各区間で高々1回に制限する。
         int minimum_perimeter = compact_shapes[P].front().perimeter;
         int normal_root_window = min(3, turn * 4 / M);
         bool normal_root_gate =
@@ -6750,6 +4758,7 @@ int main() {
                 root_confirmations_used, rescue_diagnostics);
         }
 
+        // 拡張探索が採用案を返さなければ、baselineをそのまま最終行動にする。
         TurnPlan plan;
         ArrivalDecision selected_arrival;
         if (expanded_action) {
@@ -6775,6 +4784,7 @@ int main() {
                 break;
         }
 
+        // 行動反映前の状態から、このターンの移動費と不可逆な料金悪化を診断用に再計算する。
         ll turn_movement_cost = 0;
         ll turn_relocation_fee_loss = 0;
         for (const MovePlan &move : plan.moves) {
@@ -6786,6 +4796,7 @@ int main() {
                 round_payment(group.v, group.p, next_max_perimeter);
         }
 
+        // 計画を実状態へ反映し、受入組だけを退去queueへ登録する。
         apply_plan(i, plan, owner, groups);
         if (plan.arrival) {
             departures.emplace(T, i);
@@ -6796,6 +4807,7 @@ int main() {
         }
         runtime_diagnostics.add_turn(turn_wall_begin, turn_cpu_begin);
 
+        // スコア分解は意思決定後に行い、その時間を解法本体と分けて測る。
         auto loss_wall_begin = RuntimeDiagnostics::WallClock::now();
         clock_t loss_cpu_begin = clock();
         int reject_largest_component = -1;
@@ -6812,6 +4824,8 @@ int main() {
         runtime_diagnostics.add_output(output_wall_begin);
     }
 
+    // ---------- 最終診断 ----------
+    // 各受入組の最終料金を確定し、stderrへ出すスコア分解と整合性検査値をまとめる。
     auto final_loss_wall_begin = RuntimeDiagnostics::WallClock::now();
     clock_t final_loss_cpu_begin = clock();
     finalize_loss_diagnostics(loss_diagnostics, groups);
@@ -6943,34 +4957,6 @@ int main() {
     ll pushout_direct_identity_error =
         rescue_diagnostics.pushout_arrival_fee - rescue_diagnostics.pushout_movement_cost -
         rescue_diagnostics.pushout_relocation_fee_loss - rescue_diagnostics.pushout_direct_gain;
-    ll deadline_direct_identity_error =
-        deadline_diagnostics.arrival_fee - deadline_diagnostics.movement_cost -
-        deadline_diagnostics.relocation_fee_loss - deadline_diagnostics.direct_gain;
-    int deadline_funnel_identity_error =
-        deadline_diagnostics.eligible - deadline_diagnostics.area_insufficient -
-        deadline_diagnostics.economic_upper_bound_rejected -
-        deadline_diagnostics.case_budget_skips - deadline_diagnostics.window_budget_skips -
-        deadline_diagnostics.graph_failures - deadline_diagnostics.closure_failures -
-        deadline_diagnostics.layout_failures -
-        deadline_diagnostics.rollout_generation_failures - deadline_diagnostics.screen_rejected -
-        deadline_diagnostics.confirmation_rejected - deadline_diagnostics.adopted;
-    int deadline_no_region_status_identity_error =
-        ENABLE_DEADLINE_LAYER
-            ? deadline_diagnostics.no_region_eligible -
-                  deadline_diagnostics.adopted_from_no_region -
-                  rescue_diagnostics.pushout_adopted - shadow_diagnostics.no_region_rejected
-            : 0;
-    int deadline_adopted_move_identity_error =
-        deadline_diagnostics.adopted - deadline_diagnostics.adopted_with_move;
-    int deadline_work_cap_error =
-        (deadline_diagnostics.graph_builds > DEADLINE_GRAPH_BUILD_CASE_LIMIT) +
-        (deadline_diagnostics.closure_expansions > DEADLINE_CLOSURE_EXPANSION_CASE_LIMIT) +
-        (deadline_diagnostics.layout_nodes > DEADLINE_LAYOUT_NODE_CASE_LIMIT) +
-        (deadline_diagnostics.template_probes > DEADLINE_TEMPLATE_PROBE_CASE_LIMIT) +
-        (deadline_diagnostics.growth_steps > DEADLINE_GROWTH_STEP_CASE_LIMIT) +
-        (deadline_diagnostics.connectivity_calls > DEADLINE_CONNECTIVITY_CALL_CASE_LIMIT) +
-        (deadline_diagnostics.connectivity_visits > DEADLINE_CONNECTIVITY_VISIT_CASE_LIMIT) +
-        (deadline_diagnostics.complete_plan_attempts > DEADLINE_COMPLETE_PLAN_CASE_LIMIT);
     const SampledDlpDiagnostics &dlp_diagnostics = sampled_dlp_model.diagnostics;
     long long sampled_dlp_request_count_error =
         ENABLE_SAMPLED_DLP
@@ -6986,189 +4972,14 @@ int main() {
     long long sampled_dlp_expected_rollout_calls =
         rescue_diagnostics.rollout_policy_steps +
         rescue_diagnostics.normal_root_policy_steps +
-        rescue_diagnostics.root_confirmation_policy_steps +
-        deadline_diagnostics.rollout_policy_steps;
+        rescue_diagnostics.root_confirmation_policy_steps;
     long long sampled_dlp_rollout_call_error =
         ENABLE_SAMPLED_DLP
             ? dlp_diagnostics.rollout_price_calls - sampled_dlp_expected_rollout_calls
             : dlp_diagnostics.rollout_price_calls;
-    int predictive_dp_solve_count_error =
-        ENABLE_PREDICTIVE_DP
-            ? dlp_diagnostics.rebuilds - dlp_diagnostics.predictive_dp_solves
-            : dlp_diagnostics.predictive_dp_solves;
-    long long predictive_dp_expected_queries =
-        dlp_diagnostics.real_price_calls + dlp_diagnostics.rollout_price_calls -
-        dlp_diagnostics.zero_future_calls;
-    long long predictive_dp_query_count_error =
-        ENABLE_PREDICTIVE_DP
-            ? predictive_dp_expected_queries -
-                  dlp_diagnostics.predictive_dp_query_calls
-            : dlp_diagnostics.predictive_dp_query_calls;
-    long long predictive_dp_query_partition_error =
-        dlp_diagnostics.predictive_dp_query_calls -
-        dlp_diagnostics.predictive_dp_positive_queries -
-        dlp_diagnostics.predictive_dp_zero_queries;
-    long long predictive_dp_transition_partition_error =
-        dlp_diagnostics.predictive_dp_transitions -
-        dlp_diagnostics.predictive_dp_feasible_transitions -
-        dlp_diagnostics.predictive_dp_infeasible_transitions;
-    long long predictive_dp_item_count_error =
-        ENABLE_PREDICTIVE_DP
-            ? (long long)dlp_diagnostics.predictive_dp_solves *
-                      SAMPLED_DLP_REQUEST_COUNT -
-                  dlp_diagnostics.predictive_dp_items_processed
-            : dlp_diagnostics.predictive_dp_items_processed;
-    long long predictive_dp_generation_error =
-        dlp_diagnostics.predictive_dp_prune_input_states -
-        dlp_diagnostics.predictive_dp_transitions -
-        dlp_diagnostics.predictive_dp_feasible_transitions;
-    long long predictive_dp_prune_accounting_error =
-        dlp_diagnostics.predictive_dp_prune_input_states -
-        dlp_diagnostics.predictive_dp_exact_duplicates -
-        dlp_diagnostics.predictive_dp_width_pruned -
-        dlp_diagnostics.predictive_dp_frontier_output_states;
-    long long predictive_dp_shift_histogram_sum = accumulate(
-        dlp_diagnostics.predictive_dp_shift_histogram.begin(),
-        dlp_diagnostics.predictive_dp_shift_histogram.end(), 0LL);
-    int predictive_dp_observed_maximum_shift = 0;
-    for (int shift = 0; shift <= 16; shift++) {
-        if (dlp_diagnostics.predictive_dp_shift_histogram[shift] > 0) {
-            predictive_dp_observed_maximum_shift = shift;
-        }
-    }
-    long long predictive_dp_shift_histogram_error =
-        predictive_dp_shift_histogram_sum -
-        dlp_diagnostics.predictive_dp_prune_steps;
-    int predictive_dp_maximum_shift_error =
-        dlp_diagnostics.predictive_dp_maximum_shift -
-        predictive_dp_observed_maximum_shift;
-    long long predictive_dp_internal_errors =
-        dlp_diagnostics.predictive_dp_frontier_cap_errors +
-        dlp_diagnostics.predictive_dp_duplicate_errors +
-        dlp_diagnostics.predictive_dp_capacity_errors +
-        dlp_diagnostics.predictive_dp_query_order_errors +
-        dlp_diagnostics.predictive_dp_nonfinite_errors +
-        dlp_diagnostics.predictive_dp_zero_state_errors +
-        dlp_diagnostics.predictive_dp_frontier_order_errors +
-        dlp_diagnostics.predictive_dp_query_upper_bound_errors;
-    long long predictive_dp_disabled_activity_error = 0;
-    int predictive_dp_disabled_cpu_error = 0;
-    if constexpr (!ENABLE_PREDICTIVE_DP) {
-        predictive_dp_disabled_activity_error =
-            dlp_diagnostics.predictive_dp_solves +
-            dlp_diagnostics.predictive_dp_prune_steps +
-            dlp_diagnostics.predictive_dp_positive_queries +
-            dlp_diagnostics.predictive_dp_zero_queries +
-            dlp_diagnostics.predictive_dp_transitions +
-            dlp_diagnostics.predictive_dp_items_processed +
-            dlp_diagnostics.predictive_dp_prune_input_states +
-            dlp_diagnostics.predictive_dp_frontier_output_states +
-            dlp_diagnostics.predictive_dp_exact_duplicates +
-            dlp_diagnostics.predictive_dp_width_pruned +
-            dlp_diagnostics.predictive_dp_terminal_states +
-            dlp_diagnostics.predictive_dp_zero_load_items +
-            dlp_diagnostics.predictive_dp_capacity_level_sum +
-            dlp_diagnostics.predictive_dp_item_load_level_sum +
-            dlp_diagnostics.predictive_dp_query_load_level_sum +
-            dlp_diagnostics.predictive_dp_query_calls +
-            dlp_diagnostics.predictive_dp_base_value_sum +
-            dlp_diagnostics.predictive_dp_reduced_value_sum;
-        predictive_dp_disabled_cpu_error =
-            dlp_diagnostics.predictive_dp_rebuild_cpu_ms != 0.0 ||
-            dlp_diagnostics.predictive_dp_maximum_rebuild_cpu_ms != 0.0 ||
-            dlp_diagnostics.predictive_dp_query_cpu_ms != 0.0 ||
-            dlp_diagnostics.predictive_dp_maximum_query_cpu_ms != 0.0;
-    }
-    long double predictive_dp_opportunity_identity_error =
-        ENABLE_PREDICTIVE_DP
-            ? dlp_diagnostics.opportunity_cost_sum -
-                  dlp_diagnostics.predictive_dp_opportunity_cost_sum
-            : dlp_diagnostics.predictive_dp_opportunity_cost_sum;
     runtime_diagnostics.add_diagnostic(final_loss_wall_begin, final_loss_cpu_begin);
     RuntimeSnapshot runtime = snapshot_runtime(runtime_diagnostics);
     cerr << "accepted=" << accepted_count << " rejected=" << rejected_count
-         << " deadline_enabled=" << ENABLE_DEADLINE_LAYER
-         << " deadline_eligible=" << deadline_diagnostics.eligible
-         << " deadline_no_region_eligible=" << deadline_diagnostics.no_region_eligible
-         << " deadline_noncompact_eligible=" << deadline_diagnostics.noncompact_eligible
-         << " deadline_area_insufficient=" << deadline_diagnostics.area_insufficient
-         << " deadline_economic_ub_rejected="
-         << deadline_diagnostics.economic_upper_bound_rejected
-         << " deadline_case_budget_skips=" << deadline_diagnostics.case_budget_skips
-         << " deadline_window_budget_skips=" << deadline_diagnostics.window_budget_skips
-         << " deadline_attempts=" << deadline_diagnostics.attempts
-         << " deadline_graph_builds=" << deadline_diagnostics.graph_builds
-         << " deadline_graph_failures=" << deadline_diagnostics.graph_failures
-         << " deadline_closure_failures=" << deadline_diagnostics.closure_failures
-         << " deadline_workspaces=" << deadline_diagnostics.workspaces_searched
-         << " deadline_layout_failures=" << deadline_diagnostics.layout_failures
-         << " deadline_validation_failures=" << deadline_diagnostics.validation_failures
-         << " deadline_feasible_turns=" << deadline_diagnostics.feasible_turns
-         << " deadline_feasible_plans=" << deadline_diagnostics.feasible_plans
-         << " deadline_complete_plan_attempts="
-         << deadline_diagnostics.complete_plan_attempts
-         << " deadline_zero_move_candidates_filtered="
-         << deadline_diagnostics.zero_move_candidates_filtered
-         << " deadline_direct_gate_rejected=" << deadline_diagnostics.direct_gate_rejected
-         << " deadline_rollout_generation_failures="
-         << deadline_diagnostics.rollout_generation_failures
-         << " deadline_rollout_turns=" << deadline_diagnostics.rollout_turns
-         << " deadline_screen_rejected=" << deadline_diagnostics.screen_rejected
-         << " deadline_confirmation_rejected=" << deadline_diagnostics.confirmation_rejected
-         << " deadline_confirmation_attempts=" << deadline_diagnostics.confirmation_attempts
-         << " deadline_confirmation_used=" << deadline_confirmations_used
-         << " deadline_adopted=" << deadline_diagnostics.adopted
-         << " deadline_adopted_with_move=" << deadline_diagnostics.adopted_with_move
-         << " deadline_adopted_from_no_region=" << deadline_diagnostics.adopted_from_no_region
-         << " deadline_closure_limit_exhausted="
-         << deadline_diagnostics.closure_limit_exhausted
-         << " deadline_layout_limit_exhausted="
-         << deadline_diagnostics.layout_limit_exhausted
-         << " deadline_template_limit_exhausted="
-         << deadline_diagnostics.template_limit_exhausted
-         << " deadline_growth_limit_exhausted="
-         << deadline_diagnostics.growth_limit_exhausted
-         << " deadline_connectivity_limit_exhausted="
-         << deadline_diagnostics.connectivity_limit_exhausted
-         << " deadline_complete_plan_limit_exhausted="
-         << deadline_diagnostics.complete_plan_limit_exhausted
-         << " deadline_closure_expansions=" << deadline_diagnostics.closure_expansions
-         << " deadline_closure_states=" << deadline_diagnostics.closure_states
-         << " deadline_completed_closures=" << deadline_diagnostics.completed_closures
-         << " deadline_global_closures=" << deadline_diagnostics.global_closures
-         << " deadline_layout_nodes=" << deadline_diagnostics.layout_nodes
-         << " deadline_region_candidates=" << deadline_diagnostics.region_candidates
-         << " deadline_template_probes=" << deadline_diagnostics.template_probes
-         << " deadline_growth_steps=" << deadline_diagnostics.growth_steps
-         << " deadline_connectivity_visits=" << deadline_diagnostics.connectivity_visits
-         << " deadline_connectivity_calls=" << deadline_diagnostics.connectivity_calls
-         << " deadline_rollout_policy_steps=" << deadline_diagnostics.rollout_policy_steps
-         << " deadline_moved_groups=" << deadline_diagnostics.moved_groups
-         << " deadline_moved_cells=" << deadline_diagnostics.moved_cells
-         << " deadline_arrival_fee=" << deadline_diagnostics.arrival_fee
-         << " deadline_movement_cost=" << deadline_diagnostics.movement_cost
-         << " deadline_relocation_fee_loss=" << deadline_diagnostics.relocation_fee_loss
-         << " deadline_direct_gain=" << deadline_diagnostics.direct_gain
-         << " deadline_scenario_0_future_delta="
-         << deadline_diagnostics.scenario_0_future_delta
-         << " deadline_scenario_1_future_delta="
-         << deadline_diagnostics.scenario_1_future_delta
-         << " deadline_screen_margin=" << fixed << setprecision(6)
-         << (double)deadline_diagnostics.screen_margin
-         << " deadline_cpu_ms=" << 1000.0 * deadline_diagnostics.cpu_seconds
-         << " deadline_maximum_turn_cpu_ms="
-         << 1000.0 * deadline_diagnostics.maximum_turn_cpu_seconds
-         << " deadline_partition_errors=" << deadline_diagnostics.partition_errors
-         << " deadline_prefix_connectivity_errors="
-         << deadline_diagnostics.prefix_connectivity_errors
-         << " deadline_direct_identity_errors=" << deadline_diagnostics.direct_identity_errors
-         << " deadline_direct_identity_error=" << deadline_direct_identity_error
-         << " deadline_funnel_identity_error=" << deadline_funnel_identity_error
-         << " deadline_no_region_status_identity_error="
-         << deadline_no_region_status_identity_error
-         << " deadline_adopted_move_identity_error="
-         << deadline_adopted_move_identity_error
-         << " deadline_work_cap_error=" << deadline_work_cap_error
          << " pushout_enabled=" << ENABLE_NO_REGION_PUSHOUT
          << " pushout_eligible=" << rescue_diagnostics.pushout_eligible
          << " pushout_area_insufficient=" << rescue_diagnostics.pushout_area_insufficient
@@ -7394,127 +5205,6 @@ int main() {
          << " sampled_dlp_trigger_partition_error=" << sampled_dlp_trigger_partition_error
          << " sampled_dlp_real_call_error=" << sampled_dlp_real_call_error
          << " sampled_dlp_rollout_call_error=" << sampled_dlp_rollout_call_error
-         << " predictive_dp_enabled=" << ENABLE_PREDICTIVE_DP
-         << " predictive_dp_solves=" << dlp_diagnostics.predictive_dp_solves
-         << " predictive_dp_prune_steps="
-         << dlp_diagnostics.predictive_dp_prune_steps
-         << " predictive_dp_maximum_frontier="
-         << dlp_diagnostics.predictive_dp_maximum_frontier
-         << " predictive_dp_maximum_shift="
-         << dlp_diagnostics.predictive_dp_maximum_shift
-         << " predictive_dp_positive_queries="
-         << dlp_diagnostics.predictive_dp_positive_queries
-         << " predictive_dp_zero_queries="
-         << dlp_diagnostics.predictive_dp_zero_queries
-         << " predictive_dp_query_calls="
-         << dlp_diagnostics.predictive_dp_query_calls
-         << " predictive_dp_transitions="
-         << dlp_diagnostics.predictive_dp_transitions
-         << " predictive_dp_feasible_transitions="
-         << dlp_diagnostics.predictive_dp_feasible_transitions
-         << " predictive_dp_infeasible_transitions="
-         << dlp_diagnostics.predictive_dp_infeasible_transitions
-         << " predictive_dp_items_processed="
-         << dlp_diagnostics.predictive_dp_items_processed
-         << " predictive_dp_prune_input_states="
-         << dlp_diagnostics.predictive_dp_prune_input_states
-         << " predictive_dp_frontier_output_states="
-         << dlp_diagnostics.predictive_dp_frontier_output_states
-         << " predictive_dp_exact_duplicates="
-         << dlp_diagnostics.predictive_dp_exact_duplicates
-         << " predictive_dp_width_pruned="
-         << dlp_diagnostics.predictive_dp_width_pruned
-         << " predictive_dp_terminal_states="
-         << dlp_diagnostics.predictive_dp_terminal_states
-         << " predictive_dp_zero_load_items="
-         << dlp_diagnostics.predictive_dp_zero_load_items
-         << " predictive_dp_capacity_level_sum="
-         << dlp_diagnostics.predictive_dp_capacity_level_sum
-         << " predictive_dp_item_load_level_sum="
-         << dlp_diagnostics.predictive_dp_item_load_level_sum
-         << " predictive_dp_query_load_level_sum="
-         << dlp_diagnostics.predictive_dp_query_load_level_sum
-         << " predictive_dp_base_value_sum="
-         << dlp_diagnostics.predictive_dp_base_value_sum
-         << " predictive_dp_reduced_value_sum="
-         << dlp_diagnostics.predictive_dp_reduced_value_sum
-         << " predictive_dp_frontier_hash="
-         << (dlp_diagnostics.predictive_dp_solves == 0
-                 ? 0ULL
-                 : dlp_diagnostics.predictive_dp_frontier_hash)
-         << " predictive_dp_frontier_cap_errors="
-         << dlp_diagnostics.predictive_dp_frontier_cap_errors
-         << " predictive_dp_duplicate_errors="
-         << dlp_diagnostics.predictive_dp_duplicate_errors
-         << " predictive_dp_capacity_errors="
-         << dlp_diagnostics.predictive_dp_capacity_errors
-         << " predictive_dp_query_order_errors="
-         << dlp_diagnostics.predictive_dp_query_order_errors
-         << " predictive_dp_nonfinite_errors="
-         << dlp_diagnostics.predictive_dp_nonfinite_errors
-         << " predictive_dp_zero_state_errors="
-         << dlp_diagnostics.predictive_dp_zero_state_errors
-         << " predictive_dp_frontier_order_errors="
-         << dlp_diagnostics.predictive_dp_frontier_order_errors
-         << " predictive_dp_query_upper_bound_errors="
-         << dlp_diagnostics.predictive_dp_query_upper_bound_errors
-         << " predictive_dp_solve_count_error="
-         << predictive_dp_solve_count_error
-         << " predictive_dp_query_count_error="
-         << predictive_dp_query_count_error
-         << " predictive_dp_query_partition_error="
-         << predictive_dp_query_partition_error
-         << " predictive_dp_transition_partition_error="
-         << predictive_dp_transition_partition_error
-         << " predictive_dp_item_count_error="
-         << predictive_dp_item_count_error
-         << " predictive_dp_generation_error="
-         << predictive_dp_generation_error
-         << " predictive_dp_prune_accounting_error="
-         << predictive_dp_prune_accounting_error
-         << " predictive_dp_shift_histogram_error="
-         << predictive_dp_shift_histogram_error
-         << " predictive_dp_maximum_shift_error="
-         << predictive_dp_maximum_shift_error
-         << " predictive_dp_internal_errors=" << predictive_dp_internal_errors
-         << " predictive_dp_disabled_activity_error="
-         << predictive_dp_disabled_activity_error
-         << " predictive_dp_disabled_cpu_error="
-         << predictive_dp_disabled_cpu_error
-         << " predictive_dp_shift_0="
-         << dlp_diagnostics.predictive_dp_shift_histogram[0]
-         << " predictive_dp_shift_1="
-         << dlp_diagnostics.predictive_dp_shift_histogram[1]
-         << " predictive_dp_shift_2="
-         << dlp_diagnostics.predictive_dp_shift_histogram[2]
-         << " predictive_dp_shift_3="
-         << dlp_diagnostics.predictive_dp_shift_histogram[3]
-         << " predictive_dp_shift_4="
-         << dlp_diagnostics.predictive_dp_shift_histogram[4]
-         << " predictive_dp_shift_5="
-         << dlp_diagnostics.predictive_dp_shift_histogram[5]
-         << " predictive_dp_shift_6="
-         << dlp_diagnostics.predictive_dp_shift_histogram[6]
-         << " predictive_dp_shift_7="
-         << dlp_diagnostics.predictive_dp_shift_histogram[7]
-         << " predictive_dp_shift_8="
-         << dlp_diagnostics.predictive_dp_shift_histogram[8]
-         << " predictive_dp_shift_9="
-         << dlp_diagnostics.predictive_dp_shift_histogram[9]
-         << " predictive_dp_shift_10="
-         << dlp_diagnostics.predictive_dp_shift_histogram[10]
-         << " predictive_dp_shift_11="
-         << dlp_diagnostics.predictive_dp_shift_histogram[11]
-         << " predictive_dp_shift_12="
-         << dlp_diagnostics.predictive_dp_shift_histogram[12]
-         << " predictive_dp_shift_13="
-         << dlp_diagnostics.predictive_dp_shift_histogram[13]
-         << " predictive_dp_shift_14="
-         << dlp_diagnostics.predictive_dp_shift_histogram[14]
-         << " predictive_dp_shift_15="
-         << dlp_diagnostics.predictive_dp_shift_histogram[15]
-         << " predictive_dp_shift_16="
-         << dlp_diagnostics.predictive_dp_shift_histogram[16]
          << " shadow_considered=" << shadow_diagnostics.considered
          << " shadow_upper_rejected=" << shadow_diagnostics.upper_bound_rejected
          << " shadow_actual_rejected=" << shadow_diagnostics.actual_fee_rejected
@@ -7726,18 +5416,6 @@ int main() {
          << " sampled_dlp_rebuild_cpu_ms=" << dlp_diagnostics.rebuild_cpu_ms
          << " sampled_dlp_maximum_rebuild_cpu_ms="
          << dlp_diagnostics.maximum_rebuild_cpu_ms
-         << " predictive_dp_opportunity_sum="
-         << dlp_diagnostics.predictive_dp_opportunity_cost_sum
-         << " predictive_dp_opportunity_identity_error="
-         << predictive_dp_opportunity_identity_error
-         << " predictive_dp_rebuild_cpu_ms="
-         << dlp_diagnostics.predictive_dp_rebuild_cpu_ms
-         << " predictive_dp_maximum_rebuild_cpu_ms="
-         << dlp_diagnostics.predictive_dp_maximum_rebuild_cpu_ms
-         << " predictive_dp_query_cpu_ms="
-         << dlp_diagnostics.predictive_dp_query_cpu_ms
-         << " predictive_dp_maximum_query_cpu_ms="
-         << dlp_diagnostics.predictive_dp_maximum_query_cpu_ms
          << " model_expected_p=" << density_model.expected_group_size
          << " timing_process_cpu_ms=" << runtime.process_cpu_ms
          << " timing_solver_cpu_ms=" << runtime.solver_cpu_ms
