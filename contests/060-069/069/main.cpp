@@ -155,32 +155,6 @@ constexpr int PUSHOUT_DESTINATION_ANCHOR_GLOBAL_LIMIT = 16000;
 constexpr int PUSHOUT_DESTINATION_LEGAL_LIMIT = 40;
 constexpr int PUSHOUT_DESTINATION_LIMIT = 8;
 constexpr int PUSHOUT_REPAIR_NODE_LIMIT = 1024;
-// A helper is an active non-blocker whose removal opens destination regions
-// for the true blockers.  Surveying reuses the legacy destination probes; the
-// second-stage repair has its own deterministic caps and never consumes work
-// reserved for the protected legacy candidates.
-constexpr int PUSHOUT_HELPER_OBSTRUCTION_PROBE_LIMIT = 1024;
-constexpr int PUSHOUT_HELPER_MAX_BLOCKERS = 3;
-#ifdef AHC069_DISABLE_WIDE_PUSHOUT_HELPER
-constexpr int PUSHOUT_HELPER_CHOICE_LIMIT_PER_TARGET = 1;
-constexpr int PUSHOUT_HELPER_REPAIR_LIMIT = 2;
-constexpr int PUSHOUT_HELPER_DESTINATION_ANCHOR_LIMIT = 1024;
-constexpr int PUSHOUT_HELPER_DESTINATION_ANCHOR_GLOBAL_LIMIT = 4096;
-constexpr int PUSHOUT_HELPER_DESTINATION_LEGAL_LIMIT = 24;
-constexpr int PUSHOUT_HELPER_DESTINATION_LIMIT = 6;
-constexpr int PUSHOUT_HELPER_REPAIR_NODE_LIMIT = 256;
-constexpr int PUSHOUT_HELPER_FEASIBLE_LIMIT = 1;
-#else
-constexpr int PUSHOUT_HELPER_CHOICE_LIMIT_PER_TARGET = 3;
-constexpr int PUSHOUT_HELPER_REPAIR_LIMIT = 6;
-constexpr int PUSHOUT_HELPER_DESTINATION_ANCHOR_LIMIT = 2048;
-constexpr int PUSHOUT_HELPER_DESTINATION_ANCHOR_GLOBAL_LIMIT = 16384;
-constexpr int PUSHOUT_HELPER_DESTINATION_LEGAL_LIMIT = 48;
-constexpr int PUSHOUT_HELPER_DESTINATION_LIMIT = 12;
-constexpr int PUSHOUT_HELPER_REPAIR_NODE_LIMIT = 1024;
-constexpr int PUSHOUT_HELPER_FEASIBLE_LIMIT = 2;
-#endif
-static_assert(PUSHOUT_HELPER_FEASIBLE_LIMIT <= RESCUE_ROLLOUT_CANDIDATE_LIMIT);
 // Deadline-layer reconstruction has no semantic limit on the number of moved
 // groups.  Every limit below counts deterministic work instead; an arbitrarily
 // deep closure remains eligible when its required work fits these budgets.
@@ -213,25 +187,11 @@ constexpr int ROOT_CONFIRM_SCENARIO_COUNT = 8;
 constexpr int ROOT_CONFIRM_ROLLOUT_LENGTH = 12;
 constexpr int ROOT_CONFIRMATION_TURN_LIMIT = 4;
 constexpr int ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT = 2;
-#ifdef AHC069_DISABLE_DEADLINE_LAYER
 constexpr bool ENABLE_DEADLINE_LAYER = false;
-#else
-constexpr bool ENABLE_DEADLINE_LAYER = true;
-#endif
 #ifdef AHC069_DISABLE_NO_REGION_PUSHOUT
 constexpr bool ENABLE_NO_REGION_PUSHOUT = false;
 #else
 constexpr bool ENABLE_NO_REGION_PUSHOUT = true;
-#endif
-#ifdef AHC069_DISABLE_PUSHOUT_HELPER
-constexpr bool ENABLE_PUSHOUT_HELPER = false;
-#else
-constexpr bool ENABLE_PUSHOUT_HELPER = true;
-#endif
-#if defined(AHC069_DISABLE_PUSHOUT_HELPER) || defined(AHC069_DISABLE_WIDE_PUSHOUT_HELPER)
-constexpr bool ENABLE_WIDE_PUSHOUT_HELPER = false;
-#else
-constexpr bool ENABLE_WIDE_PUSHOUT_HELPER = true;
 #endif
 #ifdef AHC069_DISABLE_GROW_AND_TRIM
 constexpr bool ENABLE_GROW_AND_TRIM = false;
@@ -2849,66 +2809,6 @@ struct RescueDiagnostics {
     double pushout_cpu_seconds = 0.0;
     double pushout_maximum_turn_cpu_seconds = 0.0;
 
-    // One-helper Push-out is an additive second search phase.  The legacy
-    // blockers-only candidates remain protected and these counters expose the
-    // added funnel and work independently.
-    int pushout_helper_considered_turns = 0;
-    int pushout_helper_no_eligible_target_turns = 0;
-    int pushout_helper_no_evidence_turns = 0;
-    int pushout_helper_economic_rejected_turns = 0;
-    int pushout_helper_seeded_turns = 0;
-    int pushout_helper_attempts = 0;
-    int pushout_helper_missing_destination = 0;
-    int pushout_helper_missing_blocker_destination = 0;
-    int pushout_helper_missing_helper_destination = 0;
-    int pushout_helper_repair_failures = 0;
-    int pushout_helper_validation_failures = 0;
-    int pushout_helper_duplicate_plans = 0;
-    int pushout_helper_feasible_plans = 0;
-    int pushout_helper_screen_rejected = 0;
-    int pushout_helper_adopted = 0;
-    int pushout_helper_surveyed_turns = 0;
-    int pushout_helper_surveyed_targets = 0;
-    int pushout_helper_large_blocker_targets = 0;
-    int pushout_helper_probe_limit_exhausted = 0;
-    int pushout_helper_feasible_limit_exhausted = 0;
-    int pushout_helper_two_feasible_turns = 0;
-    int pushout_helper_maximum_movers = 0;
-    array<int, PUSHOUT_HELPER_MAX_BLOCKERS> pushout_helper_feasible_by_blocker_count{};
-    array<int, PUSHOUT_HELPER_MAX_BLOCKERS> pushout_helper_adopted_by_blocker_count{};
-    long long pushout_helper_obstruction_probes = 0;
-    long long pushout_helper_single_owner_regions = 0;
-    long long pushout_helper_overlap_cells = 0;
-    long long pushout_helper_evidenced_groups = 0;
-    long long pushout_helper_recorded_witnesses = 0;
-    long long pushout_helper_shortlisted_choices = 0;
-    long long pushout_helper_destination_anchors = 0;
-    long long pushout_helper_destination_candidates = 0;
-    long long pushout_helper_foreign_destination_candidates = 0;
-    long long pushout_helper_retained_foreign_destinations = 0;
-    long long pushout_helper_forced_witness_destinations = 0;
-    long long pushout_helper_beam_nodes = 0;
-    long long pushout_helper_selected_covered_blockers = 0;
-    long long pushout_helper_selected_unlocked_regions = 0;
-    long long pushout_helper_selected_overlap_cells = 0;
-    ll pushout_helper_selected_movement_cost = 0;
-    ll pushout_helper_selected_departure_distance = 0;
-    ll pushout_helper_selected_adjusted_gain = 0;
-    int pushout_helper_feasible_blocker_uses_helper = 0;
-    int pushout_helper_feasible_helper_uses_blocker = 0;
-    int pushout_helper_feasible_bidirectional_cross_use = 0;
-    int pushout_helper_adopted_blocker_uses_helper = 0;
-    int pushout_helper_adopted_helper_uses_blocker = 0;
-    int pushout_helper_adopted_bidirectional_cross_use = 0;
-    long long pushout_helper_adopted_moved_groups = 0;
-    long long pushout_helper_adopted_moved_cells = 0;
-    ll pushout_helper_adopted_arrival_fee = 0;
-    ll pushout_helper_adopted_movement_cost = 0;
-    ll pushout_helper_adopted_direct_gain = 0;
-    ll pushout_helper_scenario_0_future_delta = 0;
-    ll pushout_helper_scenario_1_future_delta = 0;
-    long double pushout_helper_screen_margin = 0.0L;
-    double pushout_helper_phase_cpu_seconds = 0.0;
 };
 
 struct DeadlineLayerDiagnostics {
@@ -3239,190 +3139,10 @@ struct RescueDestination {
     int perimeter = 0;
     int fallback_overlap = 0;
     int cleared_overlap = 0;
-    int foreign_cleared_overlap = 0;
     int quadrant = 0;
-    int sector = 0;
     long double temporal_cost = 0.0L;
     long long order = 0;
 };
-
-struct PushOutHelperWitness {
-    int blocker_id = -1;
-    vector<Cell> cells;
-    int perimeter = 0;
-};
-
-struct PushOutHelperSurvey {
-    int remaining_probes = PUSHOUT_HELPER_OBSTRUCTION_PROBE_LIMIT;
-    bool probe_limit_reported = false;
-    vector<vi> owner_count_prefix;
-    vector<vector<ll>> owner_sum_prefix;
-    vector<vector<ll>> owner_square_sum_prefix;
-    vector<int> unlocked_regions;
-    vector<long long> overlap_cells;
-    vector<int> covered_blockers;
-    vector<int> last_blocker;
-    vector<vector<PushOutHelperWitness>> witnesses;
-
-    PushOutHelperSurvey(int group_count, const vvi &base_owner)
-        : owner_count_prefix(base_owner.size() + 1,
-                             vi(base_owner.size() + 1)),
-          owner_sum_prefix(base_owner.size() + 1,
-                           vector<ll>(base_owner.size() + 1)),
-          owner_square_sum_prefix(base_owner.size() + 1,
-                                  vector<ll>(base_owner.size() + 1)),
-          unlocked_regions(group_count),
-          overlap_cells(group_count),
-          covered_blockers(group_count),
-          last_blocker(group_count, -1),
-          witnesses(group_count) {
-        int n = base_owner.size();
-        for (int x = 0; x < n; x++) {
-            for (int y = 0; y < n; y++) {
-                ll owner_value = base_owner[x][y] == -1 ? 0 : base_owner[x][y] + 1;
-                owner_count_prefix[x + 1][y + 1] =
-                    (owner_value != 0) + owner_count_prefix[x][y + 1] +
-                    owner_count_prefix[x + 1][y] - owner_count_prefix[x][y];
-                owner_sum_prefix[x + 1][y + 1] =
-                    owner_value + owner_sum_prefix[x][y + 1] +
-                    owner_sum_prefix[x + 1][y] - owner_sum_prefix[x][y];
-                owner_square_sum_prefix[x + 1][y + 1] =
-                    owner_value * owner_value +
-                    owner_square_sum_prefix[x][y + 1] +
-                    owner_square_sum_prefix[x + 1][y] -
-                    owner_square_sum_prefix[x][y];
-            }
-        }
-    }
-};
-
-// Record an almost-legal blocker destination only when clearing exactly one
-// additional active owner would make every cell available.  This is the
-// causal shortlist for a helper; arbitrary active groups are never searched.
-// Count/sum/square-sum prefixes prove in O(1) that every occupied cell has the
-// same owner, avoiding allocation and O(P) materialization per blocked anchor.
-void observe_pushout_helper_obstruction(PushOutHelperSurvey &survey,
-                                        const Shape &shape, int base_x, int base_y,
-                                        int blocked_cells,
-                                        const vector<GroupState> &groups,
-                                        int blocker_id, int arrival_id,
-                                        RescueDiagnostics &diagnostics) {
-    if (survey.remaining_probes == 0) {
-        if (!survey.probe_limit_reported) {
-            survey.probe_limit_reported = true;
-            diagnostics.pushout_helper_probe_limit_exhausted++;
-        }
-        return;
-    }
-    survey.remaining_probes--;
-    diagnostics.pushout_helper_obstruction_probes++;
-
-    const Rect &a = shape.main_rect;
-    const Rect &b = shape.extra_rect;
-    auto region_sum = [&](const auto &prefix) {
-        return rectangle_sum(prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
-               rectangle_sum(prefix, base_x + b.x, base_y + b.y, b.h, b.w);
-    };
-    int occupied_cells = region_sum(survey.owner_count_prefix);
-    // blocked_cells also counts pond cells.  Equality proves the shape is
-    // pond-free, so clearing its one owner is sufficient for legality.
-    if (occupied_cells == 0 || occupied_cells != blocked_cells) return;
-    ll owner_sum = region_sum(survey.owner_sum_prefix);
-    ll owner_square_sum = region_sum(survey.owner_square_sum_prefix);
-    if (owner_sum % occupied_cells != 0 ||
-        owner_square_sum * occupied_cells != owner_sum * owner_sum) {
-        return;
-    }
-    int helper_id = (int)(owner_sum / occupied_cells) - 1;
-    if (helper_id < 0 || helper_id >= (int)groups.size() ||
-        helper_id == arrival_id || !groups[helper_id].active) {
-        return;
-    }
-
-    diagnostics.pushout_helper_single_owner_regions++;
-    diagnostics.pushout_helper_overlap_cells += occupied_cells;
-    survey.unlocked_regions[helper_id]++;
-    survey.overlap_cells[helper_id] += occupied_cells;
-    if (survey.last_blocker[helper_id] != blocker_id) {
-        survey.last_blocker[helper_id] = blocker_id;
-        survey.covered_blockers[helper_id]++;
-    }
-    if constexpr (ENABLE_WIDE_PUSHOUT_HELPER) {
-        vector<PushOutHelperWitness> &helper_witnesses =
-            survey.witnesses[helper_id];
-        bool already_recorded = any_of(
-            helper_witnesses.begin(), helper_witnesses.end(),
-            [&](const PushOutHelperWitness &witness) {
-                return witness.blocker_id == blocker_id;
-            });
-        if (!already_recorded) {
-            helper_witnesses.push_back({
-                blocker_id,
-                materialize_shape(shape, base_x, base_y,
-                                  groups[blocker_id].p),
-                shape.perimeter,
-            });
-            diagnostics.pushout_helper_recorded_witnesses++;
-        }
-    }
-}
-
-struct PushOutHelperChoice {
-    int id = -1;
-    int covered_blockers = 0;
-    int unlocked_regions = 0;
-    long long overlap_cells = 0;
-    ll movement_cost = 0;
-    ll departure_distance = 0;
-    vector<PushOutHelperWitness> witnesses;
-};
-
-vector<PushOutHelperChoice> choose_pushout_helpers(
-    const PushOutHelperSurvey &survey, const RescueTarget &target,
-    const vector<GroupState> &groups, int arrival_id, int r_milli,
-    long double direct_gain_threshold, int choice_limit,
-    int &evidenced_groups) {
-    evidenced_groups = 0;
-    vector<ll> blocker_departures;
-    blocker_departures.reserve(target.blockers.size());
-    for (int id : target.blockers) blocker_departures.push_back(groups[id].t);
-    sort(blocker_departures.begin(), blocker_departures.end());
-    ll median_departure = blocker_departures[(blocker_departures.size() - 1) / 2];
-
-    vector<PushOutHelperChoice> choices;
-    for (int id = 0; id < (int)groups.size(); id++) {
-        if (survey.unlocked_regions[id] == 0) continue;
-        evidenced_groups++;
-        if (id == arrival_id || !groups[id].active ||
-            binary_search(target.blockers.begin(), target.blockers.end(), id)) {
-            continue;
-        }
-        ll added_movement_cost = move_cost(groups[id].v, r_milli);
-        if ((long double)(target.immediate_improvement - added_movement_cost) <=
-            direct_gain_threshold) {
-            continue;
-        }
-        choices.push_back({
-            id,
-            survey.covered_blockers[id],
-            survey.unlocked_regions[id],
-            survey.overlap_cells[id],
-            added_movement_cost,
-            llabs(groups[id].t - median_departure),
-            survey.witnesses[id],
-        });
-    }
-    auto key = [](const PushOutHelperChoice &choice) {
-        return tuple{-choice.covered_blockers, -choice.unlocked_regions,
-                     choice.movement_cost, choice.departure_distance, choice.id};
-    };
-    sort(choices.begin(), choices.end(), [&](const PushOutHelperChoice &lhs,
-                                             const PushOutHelperChoice &rhs) {
-        return key(lhs) < key(rhs);
-    });
-    if ((int)choices.size() > choice_limit) choices.resize(choice_limit);
-    return choices;
-}
 
 long double rescue_destination_temporal_cost(const vector<Cell> &cells, const BoardMask &cell_mask,
                                              const vs &park, const vvi &base_owner,
@@ -3457,8 +3177,7 @@ vector<RescueDestination> make_rescue_destinations(
     ll current_s, long double theta, const vector<Cell> &baseline_cells, const vector<char> &cleared_mask,
     const vector<vector<Shape>> &all_shapes, int &remaining_destination_anchors,
     int anchor_limit, int legal_limit, int destination_limit,
-    RescueDiagnostics &diagnostics, PushOutHelperSurvey *helper_survey = nullptr,
-    bool prefer_joint_exchange = false) {
+    RescueDiagnostics &diagnostics) {
     int n = park.size();
     const GroupState &group = groups[mover_id];
     vector<vi> blocked_prefix = make_blocked_prefix(park, base_owner);
@@ -3466,12 +3185,6 @@ vector<RescueDestination> make_rescue_destinations(
     for (auto [x, y] : baseline_cells) fallback_mask[x * n + y] = true;
     vector<vi> fallback_prefix = make_flag_prefix(fallback_mask, n);
     vector<vi> cleared_prefix = make_flag_prefix(cleared_mask, n);
-    vector<vi> foreign_cleared_prefix;
-    if (prefer_joint_exchange) {
-        vector<char> foreign_cleared_mask = cleared_mask;
-        for (auto [x, y] : group.cells) foreign_cleared_mask[x * n + y] = false;
-        foreign_cleared_prefix = make_flag_prefix(foreign_cleared_mask, n);
-    }
 
     const vector<Shape> &shapes = all_shapes[group.p];
     ll previous_fee = round_payment(group.v, group.p, group.max_perimeter);
@@ -3523,19 +3236,8 @@ vector<RescueDestination> make_rescue_destinations(
             int base_y = flat % columns;
             const Rect &a = shape.main_rect;
             const Rect &b = shape.extra_rect;
-            int blocked_cells =
-                rectangle_sum(blocked_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
-                rectangle_sum(blocked_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
-            if (blocked_cells != 0) {
-                if (helper_survey != nullptr && helper_survey->remaining_probes > 0) {
-                    observe_pushout_helper_obstruction(
-                        *helper_survey, shape, base_x, base_y, blocked_cells,
-                        groups, mover_id, arrival_id, diagnostics);
-                } else if (helper_survey != nullptr &&
-                           !helper_survey->probe_limit_reported) {
-                    helper_survey->probe_limit_reported = true;
-                    diagnostics.pushout_helper_probe_limit_exhausted++;
-                }
+            if (rectangle_sum(blocked_prefix, base_x + a.x, base_y + a.y, a.h, a.w) != 0 ||
+                rectangle_sum(blocked_prefix, base_x + b.x, base_y + b.y, b.h, b.w) != 0) {
                 continue;
             }
 
@@ -3555,25 +3257,13 @@ vector<RescueDestination> make_rescue_destinations(
                                    rectangle_sum(fallback_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
             int cleared_overlap = rectangle_sum(cleared_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
                                   rectangle_sum(cleared_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
-            int foreign_cleared_overlap = 0;
-            if (prefer_joint_exchange) {
-                foreign_cleared_overlap =
-                    rectangle_sum(foreign_cleared_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
-                    rectangle_sum(foreign_cleared_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
-                diagnostics.pushout_helper_foreign_destination_candidates +=
-                    foreign_cleared_overlap > 0;
-            }
             int lower_half = 2 * base_x + shape.h >= n;
             int right_half = 2 * base_y + shape.w >= n;
-            int sector_x = min(2, 3 * (2 * base_x + shape.h) / (2 * n));
-            int sector_y = min(2, 3 * (2 * base_y + shape.w) / (2 * n));
             BoardMask mask = make_board_mask(cells, n);
             long double temporal_cost = rescue_destination_temporal_cost(
                 cells, mask, park, base_owner, groups, mover_id, arrival_id, current_s, theta);
-            legal.push_back({std::move(cells), mask, shape.perimeter, fallback_overlap,
-                             cleared_overlap, foreign_cleared_overlap,
-                             2 * lower_half + right_half, 3 * sector_x + sector_y,
-                             temporal_cost, local_order++});
+            legal.push_back({std::move(cells), mask, shape.perimeter, fallback_overlap, cleared_overlap,
+                             2 * lower_half + right_half, temporal_cost, local_order++});
             diagnostics.destination_candidates++;
         }
         if (!progressed) break;
@@ -3586,6 +3276,8 @@ vector<RescueDestination> make_rescue_destinations(
         if (lhs.perimeter != rhs.perimeter) return lhs.perimeter < rhs.perimeter;
         return lhs.order < rhs.order;
     };
+    sort(legal.begin(), legal.end(), better);
+
     vector<RescueDestination> result;
     auto add = [&](const RescueDestination &candidate) {
         for (const RescueDestination &existing : result) {
@@ -3593,76 +3285,19 @@ vector<RescueDestination> make_rescue_destinations(
         }
         result.push_back(candidate);
     };
-    if (!prefer_joint_exchange) {
-        sort(legal.begin(), legal.end(), better);
-        for (int index = 0; index < min(4, (int)legal.size()); index++) add(legal[index]);
-        for (int quadrant = 0; quadrant < 4; quadrant++) {
-            auto it = find_if(legal.begin(), legal.end(),
-                              [&](const RescueDestination &candidate) {
-                                  return candidate.quadrant == quadrant;
-                              });
-            if (it != legal.end()) add(*it);
-        }
-        for (const RescueDestination &candidate : legal) {
-            if ((int)result.size() == destination_limit) break;
-            add(candidate);
-        }
-    } else {
-        // The old order made every mover chase the same pre-existing free
-        // cells.  Preserve several such choices, but explicitly retain moves
-        // into another mover's old region and spatially diverse alternatives.
-        auto joint_better = [](const RescueDestination &lhs,
-                               const RescueDestination &rhs) {
-            if (lhs.foreign_cleared_overlap != rhs.foreign_cleared_overlap) {
-                return lhs.foreign_cleared_overlap > rhs.foreign_cleared_overlap;
-            }
-            if (lhs.cleared_overlap != rhs.cleared_overlap) {
-                return lhs.cleared_overlap > rhs.cleared_overlap;
-            }
-            if (lhs.fallback_overlap != rhs.fallback_overlap) {
-                return lhs.fallback_overlap > rhs.fallback_overlap;
-            }
-            if (lhs.temporal_cost != rhs.temporal_cost) {
-                return lhs.temporal_cost < rhs.temporal_cost;
-            }
-            if (lhs.perimeter != rhs.perimeter) return lhs.perimeter < rhs.perimeter;
-            return lhs.order < rhs.order;
-        };
-        auto add_best = [&](auto comparator, int count) {
-            vector<int> order(legal.size());
-            iota(order.begin(), order.end(), 0);
-            sort(order.begin(), order.end(), [&](int lhs, int rhs) {
-                return comparator(legal[lhs], legal[rhs]);
-            });
-            for (int index : order) {
-                if (count == 0 || (int)result.size() == destination_limit) break;
-                int before = result.size();
-                add(legal[index]);
-                count -= (int)result.size() != before;
-            }
-        };
-        add_best(joint_better, 4);
-        add_best(better, 4);
-        for (int sector = 0; sector < 9 && (int)result.size() < destination_limit;
-             sector++) {
-            const RescueDestination *best_in_sector = nullptr;
-            for (const RescueDestination &candidate : legal) {
-                if (candidate.sector != sector) continue;
-                if (best_in_sector == nullptr || joint_better(candidate, *best_in_sector)) {
-                    best_in_sector = &candidate;
-                }
-            }
-            if (best_in_sector != nullptr) add(*best_in_sector);
-        }
-        add_best(joint_better, destination_limit);
+    for (int index = 0; index < min(4, (int)legal.size()); index++) add(legal[index]);
+    for (int quadrant = 0; quadrant < 4; quadrant++) {
+        auto it = find_if(legal.begin(), legal.end(),
+                          [&](const RescueDestination &candidate) {
+                              return candidate.quadrant == quadrant;
+                          });
+        if (it != legal.end()) add(*it);
+    }
+    for (const RescueDestination &candidate : legal) {
+        if ((int)result.size() == destination_limit) break;
+        add(candidate);
     }
     if ((int)result.size() > destination_limit) result.resize(destination_limit);
-    if (prefer_joint_exchange) {
-        for (const RescueDestination &candidate : result) {
-            diagnostics.pushout_helper_retained_foreign_destinations +=
-                candidate.foreign_cleared_overlap > 0;
-        }
-    }
     return result;
 }
 
@@ -3759,11 +3394,9 @@ optional<vector<int>> repair_rescue_blockers(const vvi &base_owner, const vector
                     RescueBeamState child = state;
                     merge_mask(child.occupied, candidate.mask);
                     child.choice[pool_index] = candidate_index;
-                    child.rank +=
-                        10000.0L * candidate.foreign_cleared_overlap +
-                        1000.0L * candidate.fallback_overlap +
-                        10.0L * candidate.cleared_overlap - candidate.temporal_cost -
-                        0.01L * candidate.perimeter;
+                    child.rank += 1000.0L * candidate.fallback_overlap +
+                                  10.0L * candidate.cleared_overlap -
+                                  candidate.temporal_cost - 0.01L * candidate.perimeter;
                     child.order = state_order++;
                     next.push_back(std::move(child));
                 }
@@ -4198,72 +3831,10 @@ enum class RescueMode {
 struct PreparedRescueCandidate {
     TurnPlan plan;
     vvi final_owner;
-    // blockers occupy the arrival target; movers additionally contains the
-    // optional helper.  Keep them separate so blocker histograms retain their
-    // original meaning while costs and emitted moves cover every mover.
     vector<int> blockers;
-    vector<int> movers;
-    int helper_id = -1;
     ll compact_fee = 0;
     ll direct_gain = 0;
     ll movement_cost = 0;
-    bool blocker_uses_helper_region = false;
-    bool helper_uses_blocker_region = false;
-};
-
-struct PushOutHelperSeed {
-    int target_index = -1;
-    PushOutHelperChoice helper;
-    ll adjusted_direct_gain = 0;
-};
-
-pair<bool, bool> classify_pushout_helper_exchange(
-    const TurnPlan &plan, const vector<GroupState> &groups,
-    const vector<int> &blockers, int helper_id, int n) {
-    vector<char> helper_old(n * n, false);
-    vector<char> blocker_old(n * n, false);
-    for (auto [x, y] : groups[helper_id].cells) helper_old[x * n + y] = true;
-    for (int id : blockers) {
-        for (auto [x, y] : groups[id].cells) blocker_old[x * n + y] = true;
-    }
-    bool blocker_uses_helper = false;
-    bool helper_uses_blocker = false;
-    for (const MovePlan &move : plan.moves) {
-        if (move.id == helper_id) {
-            for (auto [x, y] : move.cells) helper_uses_blocker |= blocker_old[x * n + y];
-        } else if (binary_search(blockers.begin(), blockers.end(), move.id)) {
-            for (auto [x, y] : move.cells) blocker_uses_helper |= helper_old[x * n + y];
-        }
-    }
-    return {blocker_uses_helper, helper_uses_blocker};
-}
-
-struct PushOutHelperPhaseScope {
-    RescueDiagnostics &diagnostics;
-    clock_t cpu_begin;
-    long long destination_anchors;
-    long long destination_candidates;
-    long long beam_nodes;
-
-    explicit PushOutHelperPhaseScope(RescueDiagnostics &diagnostics)
-        : diagnostics(diagnostics),
-          cpu_begin(clock()),
-          destination_anchors(diagnostics.destination_anchors),
-          destination_candidates(diagnostics.destination_candidates),
-          beam_nodes(diagnostics.beam_nodes) {}
-
-    ~PushOutHelperPhaseScope() {
-        diagnostics.pushout_helper_destination_anchors +=
-            diagnostics.destination_anchors - destination_anchors;
-        diagnostics.pushout_helper_destination_candidates +=
-            diagnostics.destination_candidates - destination_candidates;
-        diagnostics.pushout_helper_beam_nodes += diagnostics.beam_nodes - beam_nodes;
-        clock_t cpu_end = clock();
-        if (cpu_begin != (clock_t)-1 && cpu_end != (clock_t)-1) {
-            diagnostics.pushout_helper_phase_cpu_seconds +=
-                (double)(cpu_end - cpu_begin) / CLOCKS_PER_SEC;
-        }
-    }
 };
 
 optional<RootActionResult> choose_root_action_with_rescue(
@@ -4358,54 +3929,10 @@ optional<RootActionResult> choose_root_action_with_rescue(
     RescueRolloutScenarios rollout_scenarios;
     bool rollout_ready = false;
     bool stop_after_primary = false;
-    vector<PushOutHelperSeed> helper_seeds;
-    bool helper_raw_evidence = false;
-    bool helper_surveyed_turn = false;
     const vector<Cell> &preferred_destination_cells =
         mode == RescueMode::NoRegionPushOut ? preexisting_free_cells : *baseline.cells;
 
-    auto initialize_rollout_for_first_candidate = [&]() {
-        diagnostics.feasible_turns++;
-        if (no_region_pushout) diagnostics.pushout_feasible_turns++;
-        if (remaining_groups == 0) {
-            diagnostics.rollout_skipped_no_future++;
-            stop_after_primary = true;
-            return true;
-        }
-
-        rollout_scenarios = make_rescue_rollout_scenarios(
-            groups, arrival_id, current_s, remaining_groups, theta, theta_estimator);
-        int expected_length = min(RESCUE_ROLLOUT_LENGTH, remaining_groups);
-        bool generation_ok = rollout_scenarios.complete;
-        for (const auto &scenario : rollout_scenarios.arrivals) {
-            if ((int)scenario.size() != expected_length) {
-                generation_ok = false;
-                break;
-            }
-        }
-        if (!generation_ok) {
-            diagnostics.rollout_generation_failures++;
-            if (no_region_pushout) {
-                // Reject-to-Accept is a larger intervention.  Without the
-                // common-random-number comparison, retain Reject.
-                diagnostics.pushout_rollout_generation_failures++;
-                diagnostics.pushout_screen_rejected++;
-                if (candidates.size() == 1 && candidates.front().helper_id != -1) {
-                    diagnostics.pushout_helper_screen_rejected++;
-                }
-                return false;
-            }
-            // Scenario construction is only a filter for the existing
-            // Accepted rescue.  Preserve its legal positive-direct action.
-            stop_after_primary = true;
-            return true;
-        }
-        rollout_ready = true;
-        return true;
-    };
-
-    for (int target_index = 0; target_index < (int)targets.size(); target_index++) {
-        const RescueTarget &target = targets[target_index];
+    for (const RescueTarget &target : targets) {
         if (attempted_targets == target_repair_limit || remaining_nodes == 0 ||
             (int)candidates.size() == RESCUE_ROLLOUT_CANDIDATE_LIMIT) {
             break;
@@ -4433,20 +3960,6 @@ optional<RootActionResult> choose_root_action_with_rescue(
             continue;
         }
 
-        optional<PushOutHelperSurvey> helper_survey;
-        if constexpr (ENABLE_PUSHOUT_HELPER) {
-            if (no_region_pushout &&
-                (int)target.blockers.size() <= PUSHOUT_HELPER_MAX_BLOCKERS) {
-                helper_survey.emplace(groups.size(), base_owner);
-                diagnostics.pushout_helper_surveyed_targets++;
-                if (!helper_surveyed_turn) {
-                    helper_surveyed_turn = true;
-                    diagnostics.pushout_helper_surveyed_turns++;
-                }
-            } else if (no_region_pushout) {
-                diagnostics.pushout_helper_large_blocker_targets++;
-            }
-        }
         vector<vector<RescueDestination>> pools;
         pools.reserve(target.blockers.size());
         bool missing_destination = false;
@@ -4455,35 +3968,12 @@ optional<RootActionResult> choose_root_action_with_rescue(
                 park, base_owner, groups, id, arrival_id, current_s, theta,
                 preferred_destination_cells, cleared_mask,
                 all_shapes, remaining_destination_anchors, destination_anchor_limit,
-                destination_legal_limit, destination_limit, diagnostics,
-                helper_survey ? &*helper_survey : nullptr);
+                destination_legal_limit, destination_limit, diagnostics);
             if (pool.empty()) {
                 missing_destination = true;
                 break;
             }
             pools.push_back(std::move(pool));
-        }
-        if constexpr (ENABLE_PUSHOUT_HELPER) {
-            if (helper_survey) {
-                int evidenced_groups = 0;
-                vector<PushOutHelperChoice> helpers = choose_pushout_helpers(
-                    *helper_survey, target, groups, arrival_id, r_milli,
-                    direct_gain_threshold,
-                    PUSHOUT_HELPER_CHOICE_LIMIT_PER_TARGET,
-                    evidenced_groups);
-                diagnostics.pushout_helper_evidenced_groups += evidenced_groups;
-                helper_raw_evidence |= evidenced_groups > 0;
-                diagnostics.pushout_helper_shortlisted_choices += helpers.size();
-                for (PushOutHelperChoice &helper : helpers) {
-                    ll adjusted_direct_gain =
-                        target.immediate_improvement - helper.movement_cost;
-                    helper_seeds.push_back({
-                        target_index,
-                        std::move(helper),
-                        adjusted_direct_gain,
-                    });
-                }
-            }
         }
         if (missing_destination) continue;
 
@@ -4522,360 +4012,42 @@ optional<RootActionResult> choose_root_action_with_rescue(
             chmax(diagnostics.pushout_maximum_blockers, (int)target.blockers.size());
         }
         candidates.push_back({std::move(plan), std::move(final_owner), target.blockers,
-                              target.blockers, -1, compact_fee, direct_gain,
-                              target.movement_cost});
+                              compact_fee, direct_gain, target.movement_cost});
 
         if (candidates.size() == 1) {
-            if (!initialize_rollout_for_first_candidate()) return nullopt;
-            if (stop_after_primary) break;
-        }
-    }
-
-    // Preserve the blockers-only path as the protected first phase.  The
-    // helper is tried only when that phase produced no complete plan, so it
-    // can rescue a missing action but cannot displace an existing candidate.
-    if constexpr (ENABLE_PUSHOUT_HELPER) {
-        if (no_region_pushout && candidates.empty() && !stop_after_primary) {
-            diagnostics.pushout_helper_considered_turns++;
-            if (!helper_surveyed_turn) {
-                diagnostics.pushout_helper_no_eligible_target_turns++;
-            } else if (helper_seeds.empty()) {
-                if (helper_raw_evidence) {
-                    diagnostics.pushout_helper_economic_rejected_turns++;
-                } else {
-                    diagnostics.pushout_helper_no_evidence_turns++;
-                }
-            } else {
-                diagnostics.pushout_helper_seeded_turns++;
-                sort(helper_seeds.begin(), helper_seeds.end(),
-                     [](const PushOutHelperSeed &lhs, const PushOutHelperSeed &rhs) {
-                         if (lhs.adjusted_direct_gain != rhs.adjusted_direct_gain) {
-                             return lhs.adjusted_direct_gain > rhs.adjusted_direct_gain;
-                         }
-                         if (lhs.helper.covered_blockers != rhs.helper.covered_blockers) {
-                             return lhs.helper.covered_blockers > rhs.helper.covered_blockers;
-                         }
-                         if (lhs.helper.unlocked_regions != rhs.helper.unlocked_regions) {
-                             return lhs.helper.unlocked_regions > rhs.helper.unlocked_regions;
-                         }
-                         if (lhs.target_index != rhs.target_index) {
-                             return lhs.target_index < rhs.target_index;
-                         }
-                         return lhs.helper.id < rhs.helper.id;
-                     });
-
-                PushOutHelperPhaseScope helper_scope(diagnostics);
-                int helper_remaining_nodes = PUSHOUT_HELPER_REPAIR_NODE_LIMIT;
-                int helper_remaining_destination_anchors =
-                    PUSHOUT_HELPER_DESTINATION_ANCHOR_GLOBAL_LIMIT;
-                int helper_attempts = 0;
-                for (const PushOutHelperSeed &seed : helper_seeds) {
-                    if (helper_attempts == PUSHOUT_HELPER_REPAIR_LIMIT ||
-                        helper_remaining_nodes == 0 ||
-                        helper_remaining_destination_anchors == 0 ||
-                        (int)candidates.size() == PUSHOUT_HELPER_FEASIBLE_LIMIT ||
-                        stop_after_primary) {
-                        break;
-                    }
-                    helper_attempts++;
-                    diagnostics.repair_attempts++;
-                    diagnostics.pushout_helper_attempts++;
-                    if (seed.target_index < 0 ||
-                        seed.target_index >= (int)targets.size() ||
-                        seed.helper.id < 0 || seed.helper.id >= (int)groups.size()) {
-                        diagnostics.validation_failures++;
-                        diagnostics.pushout_helper_validation_failures++;
-                        continue;
-                    }
-                    const RescueTarget &target = targets[seed.target_index];
-                    if (target.blockers.empty() ||
-                        (int)target.blockers.size() > PUSHOUT_HELPER_MAX_BLOCKERS) {
-                        diagnostics.validation_failures++;
-                        diagnostics.pushout_helper_validation_failures++;
-                        continue;
-                    }
-
-                    vector<int> movers = target.blockers;
-                    movers.push_back(seed.helper.id);
-                    sort(movers.begin(), movers.end());
-                    bool valid_movers =
-                        adjacent_find(movers.begin(), movers.end()) == movers.end() &&
-                        seed.helper.id != arrival_id && groups[seed.helper.id].active;
-                    if (!valid_movers) {
-                        diagnostics.validation_failures++;
-                        diagnostics.pushout_helper_validation_failures++;
-                        continue;
-                    }
-                    chmax(diagnostics.pushout_helper_maximum_movers,
-                          (int)movers.size());
-                    diagnostics.pushout_helper_selected_covered_blockers +=
-                        seed.helper.covered_blockers;
-                    diagnostics.pushout_helper_selected_unlocked_regions +=
-                        seed.helper.unlocked_regions;
-                    diagnostics.pushout_helper_selected_overlap_cells +=
-                        seed.helper.overlap_cells;
-                    diagnostics.pushout_helper_selected_movement_cost +=
-                        seed.helper.movement_cost;
-                    diagnostics.pushout_helper_selected_departure_distance +=
-                        seed.helper.departure_distance;
-                    diagnostics.pushout_helper_selected_adjusted_gain +=
-                        seed.adjusted_direct_gain;
-
-                    ll full_movement_cost = 0;
-                    for (int id : movers) full_movement_cost += move_cost(groups[id].v, r_milli);
-                    ll compact_fee = round_payment(arrival.v, arrival.p, target.perimeter);
-                    ll direct_gain = compact_fee - full_movement_cost - baseline_score;
-                    if ((long double)direct_gain <= direct_gain_threshold) {
-                        // The same strict economic gate was already used by
-                        // the shortlist.  Rechecking the exact mover set makes
-                        // any future refactor fail closed.
-                        diagnostics.validation_failures++;
-                        diagnostics.pushout_helper_validation_failures++;
-                        continue;
-                    }
-
-                    vvi base_owner = owner;
-                    vector<char> cleared_mask(park.size() * park.size(), false);
-                    for (int id : movers) {
-                        for (auto [x, y] : groups[id].cells) {
-                            cleared_mask[x * park.size() + y] = true;
-                        }
-                        clear_cells(base_owner, groups[id].cells);
-                    }
-                    bool target_legal = true;
-                    for (auto [x, y] : target.cells) {
-                        if (park[x][y] != '.' || base_owner[x][y] != -1) {
-                            target_legal = false;
-                            break;
-                        }
-                        base_owner[x][y] = arrival_id;
-                    }
-                    if (!target_legal) {
-                        diagnostics.validation_failures++;
-                        diagnostics.pushout_helper_validation_failures++;
-                        continue;
-                    }
-
-                    vector<char> preferred_mask;
-                    if constexpr (ENABLE_WIDE_PUSHOUT_HELPER) {
-                        preferred_mask.assign(park.size() * park.size(), false);
-                        for (auto [x, y] : preferred_destination_cells) {
-                            preferred_mask[x * park.size() + y] = true;
-                        }
-                    }
-                    auto force_causal_witness =
-                        [&](int mover_id, vector<RescueDestination> &pool) {
-                            if constexpr (!ENABLE_WIDE_PUSHOUT_HELPER) return;
-                            if (!binary_search(target.blockers.begin(),
-                                               target.blockers.end(), mover_id)) {
-                                return;
-                            }
-                            auto witness_it = find_if(
-                                seed.helper.witnesses.begin(),
-                                seed.helper.witnesses.end(),
-                                [&](const PushOutHelperWitness &witness) {
-                                    return witness.blocker_id == mover_id;
-                                });
-                            if (witness_it == seed.helper.witnesses.end()) return;
-                            const PushOutHelperWitness &witness = *witness_it;
-                            if ((int)witness.cells.size() != groups[mover_id].p ||
-                                same_region(witness.cells, groups[mover_id].cells)) {
-                                return;
-                            }
-                            for (auto [x, y] : witness.cells) {
-                                if (park[x][y] != '.' || base_owner[x][y] != -1) {
-                                    return;
-                                }
-                            }
-                            ll old_fee = round_payment(
-                                groups[mover_id].v, groups[mover_id].p,
-                                groups[mover_id].max_perimeter);
-                            ll new_fee = round_payment(
-                                groups[mover_id].v, groups[mover_id].p,
-                                max(groups[mover_id].max_perimeter,
-                                    witness.perimeter));
-                            if (old_fee != new_fee) return;
-                            for (int index = 0; index < (int)pool.size(); index++) {
-                                if (!same_region(pool[index].cells, witness.cells)) continue;
-                                rotate(pool.begin(), pool.begin() + index,
-                                       pool.begin() + index + 1);
-                                diagnostics.pushout_helper_forced_witness_destinations++;
-                                return;
-                            }
-
-                            vector<char> own_old(park.size() * park.size(), false);
-                            for (auto [x, y] : groups[mover_id].cells) {
-                                own_old[x * park.size() + y] = true;
-                            }
-                            int fallback_overlap = 0;
-                            int cleared_overlap = 0;
-                            int foreign_cleared_overlap = 0;
-                            int min_x = park.size(), min_y = park.size();
-                            int max_x = -1, max_y = -1;
-                            for (auto [x, y] : witness.cells) {
-                                int cell = x * park.size() + y;
-                                fallback_overlap += preferred_mask[cell];
-                                cleared_overlap += cleared_mask[cell];
-                                foreign_cleared_overlap +=
-                                    cleared_mask[cell] && !own_old[cell];
-                                chmin(min_x, x);
-                                chmin(min_y, y);
-                                chmax(max_x, x);
-                                chmax(max_y, y);
-                            }
-                            int height = max_x - min_x + 1;
-                            int width = max_y - min_y + 1;
-                            int lower_half = 2 * min_x + height >= (int)park.size();
-                            int right_half = 2 * min_y + width >= (int)park.size();
-                            int sector_x = min(
-                                2, 3 * (2 * min_x + height) /
-                                       (2 * (int)park.size()));
-                            int sector_y = min(
-                                2, 3 * (2 * min_y + width) /
-                                       (2 * (int)park.size()));
-                            BoardMask mask = make_board_mask(witness.cells, park.size());
-                            long double temporal_cost =
-                                rescue_destination_temporal_cost(
-                                    witness.cells, mask, park, base_owner, groups,
-                                    mover_id, arrival_id, current_s, theta);
-                            RescueDestination destination{
-                                witness.cells,
-                                mask,
-                                witness.perimeter,
-                                fallback_overlap,
-                                cleared_overlap,
-                                foreign_cleared_overlap,
-                                2 * lower_half + right_half,
-                                3 * sector_x + sector_y,
-                                temporal_cost,
-                                -1,
-                            };
-                            pool.insert(pool.begin(), std::move(destination));
-                            if ((int)pool.size() > PUSHOUT_HELPER_DESTINATION_LIMIT) {
-                                pool.pop_back();
-                            }
-                            diagnostics.destination_candidates++;
-                            diagnostics.pushout_helper_forced_witness_destinations++;
-                            diagnostics.pushout_helper_foreign_destination_candidates +=
-                                foreign_cleared_overlap > 0;
-                            diagnostics.pushout_helper_retained_foreign_destinations +=
-                                foreign_cleared_overlap > 0;
-                        };
-
-                    vector<vector<RescueDestination>> pools;
-                    pools.reserve(movers.size());
-                    bool missing_destination = false;
-                    for (int id : movers) {
-                        vector<RescueDestination> pool = make_rescue_destinations(
-                            park, base_owner, groups, id, arrival_id, current_s, theta,
-                            preferred_destination_cells, cleared_mask, all_shapes,
-                            helper_remaining_destination_anchors,
-                            PUSHOUT_HELPER_DESTINATION_ANCHOR_LIMIT,
-                            PUSHOUT_HELPER_DESTINATION_LEGAL_LIMIT,
-                            PUSHOUT_HELPER_DESTINATION_LIMIT, diagnostics,
-                            nullptr, ENABLE_WIDE_PUSHOUT_HELPER);
-                        force_causal_witness(id, pool);
-                        if (pool.empty()) {
-                            missing_destination = true;
-                            if (id == seed.helper.id) {
-                                diagnostics.pushout_helper_missing_helper_destination++;
-                            } else {
-                                diagnostics.pushout_helper_missing_blocker_destination++;
-                            }
-                            break;
-                        }
-                        pools.push_back(std::move(pool));
-                    }
-                    if (missing_destination) {
-                        diagnostics.pushout_helper_missing_destination++;
-                        continue;
-                    }
-
-                    optional<vector<int>> choices = repair_rescue_blockers(
-                        base_owner, groups, movers, pools, helper_remaining_nodes,
-                        diagnostics);
-                    if (!choices) {
-                        diagnostics.pushout_helper_repair_failures++;
-                        continue;
-                    }
-
-                    TurnPlan plan;
-                    for (int index = 0; index < (int)movers.size(); index++) {
-                        const RescueDestination &destination =
-                            pools[index][(*choices)[index]];
-                        plan.moves.push_back(
-                            {movers[index], destination.cells, destination.perimeter});
-                    }
-                    plan.arrival = target.cells;
-                    plan.arrival_perimeter = target.perimeter;
-                    plan.immediate_gain = compact_fee - full_movement_cost;
-
-                    vvi final_owner;
-                    ll fee_loss = 0;
-                    ll checked_movement_cost = 0;
-                    if (!validate_and_build_rescue_owner(
-                            plan, park, owner, groups, arrival_id, r_milli,
-                            final_owner, fee_loss, checked_movement_cost) ||
-                        fee_loss != 0 || checked_movement_cost != full_movement_cost ||
-                        plan.immediate_gain - baseline_score != direct_gain ||
-                        (long double)direct_gain <= direct_gain_threshold) {
-                        diagnostics.validation_failures++;
-                        diagnostics.pushout_helper_validation_failures++;
-                        continue;
-                    }
-
-                    bool duplicate = false;
-                    for (const PreparedRescueCandidate &candidate : candidates) {
-                        if (candidate.final_owner == final_owner) {
-                            duplicate = true;
-                            break;
-                        }
-                    }
-                    if (duplicate) {
-                        diagnostics.pushout_helper_duplicate_plans++;
-                        continue;
-                    }
-
-                    int blocker_bucket = min((int)target.blockers.size(), 4) - 1;
-                    auto [blocker_uses_helper, helper_uses_blocker] =
-                        classify_pushout_helper_exchange(
-                            plan, groups, target.blockers, seed.helper.id,
-                            park.size());
-                    diagnostics.feasible_plans++;
-                    diagnostics.feasible_by_blocker_count[blocker_bucket]++;
-                    diagnostics.feasible_direct_gain += direct_gain;
-                    diagnostics.pushout_feasible_by_blocker_count[blocker_bucket]++;
-                    chmax(diagnostics.pushout_maximum_blockers,
-                          (int)target.blockers.size());
-                    diagnostics.pushout_helper_feasible_plans++;
-                    diagnostics.pushout_helper_feasible_by_blocker_count[
-                        target.blockers.size() - 1]++;
-                    diagnostics.pushout_helper_feasible_blocker_uses_helper +=
-                        blocker_uses_helper;
-                    diagnostics.pushout_helper_feasible_helper_uses_blocker +=
-                        helper_uses_blocker;
-                    diagnostics.pushout_helper_feasible_bidirectional_cross_use +=
-                        blocker_uses_helper && helper_uses_blocker;
-                    candidates.push_back({
-                        std::move(plan), std::move(final_owner), target.blockers,
-                        std::move(movers), seed.helper.id, compact_fee, direct_gain,
-                        full_movement_cost, blocker_uses_helper,
-                        helper_uses_blocker,
-                    });
-
-                    if (candidates.size() == 1 &&
-                        !initialize_rollout_for_first_candidate()) {
-                        return nullopt;
-                    }
-                }
-                if ((int)candidates.size() == PUSHOUT_HELPER_FEASIBLE_LIMIT &&
-                    helper_attempts < (int)helper_seeds.size()) {
-                    diagnostics.pushout_helper_feasible_limit_exhausted++;
-                }
-                diagnostics.pushout_helper_two_feasible_turns +=
-                    candidates.size() >= 2;
-                if (helper_remaining_nodes == 0) diagnostics.node_limit_exhausted++;
+            diagnostics.feasible_turns++;
+            if (no_region_pushout) diagnostics.pushout_feasible_turns++;
+            if (remaining_groups == 0) {
+                diagnostics.rollout_skipped_no_future++;
+                stop_after_primary = true;
+                break;
             }
+
+            rollout_scenarios = make_rescue_rollout_scenarios(
+                groups, arrival_id, current_s, remaining_groups, theta, theta_estimator);
+            int expected_length = min(RESCUE_ROLLOUT_LENGTH, remaining_groups);
+            bool generation_ok = rollout_scenarios.complete;
+            for (const auto &scenario : rollout_scenarios.arrivals) {
+                if ((int)scenario.size() != expected_length) {
+                    generation_ok = false;
+                    break;
+                }
+            }
+            if (!generation_ok) {
+                diagnostics.rollout_generation_failures++;
+                if (no_region_pushout) {
+                    // Reject-to-Accept is a larger intervention.  Without the
+                    // common-random-number comparison, retain Reject.
+                    diagnostics.pushout_rollout_generation_failures++;
+                    diagnostics.pushout_screen_rejected++;
+                    return nullopt;
+                }
+                // Scenario construction is only a filter for the existing
+                // Accepted rescue.  Preserve its legal positive-direct action.
+                stop_after_primary = true;
+                break;
+            }
+            rollout_ready = true;
         }
     }
 
@@ -4894,11 +4066,6 @@ optional<RootActionResult> choose_root_action_with_rescue(
     }
     if (remaining_nodes == 0) diagnostics.node_limit_exhausted++;
 
-    int helper_candidate_count = count_if(
-        candidates.begin(), candidates.end(),
-        [](const PreparedRescueCandidate &candidate) {
-            return candidate.helper_id != -1;
-        });
     RootActionKind selected_kind = RootActionKind::Rescue;
     int selected_candidate = 0;
     int selected_alternative = -1;
@@ -4999,13 +4166,6 @@ optional<RootActionResult> choose_root_action_with_rescue(
         long double future_mean =
             0.5L * (best_evaluation.future_delta[0] + best_evaluation.future_delta[1]);
         long double rollout_margin = 0.5L * best_evaluation.margin_twice;
-        if (best_candidate.helper_id != -1) {
-            diagnostics.pushout_helper_scenario_0_future_delta +=
-                best_evaluation.future_delta[0];
-            diagnostics.pushout_helper_scenario_1_future_delta +=
-                best_evaluation.future_delta[1];
-            diagnostics.pushout_helper_screen_margin += rollout_margin;
-        }
         bool first_accepts = best_candidate.direct_gain + best_evaluation.future_delta[0] > 0;
         bool second_accepts = best_candidate.direct_gain + best_evaluation.future_delta[1] > 0;
         if (first_accepts != second_accepts) diagnostics.rollout_scenario_disagreements++;
@@ -5146,13 +4306,10 @@ optional<RootActionResult> choose_root_action_with_rescue(
                 diagnostics.root_selected_primary++;
                 if (no_region_pushout) {
                     diagnostics.pushout_screen_rejected++;
-                    diagnostics.pushout_helper_screen_rejected +=
-                        helper_candidate_count;
                 }
                 return nullopt;
             }
             assert(selected_kind == RootActionKind::NormalAlternative);
-            diagnostics.pushout_helper_screen_rejected += helper_candidate_count;
             diagnostics.root_selected_alternative++;
             diagnostics.root_selected_alternative_rank[selected_alternative]++;
             return RootActionResult{std::move(alternative_plans[selected_alternative]),
@@ -5169,11 +4326,6 @@ optional<RootActionResult> choose_root_action_with_rescue(
         diagnostics.rollout_adopted_margin += rollout_margin;
     }
 
-    if (no_region_pushout) {
-        diagnostics.pushout_helper_screen_rejected +=
-            helper_candidate_count -
-            (candidates[selected_candidate].helper_id != -1);
-    }
     PreparedRescueCandidate &chosen = candidates[selected_candidate];
     int blocker_bucket = min((int)chosen.blockers.size(), 4) - 1;
     ArrivalDecision selected = baseline;
@@ -5186,37 +4338,18 @@ optional<RootActionResult> choose_root_action_with_rescue(
     replace_selected_placement_success(selected.diagnostics, PlacementSource::MinimumTemplate);
     diagnostics.successes++;
     diagnostics.successes_by_blocker_count[blocker_bucket]++;
-    diagnostics.moved_groups += chosen.movers.size();
+    diagnostics.moved_groups += chosen.blockers.size();
     diagnostics.arrival_fee_gain += chosen.compact_fee - baseline_score;
     diagnostics.movement_cost += chosen.movement_cost;
     diagnostics.immediate_gain += chosen.direct_gain;
     if (no_region_pushout) {
         diagnostics.pushout_adopted++;
         diagnostics.pushout_adopted_by_blocker_count[blocker_bucket]++;
-        diagnostics.pushout_moved_groups += chosen.movers.size();
-        for (int id : chosen.movers) diagnostics.pushout_moved_cells += groups[id].p;
+        diagnostics.pushout_moved_groups += chosen.blockers.size();
+        for (int id : chosen.blockers) diagnostics.pushout_moved_cells += groups[id].p;
         diagnostics.pushout_arrival_fee += chosen.compact_fee;
         diagnostics.pushout_movement_cost += chosen.movement_cost;
         diagnostics.pushout_direct_gain += chosen.direct_gain;
-        if (chosen.helper_id != -1) {
-            diagnostics.pushout_helper_adopted++;
-            diagnostics.pushout_helper_adopted_by_blocker_count[
-                chosen.blockers.size() - 1]++;
-            diagnostics.pushout_helper_adopted_blocker_uses_helper +=
-                chosen.blocker_uses_helper_region;
-            diagnostics.pushout_helper_adopted_helper_uses_blocker +=
-                chosen.helper_uses_blocker_region;
-            diagnostics.pushout_helper_adopted_bidirectional_cross_use +=
-                chosen.blocker_uses_helper_region &&
-                chosen.helper_uses_blocker_region;
-            diagnostics.pushout_helper_adopted_moved_groups += chosen.movers.size();
-            for (int id : chosen.movers) {
-                diagnostics.pushout_helper_adopted_moved_cells += groups[id].p;
-            }
-            diagnostics.pushout_helper_adopted_arrival_fee += chosen.compact_fee;
-            diagnostics.pushout_helper_adopted_movement_cost += chosen.movement_cost;
-            diagnostics.pushout_helper_adopted_direct_gain += chosen.direct_gain;
-        }
     }
     return RootActionResult{std::move(chosen.plan), std::move(selected)};
 }
@@ -7228,101 +6361,6 @@ int main() {
     ll pushout_direct_identity_error =
         rescue_diagnostics.pushout_arrival_fee - rescue_diagnostics.pushout_movement_cost -
         rescue_diagnostics.pushout_relocation_fee_loss - rescue_diagnostics.pushout_direct_gain;
-    int pushout_helper_turn_funnel_error =
-        rescue_diagnostics.pushout_helper_considered_turns -
-        rescue_diagnostics.pushout_helper_no_eligible_target_turns -
-        rescue_diagnostics.pushout_helper_no_evidence_turns -
-        rescue_diagnostics.pushout_helper_economic_rejected_turns -
-        rescue_diagnostics.pushout_helper_seeded_turns;
-    int pushout_helper_attempt_funnel_error =
-        rescue_diagnostics.pushout_helper_attempts -
-        rescue_diagnostics.pushout_helper_missing_destination -
-        rescue_diagnostics.pushout_helper_repair_failures -
-        rescue_diagnostics.pushout_helper_validation_failures -
-        rescue_diagnostics.pushout_helper_duplicate_plans -
-        rescue_diagnostics.pushout_helper_feasible_plans;
-    int pushout_helper_missing_partition_error =
-        rescue_diagnostics.pushout_helper_missing_destination -
-        rescue_diagnostics.pushout_helper_missing_blocker_destination -
-        rescue_diagnostics.pushout_helper_missing_helper_destination;
-    int pushout_helper_feasible_funnel_error =
-        rescue_diagnostics.pushout_helper_feasible_plans -
-        rescue_diagnostics.pushout_helper_screen_rejected -
-        rescue_diagnostics.pushout_helper_adopted;
-    int pushout_helper_feasible_histogram_error =
-        rescue_diagnostics.pushout_helper_feasible_plans -
-        accumulate(rescue_diagnostics.pushout_helper_feasible_by_blocker_count.begin(),
-                   rescue_diagnostics.pushout_helper_feasible_by_blocker_count.end(), 0);
-    int pushout_helper_adopted_histogram_error =
-        rescue_diagnostics.pushout_helper_adopted -
-        accumulate(rescue_diagnostics.pushout_helper_adopted_by_blocker_count.begin(),
-                   rescue_diagnostics.pushout_helper_adopted_by_blocker_count.end(), 0);
-    ll pushout_helper_direct_identity_error =
-        rescue_diagnostics.pushout_helper_adopted_arrival_fee -
-        rescue_diagnostics.pushout_helper_adopted_movement_cost -
-        rescue_diagnostics.pushout_helper_adopted_direct_gain;
-    int pushout_helper_work_cap_error =
-        (rescue_diagnostics.pushout_helper_attempts >
-         PUSHOUT_HELPER_REPAIR_LIMIT *
-             rescue_diagnostics.pushout_helper_seeded_turns) +
-        (rescue_diagnostics.pushout_helper_surveyed_targets >
-         PUSHOUT_TARGET_REPAIR_LIMIT *
-             rescue_diagnostics.pushout_helper_surveyed_turns) +
-        (rescue_diagnostics.pushout_helper_obstruction_probes >
-         (long long)PUSHOUT_HELPER_OBSTRUCTION_PROBE_LIMIT *
-             rescue_diagnostics.pushout_helper_surveyed_targets) +
-        (rescue_diagnostics.pushout_helper_destination_anchors >
-         (long long)PUSHOUT_HELPER_DESTINATION_ANCHOR_GLOBAL_LIMIT *
-             rescue_diagnostics.pushout_helper_seeded_turns) +
-        (rescue_diagnostics.pushout_helper_beam_nodes >
-         (long long)PUSHOUT_HELPER_REPAIR_NODE_LIMIT *
-             rescue_diagnostics.pushout_helper_seeded_turns) +
-        (rescue_diagnostics.pushout_helper_feasible_plans >
-         (long long)PUSHOUT_HELPER_FEASIBLE_LIMIT *
-             rescue_diagnostics.pushout_helper_seeded_turns) +
-        (rescue_diagnostics.pushout_helper_shortlisted_choices >
-         (long long)PUSHOUT_HELPER_CHOICE_LIMIT_PER_TARGET *
-             rescue_diagnostics.pushout_helper_surveyed_targets) +
-        (rescue_diagnostics.pushout_helper_two_feasible_turns >
-         rescue_diagnostics.pushout_helper_seeded_turns) +
-        (rescue_diagnostics.pushout_helper_maximum_movers >
-         PUSHOUT_HELPER_MAX_BLOCKERS + 1);
-#ifdef AHC069_DISABLE_PUSHOUT_HELPER
-    bool any_pushout_helper_diagnostic =
-        rescue_diagnostics.pushout_helper_considered_turns != 0 ||
-        rescue_diagnostics.pushout_helper_no_eligible_target_turns != 0 ||
-        rescue_diagnostics.pushout_helper_no_evidence_turns != 0 ||
-        rescue_diagnostics.pushout_helper_economic_rejected_turns != 0 ||
-        rescue_diagnostics.pushout_helper_seeded_turns != 0 ||
-        rescue_diagnostics.pushout_helper_attempts != 0 ||
-        rescue_diagnostics.pushout_helper_missing_blocker_destination != 0 ||
-        rescue_diagnostics.pushout_helper_missing_helper_destination != 0 ||
-        rescue_diagnostics.pushout_helper_feasible_plans != 0 ||
-        rescue_diagnostics.pushout_helper_screen_rejected != 0 ||
-        rescue_diagnostics.pushout_helper_adopted != 0 ||
-        rescue_diagnostics.pushout_helper_surveyed_targets != 0 ||
-        rescue_diagnostics.pushout_helper_large_blocker_targets != 0 ||
-        rescue_diagnostics.pushout_helper_feasible_limit_exhausted != 0 ||
-        rescue_diagnostics.pushout_helper_two_feasible_turns != 0 ||
-        rescue_diagnostics.pushout_helper_obstruction_probes != 0 ||
-        rescue_diagnostics.pushout_helper_single_owner_regions != 0 ||
-        rescue_diagnostics.pushout_helper_evidenced_groups != 0 ||
-        rescue_diagnostics.pushout_helper_recorded_witnesses != 0 ||
-        rescue_diagnostics.pushout_helper_shortlisted_choices != 0 ||
-        rescue_diagnostics.pushout_helper_destination_anchors != 0 ||
-        rescue_diagnostics.pushout_helper_destination_candidates != 0 ||
-        rescue_diagnostics.pushout_helper_foreign_destination_candidates != 0 ||
-        rescue_diagnostics.pushout_helper_retained_foreign_destinations != 0 ||
-        rescue_diagnostics.pushout_helper_forced_witness_destinations != 0 ||
-        rescue_diagnostics.pushout_helper_beam_nodes != 0 ||
-        rescue_diagnostics.pushout_helper_adopted_arrival_fee != 0 ||
-        rescue_diagnostics.pushout_helper_adopted_movement_cost != 0 ||
-        rescue_diagnostics.pushout_helper_adopted_direct_gain != 0 ||
-        rescue_diagnostics.pushout_helper_phase_cpu_seconds != 0.0;
-    int pushout_helper_disabled_error = any_pushout_helper_diagnostic;
-#else
-    int pushout_helper_disabled_error = 0;
-#endif
     ll deadline_direct_identity_error =
         deadline_diagnostics.arrival_fee - deadline_diagnostics.movement_cost -
         deadline_diagnostics.relocation_fee_loss - deadline_diagnostics.direct_gain;
@@ -7519,143 +6557,6 @@ int main() {
          << " pushout_cpu_ms=" << 1000.0 * rescue_diagnostics.pushout_cpu_seconds
          << " pushout_maximum_turn_cpu_ms="
          << 1000.0 * rescue_diagnostics.pushout_maximum_turn_cpu_seconds
-         << " pushout_helper_enabled=" << ENABLE_PUSHOUT_HELPER
-         << " pushout_helper_wide_enabled=" << ENABLE_WIDE_PUSHOUT_HELPER
-         << " pushout_helper_considered_turns="
-         << rescue_diagnostics.pushout_helper_considered_turns
-         << " pushout_helper_no_eligible_target_turns="
-         << rescue_diagnostics.pushout_helper_no_eligible_target_turns
-         << " pushout_helper_no_evidence_turns="
-         << rescue_diagnostics.pushout_helper_no_evidence_turns
-         << " pushout_helper_economic_rejected_turns="
-         << rescue_diagnostics.pushout_helper_economic_rejected_turns
-         << " pushout_helper_seeded_turns="
-         << rescue_diagnostics.pushout_helper_seeded_turns
-         << " pushout_helper_attempts=" << rescue_diagnostics.pushout_helper_attempts
-         << " pushout_helper_missing_destination="
-         << rescue_diagnostics.pushout_helper_missing_destination
-         << " pushout_helper_missing_blocker_destination="
-         << rescue_diagnostics.pushout_helper_missing_blocker_destination
-         << " pushout_helper_missing_helper_destination="
-         << rescue_diagnostics.pushout_helper_missing_helper_destination
-         << " pushout_helper_repair_failures="
-         << rescue_diagnostics.pushout_helper_repair_failures
-         << " pushout_helper_validation_failures="
-         << rescue_diagnostics.pushout_helper_validation_failures
-         << " pushout_helper_duplicate_plans="
-         << rescue_diagnostics.pushout_helper_duplicate_plans
-         << " pushout_helper_feasible_plans="
-         << rescue_diagnostics.pushout_helper_feasible_plans
-         << " pushout_helper_screen_rejected="
-         << rescue_diagnostics.pushout_helper_screen_rejected
-         << " pushout_helper_adopted=" << rescue_diagnostics.pushout_helper_adopted
-         << " pushout_helper_surveyed_turns="
-         << rescue_diagnostics.pushout_helper_surveyed_turns
-         << " pushout_helper_surveyed_targets="
-         << rescue_diagnostics.pushout_helper_surveyed_targets
-         << " pushout_helper_large_blocker_targets="
-         << rescue_diagnostics.pushout_helper_large_blocker_targets
-         << " pushout_helper_probe_limit_exhausted="
-         << rescue_diagnostics.pushout_helper_probe_limit_exhausted
-         << " pushout_helper_feasible_limit_exhausted="
-         << rescue_diagnostics.pushout_helper_feasible_limit_exhausted
-         << " pushout_helper_two_feasible_turns="
-         << rescue_diagnostics.pushout_helper_two_feasible_turns
-         << " pushout_helper_maximum_movers="
-         << rescue_diagnostics.pushout_helper_maximum_movers
-         << " pushout_helper_feasible_1_blocker="
-         << rescue_diagnostics.pushout_helper_feasible_by_blocker_count[0]
-         << " pushout_helper_feasible_2_blockers="
-         << rescue_diagnostics.pushout_helper_feasible_by_blocker_count[1]
-         << " pushout_helper_feasible_3_blockers="
-         << rescue_diagnostics.pushout_helper_feasible_by_blocker_count[2]
-         << " pushout_helper_adopted_1_blocker="
-         << rescue_diagnostics.pushout_helper_adopted_by_blocker_count[0]
-         << " pushout_helper_adopted_2_blockers="
-         << rescue_diagnostics.pushout_helper_adopted_by_blocker_count[1]
-         << " pushout_helper_adopted_3_blockers="
-         << rescue_diagnostics.pushout_helper_adopted_by_blocker_count[2]
-         << " pushout_helper_obstruction_probes="
-         << rescue_diagnostics.pushout_helper_obstruction_probes
-         << " pushout_helper_single_owner_regions="
-         << rescue_diagnostics.pushout_helper_single_owner_regions
-         << " pushout_helper_overlap_cells="
-         << rescue_diagnostics.pushout_helper_overlap_cells
-         << " pushout_helper_evidenced_groups="
-         << rescue_diagnostics.pushout_helper_evidenced_groups
-         << " pushout_helper_recorded_witnesses="
-         << rescue_diagnostics.pushout_helper_recorded_witnesses
-         << " pushout_helper_shortlisted_choices="
-         << rescue_diagnostics.pushout_helper_shortlisted_choices
-         << " pushout_helper_destination_anchors="
-         << rescue_diagnostics.pushout_helper_destination_anchors
-         << " pushout_helper_destination_candidates="
-         << rescue_diagnostics.pushout_helper_destination_candidates
-         << " pushout_helper_foreign_destination_candidates="
-         << rescue_diagnostics.pushout_helper_foreign_destination_candidates
-         << " pushout_helper_retained_foreign_destinations="
-         << rescue_diagnostics.pushout_helper_retained_foreign_destinations
-         << " pushout_helper_forced_witness_destinations="
-         << rescue_diagnostics.pushout_helper_forced_witness_destinations
-         << " pushout_helper_beam_nodes="
-         << rescue_diagnostics.pushout_helper_beam_nodes
-         << " pushout_helper_selected_covered_blockers="
-         << rescue_diagnostics.pushout_helper_selected_covered_blockers
-         << " pushout_helper_selected_unlocked_regions="
-         << rescue_diagnostics.pushout_helper_selected_unlocked_regions
-         << " pushout_helper_selected_overlap_cells="
-         << rescue_diagnostics.pushout_helper_selected_overlap_cells
-         << " pushout_helper_selected_movement_cost="
-         << rescue_diagnostics.pushout_helper_selected_movement_cost
-         << " pushout_helper_selected_departure_distance="
-         << rescue_diagnostics.pushout_helper_selected_departure_distance
-         << " pushout_helper_selected_adjusted_gain="
-         << rescue_diagnostics.pushout_helper_selected_adjusted_gain
-         << " pushout_helper_feasible_blocker_uses_helper="
-         << rescue_diagnostics.pushout_helper_feasible_blocker_uses_helper
-         << " pushout_helper_feasible_helper_uses_blocker="
-         << rescue_diagnostics.pushout_helper_feasible_helper_uses_blocker
-         << " pushout_helper_feasible_bidirectional_cross_use="
-         << rescue_diagnostics.pushout_helper_feasible_bidirectional_cross_use
-         << " pushout_helper_adopted_blocker_uses_helper="
-         << rescue_diagnostics.pushout_helper_adopted_blocker_uses_helper
-         << " pushout_helper_adopted_helper_uses_blocker="
-         << rescue_diagnostics.pushout_helper_adopted_helper_uses_blocker
-         << " pushout_helper_adopted_bidirectional_cross_use="
-         << rescue_diagnostics.pushout_helper_adopted_bidirectional_cross_use
-         << " pushout_helper_adopted_moved_groups="
-         << rescue_diagnostics.pushout_helper_adopted_moved_groups
-         << " pushout_helper_adopted_moved_cells="
-         << rescue_diagnostics.pushout_helper_adopted_moved_cells
-         << " pushout_helper_adopted_arrival_fee="
-         << rescue_diagnostics.pushout_helper_adopted_arrival_fee
-         << " pushout_helper_adopted_movement_cost="
-         << rescue_diagnostics.pushout_helper_adopted_movement_cost
-         << " pushout_helper_adopted_direct_gain="
-         << rescue_diagnostics.pushout_helper_adopted_direct_gain
-         << " pushout_helper_scenario_0_future_delta="
-         << rescue_diagnostics.pushout_helper_scenario_0_future_delta
-         << " pushout_helper_scenario_1_future_delta="
-         << rescue_diagnostics.pushout_helper_scenario_1_future_delta
-         << " pushout_helper_screen_margin=" << fixed << setprecision(6)
-         << (double)rescue_diagnostics.pushout_helper_screen_margin
-         << " pushout_helper_phase_cpu_ms="
-         << 1000.0 * rescue_diagnostics.pushout_helper_phase_cpu_seconds
-         << " pushout_helper_turn_funnel_error=" << pushout_helper_turn_funnel_error
-         << " pushout_helper_attempt_funnel_error="
-         << pushout_helper_attempt_funnel_error
-         << " pushout_helper_missing_partition_error="
-         << pushout_helper_missing_partition_error
-         << " pushout_helper_feasible_funnel_error="
-         << pushout_helper_feasible_funnel_error
-         << " pushout_helper_feasible_histogram_error="
-         << pushout_helper_feasible_histogram_error
-         << " pushout_helper_adopted_histogram_error="
-         << pushout_helper_adopted_histogram_error
-         << " pushout_helper_direct_identity_error="
-         << pushout_helper_direct_identity_error
-         << " pushout_helper_work_cap_error=" << pushout_helper_work_cap_error
-         << " pushout_helper_disabled_error=" << pushout_helper_disabled_error
          << " pushout_status_identity_error=" << pushout_status_identity_error
          << " pushout_feasible_histogram_error=" << pushout_feasible_histogram_error
          << " pushout_adopted_histogram_error=" << pushout_adopted_histogram_error

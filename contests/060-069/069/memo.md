@@ -4114,3 +4114,31 @@ wide - narrowは次の恒等式で+735,862になる。
 探索幅不足という仮説は、feasible 4→27、adopt 2→13によって十分検証できた。しかしhelperなしv14から見たone-helper段階全体の改善は+2,916,701、+0.04477%に留まり、複雑な専用実装とCPU増加に見合わない。v15は2/100 seedだけ、v16追加分も11/100 seedだけに作用し、v16は5勝6敗だった。これ以上work capや候補数を調整する期待値は低い。
 
 ユーザーとの合意により、one-helper v15/v16はmainlineから廃止し、次の基準をhelper導入前のv14 `grow-and-trim + sampled DLP + 既存NoRegion Push-out`へ戻す。今回の実験は失敗として消去せず、この節、結果JSON、出力、実装をGit履歴へ保存する。将来再配置へ再挑戦する場合は、blockerへhelperを1組足す拡張ではなく、複数moverの領域を最初から同時に割り当てる別設計として扱う。
+
+## 2026-08-02: one-helper段階の削除とv14基準への復元（実行前固定）
+
+one-helper v15/v16の実装と結果はcommit `8ae2217`（`AHC069: archive staged policy experiments`）へ保存した。その上で、mainlineからhelper専用の定数・feature flag・obstruction survey・causal witness・候補選択・joint destination pool・第2 repair phase・診断・保存則・stderr項をすべて削除した。`main.cpp`内の`helper`、`foreign_cleared_overlap`、`sector`、`movers`等の関連symbolは0件になった。
+
+既存のblockers-only経路は、凍結済みhelper-free参照`/private/tmp/ahc069_main_before_deadline_only.cpp`と静的に照合した。RescueTargetとPushOutDiagnosticScopeは一致し、destination生成、beam repair、root rescueは整形と後から導入したsampled DLP引数・呼出し以外一致した。したがってtarget順、合法性、destination順位と4象限diversity、blocker repair、rollout候補比較、採用時の集計はhelper導入前へ戻っている。独立監査でも意図しない差は0件だった。
+
+提出用source単体で構成が確定するよう、Deadline Layerはマクロではなく`ENABLE_DEADLINE_LAYER = false`へ固定した。NoRegion Push-out、grow-and-trim、sampled DLPは既定で有効である。Phiとcrisisは未導入のまま。
+
+### 実行前固定物
+
+- archive commit: `8ae2217`
+- `main.cpp` SHA-256: `6f763500e0d5c0c851ce26971be88129f87666d9659d6463ded4f9f29280e997`
+- Clang release binary: `/private/tmp/ahc069_v14_restored`
+- Clang release binary SHA-256: `67bd21ad811c788b5f4bc88b4d36a4a83d35b6e02a8c151cb217dcb04c7cab2e`
+- sanitizer binary: `/private/tmp/ahc069_v14_restored_san`
+- sanitizer binary SHA-256: `0f8c12f1121185ec0ab12ee14bc8247c15887514388b0e1215e28861c5fad66b`
+- GCC release binary: `/private/tmp/ahc069_v14_restored_gcc`
+- GCC release binary SHA-256: `03c8e321515e92ad72959815bb32d5f7c487ed5dc5b10fac4a163b5c2e3d88a3`
+- config: `pahcer/bench_v14_restored.toml`
+- config SHA-256: `d2b26311bab5548a63d3a9df1a4bfb9fda2e2041b9f572e6107ba6330e1f1880`
+- v14 oracle result: `pahcer/json/result_20260802_174107.json`
+- v14 oracle absolute score: `6,515,194,836`（100/100 AC）
+- v14 oracle stdout: `tools/out-sampled-dlp-v14/{0000..0099}.txt`
+
+Clang C++17/C++20とGCC C++17の警告付きsyntax検査、3 binaryのbuild、Clang Static Analyzer、`git diff --check`はすべてpassし、標準警告・指摘0件。hard gateは全100 seedのscore一致、stdout byte一致、100/100 AC、共通するnon-timing診断値の一致、全error/identity field 0、ログ上`deadline=0 / pushout=1 / grow-and-trim=1 / sampled-DLP=1`とする。
+
+ここまで固定した復元binaryはまだ一度も実行していない。以降はsanitizer probe、100 seed互換検証、seed 0決定性probeを行い、最初の解答実行後はユーザーの次の明示指示までsource・config・memoを変更しない。
