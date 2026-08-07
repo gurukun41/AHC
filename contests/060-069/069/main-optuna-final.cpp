@@ -145,62 +145,15 @@ constexpr int THETA_MAX = 8000;
 constexpr int THETA_STEP = 100;
 constexpr int THETA_QUADRATURE_STEPS = 48;
 
-// sampled DLPは総芝面積を流体容量として扱うため、初期盤面の外周率に応じて
-// 滑らかな盤面は1.30倍、中程度の盤面は1.25倍、厳しい盤面は1.00倍とする。
-// ケース中は倍率を固定し、再配置・rolloutを含む全admissionで同じ尺度を使う。
-constexpr int DLP_SCALE_DENOMINATOR = 1000;
-constexpr int DLP_SMOOTH_SCALE_MILLI = 1300;
-constexpr int DLP_MODERATE_SCALE_MILLI = 1250;
-constexpr int DLP_CONSTRAINED_SCALE_MILLI = 1000;
-constexpr int DLP_SMOOTH_BOUNDARY_THRESHOLD_PERCENT = 55;
-constexpr int DLP_MODERATE_BOUNDARY_THRESHOLD_PERCENT = 70;
-constexpr int HARD_PLACEMENT_BOUNDARY_THRESHOLD_PERCENT = 80;
-int case_dlp_scale_milli = DLP_CONSTRAINED_SCALE_MILLI;
-
-// root rolloutの未来料金は通常1.0倍で現在差へ足す。
-// 保存済みv29 cacheで再現した限定expertだけ0.1倍とし、短いrolloutの分散より
-// 現在ターンの確定利益を優先する。比較は1000倍整数のまま行う。
-constexpr int ROOT_WEIGHT_SCALE = 1000;
-constexpr int ROOT_DEFAULT_FUTURE_WEIGHT_MILLI = 1000;
-constexpr int ROOT_DIRECT_FUTURE_WEIGHT_MILLI = 100;
-int case_root_future_weight_milli = ROOT_DEFAULT_FUTURE_WEIGHT_MILLI;
-
 // ---------- 通常配置 ----------
 constexpr int COMPACT_PERIMETER_MARGIN = 4;
+constexpr int PLACEMENT_GLOBAL_SHORTLIST = 3;
+constexpr int PLACEMENT_SHORTLIST_LIMIT = 6;
+constexpr int CONNECTED_GROWTH_SEED_LIMIT = 16;
+constexpr int GROW_AND_TRIM_EXTRA_CELLS = 8;
+constexpr int GROW_AND_TRIM_CANDIDATE_LIMIT = 8;
 constexpr int FUTURE_FIT_SNAPSHOT_COUNT = 3;
 constexpr array<int, 8> FUTURE_FIT_SIDES = {2, 3, 4, 5, 6, 8, 10, 12};
-
-// connected系の旧Acceptedだけを磨くnear-template deformation。
-// 保存100 seedでtailが出た高外周率盤面は対象外とし、E/G<0.55のみで
-// v31と同じdense boxとstrict周長降下を候補として追加する。
-// 旧Reject、template成功、synthetic rolloutの経路は変更しない。
-constexpr int DENSE_BOX_MIN_GROUP_SIZE = 50;
-constexpr int DENSE_BOX_EXTRA_CELLS = 16;
-constexpr int DENSE_BOX_PERIMETER_MARGIN = 4;
-constexpr int DENSE_BOX_GLOBAL_ANCHOR_LIMIT = 12;
-constexpr int DENSE_BOX_TOTAL_ANCHOR_LIMIT = 16;
-// 最小周長まで改善したときの料金上界が1万以上の先着24回だけ、
-// 高価な全盤面走査を行う。strict descentはこの予算から分離する。
-constexpr ll DENSE_BOX_MIN_MAXIMUM_FEE_GAIN = 10000;
-constexpr int DENSE_BOX_ATTEMPT_LIMIT_PER_CASE = 24;
-constexpr int PERIMETER_DESCENT_MAX_STEPS = 8;
-int case_dense_box_attempts = 0;
-bool case_connected_polish_enabled = false;
-
-// 初期盤面だけで選ぶ排他的なplacement expert。
-// 通常値は旧fullと同一で、E/G>=0.80の難しい盤面だけ、保存済みv29 candidate p2の
-// 候補幅とfuture-fit比率をそのまま使う。到着列を見て途中でexpertを変えない。
-struct CasePlacementConfig {
-    int global_shortlist = 3;
-    int shortlist_limit = 6;
-    int connected_growth_seed_limit = 16;
-    int grow_and_trim_extra_cells = 8;
-    int grow_and_trim_candidate_limit = 8;
-    int future_fit_min_weight_milli = 250;
-};
-
-CasePlacementConfig case_placement_config;
-int case_static_expert = 0;
 
 // ---------- 受入済み配置を整えるCompact rescue ----------
 // 最小周長テンプレートの全アンカーを安価に走査し、「衝突セル数」と
@@ -416,70 +369,6 @@ long double rectangle_sum(const vector<vector<long double>> &prefix, int x, int 
     return prefix[x + h][y + w] - prefix[x][y + w] - prefix[x + h][y] + prefix[x][y];
 }
 
-// N=50を1行1ワードに収め、templateの合法anchorだけをbase_y昇順で列挙する。
-// invalid_start[w][k][x]のbit yは、xから2^k行のどこかで
-// [y,y+w)に池または占有セルがあることを表す。行方向は冪長sparse tableなので、
-// 任意の高さを重なる2区間のORで厳密に照会できる。
-// 累積和版と合法集合・base_x/base_y順を変えず、不合法anchorの個別照会だけを省く。
-struct LegalAnchorIndex {
-    static constexpr int MAX_N = 50;
-    static constexpr int LOG_N = 6;
-
-    int n = 0;
-    array<array<array<uint64_t, MAX_N>, LOG_N>, MAX_N + 1> invalid_start{};
-
-    LegalAnchorIndex(const vs &park, const vvi *owner) : n(park.size()) {
-        array<uint64_t, MAX_N> blocked_rows{};
-        for (int x = 0; x < n; x++) {
-            for (int y = 0; y < n; y++) {
-                if (park[x][y] == '#' || (owner != nullptr && (*owner)[x][y] != -1)) {
-                    blocked_rows[x] |= 1ULL << y;
-                }
-            }
-        }
-
-        // bit yを「この行の幅w窓[y,y+w)が塞がる」にする。
-        for (int x = 0; x < n; x++) {
-            uint64_t blocked_windows = 0;
-            for (int w = 1; w <= n; w++) {
-                blocked_windows |= blocked_rows[x] >> (w - 1);
-                invalid_start[w][0][x] = blocked_windows;
-            }
-        }
-        for (int w = 1; w <= n; w++) {
-            for (int level = 1; level < LOG_N; level++) {
-                int half = 1 << (level - 1);
-                int length = 2 * half;
-                for (int x = 0; x + length <= n; x++) {
-                    invalid_start[w][level][x] =
-                        invalid_start[w][level - 1][x] |
-                        invalid_start[w][level - 1][x + half];
-                }
-            }
-        }
-    }
-
-    uint64_t rectangle_invalid_base_y(const Rect &rect, int base_x) const {
-        if (rect.h == 0 || rect.w == 0) return 0;
-        int level = 31 - __builtin_clz(rect.h);
-        int length = 1 << level;
-        int x = base_x + rect.x;
-        uint64_t invalid = invalid_start[rect.w][level][x] |
-                           invalid_start[rect.w][level][x + rect.h - length];
-        // invalidのbit qは矩形自身の開始列qを表す。q=base_y+rect.yを
-        // base_yのbit位置へ揃える。
-        return invalid >> rect.y;
-    }
-
-    uint64_t legal_base_y_mask(const Shape &shape, int base_x) const {
-        uint64_t invalid = rectangle_invalid_base_y(shape.main_rect, base_x) |
-                           rectangle_invalid_base_y(shape.extra_rect, base_x);
-        int base_y_count = n - shape.w + 1;
-        uint64_t range_mask = (1ULL << base_y_count) - 1;
-        return ~invalid & range_mask;
-    }
-};
-
 // テンプレートが1つも置けない場合の完全なフォールバック。
 // 各空き連結成分をBFSし、先頭pセルを取る。BFSのprefixは常に連結なので、
 // pセル以上の空き連結成分が存在すれば必ず合法領域を返せる。
@@ -549,29 +438,6 @@ int calc_perimeter(const vector<Cell> &cells, int n) {
 }
 
 using i128 = __int128_t;
-
-// root比較の「現在差 + 重み付き未来差」を整数で合成する。
-// weight=1000では従来式と符号・順位が厳密に一致する。
-i128 root_margin_scaled(int scenario_count, ll direct_gain, i128 future_delta_sum) {
-    return (i128)ROOT_WEIGHT_SCALE * scenario_count * direct_gain +
-           (i128)case_root_future_weight_milli * future_delta_sum;
-}
-
-ll root_margin_scaled_ll(int scenario_count, ll direct_gain, ll future_delta_sum) {
-    i128 value = root_margin_scaled(scenario_count, direct_gain, future_delta_sum);
-    assert(numeric_limits<ll>::min() <= value && value <= numeric_limits<ll>::max());
-    return (ll)value;
-}
-
-bool root_scenario_positive(ll direct_gain, ll future_delta) {
-    return (i128)ROOT_WEIGHT_SCALE * direct_gain +
-               (i128)case_root_future_weight_milli * future_delta >
-           0;
-}
-
-long double root_margin_fee(i128 scaled_margin, int scenario_count) {
-    return (long double)scaled_margin / (ROOT_WEIGHT_SCALE * scenario_count);
-}
 
 // 公式の料金 round(4*V*sqrt(P)/周長) を整数演算で確定する。
 // sqrtによる近似値を初期値にし、丸め境界を128bit整数で前後補正することで
@@ -660,8 +526,6 @@ enum class PlacementSource {
     ExtendedTemplate,
     ConnectedGrowth,
     GrowAndTrim,
-    DenseBoxTrim,
-    PerimeterDescent,
 };
 
 // 通常配置がどの候補生成器から選ばれたかを、診断用に保持する。
@@ -881,7 +745,7 @@ struct FutureBucketDemand {
 // 「未観測の1組は現在時刻Sより後に始まる」という条件付き未来分布。
 // 指数分布からlを取り滞在時間をD=l+1とし、開始時刻はH-l個の整数から一様に選ばれる。
 // y=1-exp(-l/theta)への変数変換で指数密度を吸収し、正規化定数は分子・分母で相殺する。
-// 旧64時間帯shadowと、通常配置の将来snapshot生成の両方で使う。
+// この構造体はsampled DLPを無効化した旧64時間帯モデルだけで使う。
 struct ConditionalFutureDemand {
     struct Node {
         long double stay_duration;
@@ -1491,7 +1355,6 @@ struct TemporalPlacementDiagnostics {
     ll actual_rejected_candidate_fee = 0;
     int future_fit_evaluated_turns = 0;
     int future_fit_changed_placements = 0;
-    int connected_polish_changed_placements = 0;
     int incremental_changed_from_absolute = 0;
     int final_changed_from_absolute = 0;
     long long anchors_checked = 0;
@@ -1511,33 +1374,6 @@ struct TemporalPlacementDiagnostics {
     long long grow_and_trim_perimeter_worsened_candidates = 0;
     long long grow_and_trim_shortlisted_candidates = 0;
     int grow_and_trim_successes = 0;
-    int connected_polish_candidate_turns = 0;
-    int connected_polish_static_filtered_turns = 0;
-    int connected_polish_eligible_turns = 0;
-    int dense_box_eligible_turns = 0;
-    int dense_box_value_filtered_turns = 0;
-    int dense_box_budget_skips = 0;
-    long long dense_box_anchors_checked = 0;
-    long long dense_box_feasible_anchors = 0;
-    long long dense_box_shortlisted_anchors = 0;
-    long long dense_box_component_failures = 0;
-    long long dense_box_trim_attempts = 0;
-    long long dense_box_trimmed_cells = 0;
-    long long dense_box_trim_failures = 0;
-    long long dense_box_nonimproving_candidates = 0;
-    long long dense_box_duplicate_candidates = 0;
-    long long dense_box_candidates = 0;
-    long long dense_box_future_fit_rejections = 0;
-    long long dense_box_perimeter_improvement = 0;
-    int dense_box_successes = 0;
-    long long perimeter_descent_attempts = 0;
-    long long perimeter_descent_prefilter_rejections = 0;
-    long long perimeter_descent_steps = 0;
-    long long perimeter_descent_candidates = 0;
-    long long perimeter_descent_nonimproving_candidates = 0;
-    long long perimeter_descent_future_fit_rejections = 0;
-    long long perimeter_descent_perimeter_improvement = 0;
-    int perimeter_descent_successes = 0;
     long long shortlisted_candidates = 0;
     long long future_fit_snapshots = 0;
 };
@@ -1585,8 +1421,7 @@ bool placement_absolute_less(const PlacementCandidate &lhs, const PlacementCandi
 }
 
 // 全合法候補を高価なfuture-fitへ渡さず、性質の異なる最大6候補へ圧縮する。
-// 高外周率placement expertだけはglobal枠を増やして最大8候補とする。
-// 内訳はincremental上位3または5、absolute最良、列挙順の最初、別象限の最良。
+// 内訳はincremental上位3、absolute最良、列挙順の最初、別象限の最良。
 // 同一領域はhashで安価に絞った後、セル集合を比較して重複除去する。
 struct PlacementShortlistBuilder {
     int best_perimeter = numeric_limits<int>::max();
@@ -1624,7 +1459,7 @@ struct PlacementShortlistBuilder {
 
         PlacementCandidate key_candidate{{},       0,     perimeter, incremental_cost, absolute_cost, enumeration_order,
                                          quadrant, source};
-        if ((int)global_best.size() < case_placement_config.global_shortlist ||
+        if ((int)global_best.size() < PLACEMENT_GLOBAL_SHORTLIST ||
             placement_increment_less(key_candidate, global_best.back())) {
             const PlacementCandidate &full_candidate = get_candidate();
             bool duplicate = false;
@@ -1638,7 +1473,7 @@ struct PlacementShortlistBuilder {
             if (!duplicate) {
                 global_best.push_back(full_candidate);
                 sort(global_best.begin(), global_best.end(), placement_increment_less);
-                if ((int)global_best.size() > case_placement_config.global_shortlist) {
+                if ((int)global_best.size() > PLACEMENT_GLOBAL_SHORTLIST) {
                     global_best.pop_back();
                 }
             }
@@ -1682,8 +1517,8 @@ struct PlacementShortlistBuilder {
             }
         }
         add(diverse);
-        if ((int)result.size() > case_placement_config.shortlist_limit) {
-            result.resize(case_placement_config.shortlist_limit);
+        if ((int)result.size() > PLACEMENT_SHORTLIST_LIMIT) {
+            result.resize(PLACEMENT_SHORTLIST_LIMIT);
         }
         return result;
     }
@@ -1693,14 +1528,11 @@ bool validate_connected_region(const vector<Cell> &cells, int n);
 
 // grow-and-trimの「trim」部分。
 // 貪欲成長をちょうどpセルで止めると、最後の数セルだけが突起になることがある。
-// そこで一度p+8（高外周率expertではp+12）セルまで育て、
-// 連結性を壊す関節点を避けながら境界セルを削る。
+// そこで一度p+8セルまで育て、連結性を壊す関節点を避けながら境界セルを削る。
 // 削除後の周長変化が良いセルを優先し、pセルへ戻した領域を追加候補として返す。
-optional<vector<Cell>> trim_connected_region(
-    const vs &park, const vvi &owner, const vector<Cell> &grown, int p,
-    long long &trimmed_cells,
-    const vector<vector<long double>> *primary_removal_cost = nullptr,
-    const vector<vector<long double>> *secondary_removal_cost = nullptr) {
+optional<vector<Cell>> trim_grown_connected_region(const vs &park, const vvi &owner,
+                                                   const vector<Cell> &grown, int p,
+                                                   TemporalPlacementDiagnostics &diagnostics) {
     int n = park.size();
     vector<char> selected(n * n, false);
     vector<int> growth_order(n * n, -1);
@@ -1761,8 +1593,6 @@ optional<vector<Cell>> trim_connected_region(
         int removed = -1;
         int best_perimeter_change = numeric_limits<int>::max();
         int best_growth_order = -1;
-        long double best_primary_cost = -numeric_limits<long double>::infinity();
-        long double best_secondary_cost = -numeric_limits<long double>::infinity();
         for (const Cell &position : grown) {
             int cell = position.first * n + position.second;
             if (!selected[cell] || articulation[cell]) continue;
@@ -1776,44 +1606,19 @@ optional<vector<Cell>> trim_connected_region(
             }
             if (selected_neighbors == 4) continue;
             int perimeter_change = 2 * selected_neighbors - 4;
-            long double primary_cost = primary_removal_cost
-                                           ? (*primary_removal_cost)[x][y]
-                                           : 0.0L;
-            long double secondary_cost = secondary_removal_cost
-                                             ? (*secondary_removal_cost)[x][y]
-                                             : 0.0L;
-            bool better = perimeter_change < best_perimeter_change;
-            if (!better && perimeter_change == best_perimeter_change) {
-                if (primary_removal_cost) {
-                    better = primary_cost > best_primary_cost ||
-                             (primary_cost == best_primary_cost &&
-                              secondary_cost > best_secondary_cost) ||
-                             (primary_cost == best_primary_cost &&
-                              secondary_cost == best_secondary_cost &&
-                              growth_order[cell] > best_growth_order) ||
-                             (primary_cost == best_primary_cost &&
-                              secondary_cost == best_secondary_cost &&
-                              growth_order[cell] == best_growth_order &&
-                              (removed == -1 || cell < removed));
-                } else {
-                    // 既存grow-and-trimは従来の列挙順を完全に保つ。
-                    better = growth_order[cell] > best_growth_order ||
-                             (growth_order[cell] == best_growth_order &&
-                              (removed == -1 || cell < removed));
-                }
-            }
-            if (better) {
+            if (perimeter_change < best_perimeter_change ||
+                (perimeter_change == best_perimeter_change && growth_order[cell] > best_growth_order) ||
+                (perimeter_change == best_perimeter_change && growth_order[cell] == best_growth_order &&
+                 (removed == -1 || cell < removed))) {
                 removed = cell;
                 best_perimeter_change = perimeter_change;
                 best_growth_order = growth_order[cell];
-                best_primary_cost = primary_cost;
-                best_secondary_cost = secondary_cost;
             }
         }
         if (removed == -1) return nullopt;
         selected[removed] = false;
         remaining--;
-        trimmed_cells++;
+        diagnostics.grow_and_trim_trimmed_cells++;
     }
 
     vector<Cell> result;
@@ -1828,436 +1633,6 @@ optional<vector<Cell>> trim_connected_region(
     return result;
 }
 
-// 旧connected配置を、近最小周長box内の高密度な空き成分から作り直す。
-// 全anchorはfree集合の周長までbitsetで安価に採点し、Tarjan trimは上位16件だけに限定する。
-// ここでは候補を返すだけで、旧Acceptedの保護・料金増・future-fit非悪化は呼び出し側で確認する。
-vector<vector<Cell>> make_dense_box_trim_candidates(
-    const vs &park, const vvi &owner, int p, int minimum_perimeter,
-    int old_perimeter, const vector<vector<long double>> &incremental_cell,
-    const vector<vector<long double>> &absolute_cell,
-    const vector<vector<long double>> &incremental_prefix,
-    const vector<vector<long double>> &absolute_prefix,
-    TemporalPlacementDiagnostics &diagnostics) {
-    struct DenseBoxAnchor {
-        int base_x = 0;
-        int base_y = 0;
-        int h = 0;
-        int w = 0;
-        int free_cells = 0;
-        int free_perimeter = 0;
-        int box_perimeter = 0;
-        int quadrant = 0;
-        long double incremental_sum = 0.0L;
-        long double absolute_sum = 0.0L;
-        long long order = 0;
-    };
-
-    auto anchor_less = [](const DenseBoxAnchor &lhs, const DenseBoxAnchor &rhs) {
-        return tuple(lhs.free_perimeter, lhs.box_perimeter, lhs.free_cells,
-                     abs(lhs.h - lhs.w), lhs.incremental_sum, lhs.absolute_sum,
-                     lhs.order) <
-               tuple(rhs.free_perimeter, rhs.box_perimeter, rhs.free_cells,
-                     abs(rhs.h - rhs.w), rhs.incremental_sum, rhs.absolute_sum,
-                     rhs.order);
-    };
-
-    int n = park.size();
-    int extra_cells = DENSE_BOX_EXTRA_CELLS;
-    int maximum_box_perimeter =
-        min(old_perimeter - 2, minimum_perimeter + DENSE_BOX_PERIMETER_MARGIN);
-    if (maximum_box_perimeter < minimum_perimeter) return {};
-
-    vector<vi> blocked_prefix = make_blocked_prefix(park, owner);
-    array<uint64_t, 50> free_rows{};
-    for (int x = 0; x < n; x++) {
-        for (int y = 0; y < n; y++) {
-            if (park[x][y] == '.' && owner[x][y] == -1) {
-                free_rows[x] |= 1ULL << y;
-            }
-        }
-    }
-
-    vector<DenseBoxAnchor> global_best;
-    array<optional<DenseBoxAnchor>, 4> quadrant_best;
-    long long anchor_order = 0;
-    for (int h = 1; h <= n; h++) {
-        for (int w = 1; w <= n; w++) {
-            int area = h * w;
-            int box_perimeter = 2 * (h + w);
-            if (area < p || area > p + extra_cells ||
-                box_perimeter > maximum_box_perimeter) {
-                continue;
-            }
-            uint64_t width_mask = (1ULL << w) - 1;
-            for (int base_x = 0; base_x + h <= n; base_x++) {
-                for (int base_y = 0; base_y + w <= n; base_y++) {
-                    diagnostics.dense_box_anchors_checked++;
-                    int blocked = rectangle_sum(blocked_prefix, base_x, base_y, h, w);
-                    int free_count = area - blocked;
-                    if (free_count < p) continue;
-                    diagnostics.dense_box_feasible_anchors++;
-
-                    int shared_edges = 0;
-                    uint64_t previous = 0;
-                    for (int dx = 0; dx < h; dx++) {
-                        uint64_t row = (free_rows[base_x + dx] >> base_y) & width_mask;
-                        shared_edges += __builtin_popcountll(row & (row >> 1));
-                        if (dx > 0) shared_edges += __builtin_popcountll(row & previous);
-                        previous = row;
-                    }
-                    int free_perimeter = 4 * free_count - 2 * shared_edges;
-                    long double incremental_sum = rectangle_sum(
-                        incremental_prefix, base_x, base_y, h, w);
-                    long double absolute_sum = rectangle_sum(
-                        absolute_prefix, base_x, base_y, h, w);
-                    int lower_half = 2 * base_x + h >= n;
-                    int right_half = 2 * base_y + w >= n;
-                    DenseBoxAnchor anchor{base_x, base_y, h, w, free_count,
-                                          free_perimeter, box_perimeter,
-                                          2 * lower_half + right_half,
-                                          incremental_sum, absolute_sum,
-                                          anchor_order++};
-
-                    global_best.push_back(anchor);
-                    sort(global_best.begin(), global_best.end(), anchor_less);
-                    if ((int)global_best.size() > DENSE_BOX_GLOBAL_ANCHOR_LIMIT) {
-                        global_best.pop_back();
-                    }
-                    if (!quadrant_best[anchor.quadrant] ||
-                        anchor_less(anchor, *quadrant_best[anchor.quadrant])) {
-                        quadrant_best[anchor.quadrant] = anchor;
-                    }
-                }
-            }
-        }
-    }
-
-    vector<DenseBoxAnchor> anchors = global_best;
-    auto same_anchor = [](const DenseBoxAnchor &lhs, const DenseBoxAnchor &rhs) {
-        return lhs.base_x == rhs.base_x && lhs.base_y == rhs.base_y &&
-               lhs.h == rhs.h && lhs.w == rhs.w;
-    };
-    for (const auto &candidate : quadrant_best) {
-        if (!candidate) continue;
-        bool duplicate = any_of(anchors.begin(), anchors.end(),
-                                [&](const DenseBoxAnchor &anchor) {
-                                    return same_anchor(anchor, *candidate);
-                                });
-        if (!duplicate && (int)anchors.size() < DENSE_BOX_TOTAL_ANCHOR_LIMIT) {
-            anchors.push_back(*candidate);
-        }
-    }
-    diagnostics.dense_box_shortlisted_anchors += anchors.size();
-
-    vector<vector<Cell>> result;
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-    auto add_result = [&](optional<vector<Cell>> candidate) {
-        if (!candidate) {
-            diagnostics.dense_box_trim_failures++;
-            return;
-        }
-        int perimeter = calc_perimeter(*candidate, n);
-        if (perimeter >= old_perimeter) {
-            diagnostics.dense_box_nonimproving_candidates++;
-            return;
-        }
-        if ((int)candidate->size() != p ||
-            !validate_connected_region(*candidate, n)) {
-            diagnostics.dense_box_trim_failures++;
-            return;
-        }
-        for (auto [x, y] : *candidate) {
-            if (park[x][y] != '.' || owner[x][y] != -1) {
-                diagnostics.dense_box_trim_failures++;
-                return;
-            }
-        }
-        for (const vector<Cell> &existing : result) {
-            if (same_region(existing, *candidate)) {
-                diagnostics.dense_box_duplicate_candidates++;
-                return;
-            }
-        }
-        diagnostics.dense_box_candidates++;
-        result.push_back(std::move(*candidate));
-    };
-
-    for (const DenseBoxAnchor &anchor : anchors) {
-        vector<char> visited(anchor.h * anchor.w, false);
-        bool found_component = false;
-        for (int start_x = 0; start_x < anchor.h && !found_component; start_x++) {
-            for (int start_y = 0; start_y < anchor.w && !found_component; start_y++) {
-                int start = start_x * anchor.w + start_y;
-                int global_x = anchor.base_x + start_x;
-                int global_y = anchor.base_y + start_y;
-                if (visited[start] || park[global_x][global_y] != '.' ||
-                    owner[global_x][global_y] != -1) {
-                    continue;
-                }
-                vector<Cell> component;
-                queue<pair<int, int>> que;
-                visited[start] = true;
-                que.emplace(start_x, start_y);
-                while (!que.empty()) {
-                    auto [local_x, local_y] = que.front();
-                    que.pop();
-                    component.emplace_back(anchor.base_x + local_x,
-                                           anchor.base_y + local_y);
-                    for (int dir = 0; dir < 4; dir++) {
-                        int next_x = local_x + DX[dir];
-                        int next_y = local_y + DY[dir];
-                        if (!inside(next_x, next_y, anchor.h, anchor.w)) continue;
-                        int next = next_x * anchor.w + next_y;
-                        int next_global_x = anchor.base_x + next_x;
-                        int next_global_y = anchor.base_y + next_y;
-                        if (visited[next] || park[next_global_x][next_global_y] != '.' ||
-                            owner[next_global_x][next_global_y] != -1) {
-                            continue;
-                        }
-                        visited[next] = true;
-                        que.emplace(next_x, next_y);
-                    }
-                }
-                if ((int)component.size() < p) continue;
-                found_component = true;
-                if ((int)component.size() == p) {
-                    add_result(optional<vector<Cell>>(std::move(component)));
-                    continue;
-                }
-
-                diagnostics.dense_box_trim_attempts += 2;
-                add_result(trim_connected_region(
-                    park, owner, component, p, diagnostics.dense_box_trimmed_cells,
-                    &incremental_cell, &absolute_cell));
-                add_result(trim_connected_region(
-                    park, owner, component, p, diagnostics.dense_box_trimmed_cells,
-                    &absolute_cell, &incremental_cell));
-            }
-        }
-        if (!found_component) diagnostics.dense_box_component_failures++;
-    }
-    return result;
-}
-
-struct RegionSwap {
-    int removed = -1;
-    int added = -1;
-    // gain=k_add_after-k_remove。周長は2*gainだけ短くなる。
-    int gain = 0;
-    long double incremental_delta = 0.0L;
-    long double absolute_delta = 0.0L;
-};
-
-struct RegionSwapNeighborhood {
-    vector<int> selected_neighbors;
-    vector<int> frontier_neighbors;
-    vector<int> frontier;
-    int minimum_removed_neighbors = 5;
-    int maximum_added_neighbors = 0;
-};
-
-RegionSwapNeighborhood make_region_swap_neighborhood(
-    const vs &park, const vvi &owner, const vector<char> &selected) {
-    int n = park.size();
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-    RegionSwapNeighborhood result;
-    result.selected_neighbors.assign(n * n, 0);
-    result.frontier_neighbors.assign(n * n, 0);
-    vector<char> in_frontier(n * n, false);
-    for (int cell = 0; cell < n * n; cell++) {
-        if (!selected[cell]) continue;
-        int x = cell / n;
-        int y = cell % n;
-        for (int dir = 0; dir < 4; dir++) {
-            int nx = x + DX[dir];
-            int ny = y + DY[dir];
-            if (!inside(nx, ny, n, n)) continue;
-            int next = nx * n + ny;
-            if (selected[next]) {
-                result.selected_neighbors[cell]++;
-                continue;
-            }
-            if (park[nx][ny] != '.' || owner[nx][ny] != -1 ||
-                in_frontier[next]) {
-                continue;
-            }
-            in_frontier[next] = true;
-            result.frontier.push_back(next);
-        }
-        chmin(result.minimum_removed_neighbors,
-              result.selected_neighbors[cell]);
-    }
-    for (int added : result.frontier) {
-        int x = added / n;
-        int y = added % n;
-        for (int dir = 0; dir < 4; dir++) {
-            int nx = x + DX[dir];
-            int ny = y + DY[dir];
-            if (inside(nx, ny, n, n) && selected[nx * n + ny]) {
-                result.frontier_neighbors[added]++;
-            }
-        }
-        chmax(result.maximum_added_neighbors,
-              result.frontier_neighbors[added]);
-    }
-    return result;
-}
-
-vector<char> find_region_articulation(const vector<char> &selected, int n) {
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-    vector<int> discovery(n * n, -1), low(n * n), parent(n * n, -1);
-    vector<char> articulation(n * n, false);
-    int timer = 0;
-    function<void(int)> dfs = [&](int cell) {
-        discovery[cell] = low[cell] = timer++;
-        int children = 0;
-        int x = cell / n;
-        int y = cell % n;
-        for (int dir = 0; dir < 4; dir++) {
-            int nx = x + DX[dir];
-            int ny = y + DY[dir];
-            if (!inside(nx, ny, n, n)) continue;
-            int next = nx * n + ny;
-            if (!selected[next]) continue;
-            if (discovery[next] == -1) {
-                parent[next] = cell;
-                children++;
-                dfs(next);
-                chmin(low[cell], low[next]);
-                if (parent[cell] == -1 && children > 1) {
-                    articulation[cell] = true;
-                }
-                if (parent[cell] != -1 && low[next] >= discovery[cell]) {
-                    articulation[cell] = true;
-                }
-            } else if (next != parent[cell]) {
-                chmin(low[cell], discovery[next]);
-            }
-        }
-    };
-    for (int cell = 0; cell < n * n; cell++) {
-        if (selected[cell] && discovery[cell] == -1) dfs(cell);
-    }
-    return articulation;
-}
-
-optional<RegionSwap> find_best_strict_region_swap(
-    const vs &park, const vvi &owner, const vector<char> &selected,
-    const vector<vector<long double>> &incremental_cell,
-    const vector<vector<long double>> &absolute_cell,
-    bool *prefilter_rejected = nullptr) {
-    if (prefilter_rejected) *prefilter_rejected = false;
-    int n = park.size();
-    RegionSwapNeighborhood neighborhood =
-        make_region_swap_neighborhood(park, owner, selected);
-    // add側近傍数はremoveで増えない。この条件なら
-    // articulationを求めるまでもなくstrict降下は不可能である。
-    if (neighborhood.maximum_added_neighbors <=
-        neighborhood.minimum_removed_neighbors) {
-        if (prefilter_rejected) *prefilter_rejected = true;
-        return nullopt;
-    }
-    vector<char> articulation = find_region_articulation(selected, n);
-    optional<RegionSwap> best;
-    for (int removed = 0; removed < n * n; removed++) {
-        if (!selected[removed] || articulation[removed]) continue;
-        int rx = removed / n;
-        int ry = removed % n;
-        int removed_neighbors = neighborhood.selected_neighbors[removed];
-        for (int added : neighborhood.frontier) {
-            int ax = added / n;
-            int ay = added % n;
-            int adjacent_to_removed = abs(ax - rx) + abs(ay - ry) == 1;
-            int added_neighbors =
-                neighborhood.frontier_neighbors[added] - adjacent_to_removed;
-            int gain = added_neighbors - removed_neighbors;
-            if (gain <= 0) continue;
-            RegionSwap candidate{
-                removed, added, gain,
-                incremental_cell[ax][ay] - incremental_cell[rx][ry],
-                absolute_cell[ax][ay] - absolute_cell[rx][ry]};
-            if (!best || candidate.gain > best->gain ||
-                (candidate.gain == best->gain &&
-                 candidate.incremental_delta < best->incremental_delta) ||
-                (candidate.gain == best->gain &&
-                 candidate.incremental_delta == best->incremental_delta &&
-                 candidate.absolute_delta < best->absolute_delta) ||
-                (candidate.gain == best->gain &&
-                 candidate.incremental_delta == best->incremental_delta &&
-                 candidate.absolute_delta == best->absolute_delta &&
-                 pair(candidate.removed, candidate.added) <
-                     pair(best->removed, best->added))) {
-                best = candidate;
-            }
-        }
-    }
-    return best;
-}
-
-vector<Cell> materialize_selected_region(const vector<char> &selected, int n) {
-    vector<Cell> result;
-    result.reserve(count(selected.begin(), selected.end(), true));
-    for (int cell = 0; cell < n * n; cell++) {
-        if (selected[cell]) result.emplace_back(cell / n, cell % n);
-    }
-    return result;
-}
-
-// swap構築側でも合法frontierだけを加えるが、各実体化後に面積以外の
-// 池・占有・重複・盤外・4連結をまとめて再検証し、探索バグを局所化する。
-bool validate_free_connected_region(const vs &park, const vvi &owner,
-                                    const vector<Cell> &cells) {
-    int n = park.size();
-    if (!validate_connected_region(cells, n)) return false;
-    for (auto [x, y] : cells) {
-        if (park[x][y] != '.' || owner[x][y] != -1) return false;
-    }
-    return true;
-}
-
-// selected connected領域の突起1セルと外側の凹部1セルを交換する局所降下。
-// 非関節セルだけを外し、k_add_after>k_removeのときだけ反映する。
-// 終端形がfuture-fitで落ちても浅い改善を失わないよう全中間形を返す。
-vector<vector<Cell>> make_perimeter_descent_candidates(
-    const vs &park, const vvi &owner, const vector<Cell> &initial,
-    const vector<vector<long double>> &incremental_cell,
-    const vector<vector<long double>> &absolute_cell,
-    TemporalPlacementDiagnostics &diagnostics) {
-    diagnostics.perimeter_descent_attempts++;
-    int n = park.size();
-    vector<char> selected(n * n, false);
-    for (auto [x, y] : initial) selected[x * n + y] = true;
-    int steps = 0;
-    vector<vector<Cell>> result;
-    while (steps < PERIMETER_DESCENT_MAX_STEPS) {
-        bool prefilter_rejected = false;
-        optional<RegionSwap> best = find_best_strict_region_swap(
-            park, owner, selected, incremental_cell, absolute_cell,
-            &prefilter_rejected);
-        if (!best) {
-            if (prefilter_rejected) {
-                diagnostics.perimeter_descent_prefilter_rejections++;
-            }
-            break;
-        }
-        selected[best->removed] = false;
-        selected[best->added] = true;
-        vector<Cell> candidate = materialize_selected_region(selected, n);
-        if (candidate.size() != initial.size() ||
-            !validate_free_connected_region(park, owner, candidate)) {
-            break;
-        }
-        steps++;
-        result.push_back(std::move(candidate));
-    }
-    diagnostics.perimeter_descent_steps += steps;
-    diagnostics.perimeter_descent_candidates += result.size();
-    return result;
-}
-
 vector<vector<Cell>> make_connected_growth_candidates(
     const vs &park, const vvi &owner, int p,
     vector<vector<Cell>> &grow_and_trim_candidates,
@@ -2265,9 +1640,9 @@ vector<vector<Cell>> make_connected_growth_candidates(
     // 処理順:
     // 1. 空き連結成分を抽出する。
     // 2. 障害物・盤面端からの距離を求める。
-    // 3. 各成分の端・対角・障害物距離から最大16または24個のseedを選ぶ。
+    // 3. 各成分の端・対角・障害物距離から最大16個のseedを選ぶ。
     // 4. 選択済み隣接数が多いセルを優先し、連結なままpセルへ成長させる。
-    // 5. 一部のseedではさらに8または12セル育て、trimした候補も作る。
+    // 5. 一部のseedではさらに8セル育て、trimした候補も作る。
     int n = park.size();
     constexpr int DX[4] = {-1, 1, 0, 0};
     constexpr int DY[4] = {0, 0, -1, 1};
@@ -2395,13 +1770,9 @@ vector<vector<Cell>> make_connected_growth_candidates(
     };
     vector<Seed> seeds;
     set<Cell> used_seeds;
-    for (int feature = 0;
-         feature < SEED_FEATURE_COUNT &&
-         (int)seeds.size() < case_placement_config.connected_growth_seed_limit;
-         feature++) {
+    for (int feature = 0; feature < SEED_FEATURE_COUNT && (int)seeds.size() < CONNECTED_GROWTH_SEED_LIMIT; feature++) {
         for (int order_index = 0;
-             order_index < (int)component_order.size() &&
-             (int)seeds.size() < case_placement_config.connected_growth_seed_limit;
+             order_index < (int)component_order.size() && (int)seeds.size() < CONNECTED_GROWTH_SEED_LIMIT;
              order_index++) {
             int component_id = component_order[order_index];
             Cell seed = feature_seeds[component_id][feature];
@@ -2430,7 +1801,7 @@ vector<vector<Cell>> make_connected_growth_candidates(
         int seed_y = seed_info.cell.second;
         vector<char> selected(n * n, false);
         vector<Cell> region;
-        region.reserve(p + case_placement_config.grow_and_trim_extra_cells);
+        region.reserve(p + GROW_AND_TRIM_EXTRA_CELLS);
         priority_queue<GrowthEntry, vector<GrowthEntry>, decltype(entry_worse)> frontier(entry_worse);
 
         auto count_selected_neighbors = [&](int cell) {
@@ -2489,19 +1860,18 @@ vector<vector<Cell>> make_connected_growth_candidates(
                 // 元のpセル候補も必ず残し、trim版は置換ではなく追加候補にする。
                 // これによりgrow-and-trimが悪い場合は従来形状へ戻れる。
                 add_candidate(optional<vector<Cell>>(region));
-                if (grow_and_trim_attempts < case_placement_config.grow_and_trim_candidate_limit) {
+                if (grow_and_trim_attempts < GROW_AND_TRIM_CANDIDATE_LIMIT) {
                     grow_and_trim_attempts++;
                     diagnostics.grow_and_trim_base_candidates++;
                     int base_perimeter = calc_perimeter(region, n);
-                    grow_until(p + case_placement_config.grow_and_trim_extra_cells);
+                    grow_until(p + GROW_AND_TRIM_EXTRA_CELLS);
                     diagnostics.grow_and_trim_grown_cells += region.size() - p;
-                    if ((int)region.size() != p + case_placement_config.grow_and_trim_extra_cells) {
+                    if ((int)region.size() != p + GROW_AND_TRIM_EXTRA_CELLS) {
                         diagnostics.grow_and_trim_growth_failures++;
                     } else {
                         diagnostics.grow_and_trim_full_growths++;
-                        optional<vector<Cell>> trimmed = trim_connected_region(
-                            park, owner, region, p,
-                            diagnostics.grow_and_trim_trimmed_cells);
+                        optional<vector<Cell>> trimmed =
+                            trim_grown_connected_region(park, owner, region, p, diagnostics);
                         if (!trimmed) {
                             diagnostics.grow_and_trim_trim_failures++;
                         } else {
@@ -2564,10 +1934,8 @@ int placement_quadrant(const vector<Cell> &cells, int n) {
     return 2 * lower_half + right_half;
 }
 
-long double compact_fit_utility(const vs &park, const vvi &owner,
-                                const vector<GroupState> &groups,
-                                const vector<char> &in_candidate,
-                                ll snapshot_time) {
+long double compact_fit_utility(const vs &park, const vvi &owner, const vector<GroupState> &groups,
+                                const vector<char> &in_candidate, ll snapshot_time) {
     // DPの各値は「そのセルを右下端とする最大空き正方形の一辺」。
     // 2,3,4,...,12四方を置ける位置数を数え、大きい正方形ほどside^2で重く評価する。
     // snapshot_timeまでに退去する既存組は空きとみなし、今回の候補領域は占有扱いにする。
@@ -2629,10 +1997,8 @@ array<ll, FUTURE_FIT_SNAPSHOT_COUNT> make_future_fit_snapshots(const Conditional
     return snapshots;
 }
 
-long double evaluate_compact_fit(
-    const vs &park, const vvi &owner, const vector<GroupState> &groups,
-    const vector<Cell> &candidate,
-    const array<ll, FUTURE_FIT_SNAPSHOT_COUNT> &snapshots) {
+long double evaluate_compact_fit(const vs &park, const vvi &owner, const vector<GroupState> &groups,
+                                 const vector<Cell> &candidate, const array<ll, FUTURE_FIT_SNAPSHOT_COUNT> &snapshots) {
     int n = park.size();
     vector<char> in_candidate(n * n, false);
     for (auto [x, y] : candidate) in_candidate[x * n + y] = true;
@@ -2640,39 +2006,31 @@ long double evaluate_compact_fit(
     long double sum = 0.0L;
     long double minimum = numeric_limits<long double>::infinity();
     for (ll snapshot : snapshots) {
-        long double utility = compact_fit_utility(
-            park, owner, groups, in_candidate, snapshot);
+        long double utility = compact_fit_utility(park, owner, groups, in_candidate, snapshot);
         sum += utility;
         chmin(minimum, utility);
     }
-    // 通常expertは最悪snapshotを25%、高外周率placement expertは50%混ぜる。
-    // いずれも平均だけで途中の空き形状崩壊を見落とさないための固定比率である。
+    // 平均だけでなく最悪snapshotも25%混ぜ、途中で空き形状が崩れる候補を避ける。
     long double average = sum / FUTURE_FIT_SNAPSHOT_COUNT;
-    long double minimum_weight =
-        (long double)case_placement_config.future_fit_min_weight_milli /
-        DLP_SCALE_DENOMINATOR;
-    return (1.0L - minimum_weight) * average + minimum_weight * minimum;
+    return 0.75L * average + 0.25L * minimum;
 }
 
 optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park, const vvi &owner,
                                                                   const vector<GroupState> &groups, ll current_s,
-                                                                  ll arrival_t, int p, ll arrival_v,
-                                                                  long double opportunity_cost, long double theta,
+                                                                  ll arrival_t, int p, long double theta,
                                                                   int remaining_groups, const vector<Shape> &shapes,
                                                                   TemporalPlacementDiagnostics &diagnostics,
                                                                   vector<NormalPlacementChoice> *root_alternatives = nullptr) {
     // 通常配置の選択手順:
     // 1. 置ける最小周長テンプレートを全走査する。
     // 2. なければ次の周長tier、connected growth、grow-and-trimを追加する。
-    // 3. 退去時刻の近い領域が接するように、境界コストで最大6または8候補へ絞る。
+    // 3. 退去時刻の近い領域が接するように、境界コストで最大6候補へ絞る。
     // 4. 未来3時点に残る空き正方形を評価して最終候補を選ぶ。
-    // 5. 実ターンで旧方策がconnected系かつ経済的Acceptなら、near-template deformationを追加する。
-    //    synthetic rolloutでは再帰的な探索量増加を避け、従来の軽量方策を保つ。
-    // 6. 実ターンではrollout比較用に通常配置の次点も最大2件返す。
+    // 5. 実ターンではrollout比較用に通常配置の次点も最大2件返す。
     if (root_alternatives) root_alternatives->clear();
     diagnostics.attempts++;
     int n = park.size();
-    LegalAnchorIndex legal_anchor_index(park, &owner);
+    vector<vi> blocked_prefix = make_blocked_prefix(park, owner);
 
     ConditionalFutureDemand future_demand(current_s, theta);
     long double candidate_arrival_level = future_demand.future_start_cdf(arrival_t);
@@ -2747,14 +2105,18 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
         int max_x = n - shape.h;
         int max_y = n - shape.w;
         for (int base_x = 0; base_x <= max_x; base_x++) {
-            // 診断上のanchor数は旧累積和版と同じ論理全数を数える。
-            diagnostics.anchors_checked += max_y + 1;
-            uint64_t legal_base_y = legal_anchor_index.legal_base_y_mask(shape, base_x);
-            while (legal_base_y != 0) {
-                int base_y = __builtin_ctzll(legal_base_y);
-                legal_base_y &= legal_base_y - 1;
+            for (int base_y = 0; base_y <= max_y; base_y++) {
+                diagnostics.anchors_checked++;
                 const Rect &main_rect = shape.main_rect;
                 const Rect &extra_rect = shape.extra_rect;
+                if (rectangle_sum(blocked_prefix, base_x + main_rect.x, base_y + main_rect.y, main_rect.h,
+                                  main_rect.w) != 0) {
+                    continue;
+                }
+                if (rectangle_sum(blocked_prefix, base_x + extra_rect.x, base_y + extra_rect.y, extra_rect.h,
+                                  extra_rect.w) != 0) {
+                    continue;
+                }
                 diagnostics.legal_compact_candidates++;
                 found_legal = true;
 
@@ -2864,202 +2226,37 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
     int best_index = incremental_best;
 
     long double future_mass = future_demand.future_start_cdf(arrival_t);
-    bool future_fit_available =
-        remaining_groups > 0 && arrival_t - current_s > 1 && future_mass > 1e-12L;
-    optional<array<ll, FUTURE_FIT_SNAPSHOT_COUNT>> common_snapshots;
-    vector<long double> future_fit_values(candidates.size());
+    vector<long double> future_fit_values;
     bool used_future_fit = false;
-    if ((int)candidates.size() >= 2 && future_fit_available) {
+    if ((int)candidates.size() >= 2 && remaining_groups > 0 && arrival_t - current_s > 1 && future_mass > 1e-12L) {
         used_future_fit = true;
-        common_snapshots = make_future_fit_snapshots(future_demand, current_s, arrival_t);
+        if (root_alternatives) future_fit_values.resize(candidates.size());
+        array<ll, FUTURE_FIT_SNAPSHOT_COUNT> snapshots = make_future_fit_snapshots(future_demand, current_s, arrival_t);
         long double best_fit = -numeric_limits<long double>::infinity();
         for (int index = 0; index < (int)candidates.size(); index++) {
-            long double fit = evaluate_compact_fit(
-                park, owner, groups, candidates[index].cells, *common_snapshots);
-            future_fit_values[index] = fit;
+            long double fit = evaluate_compact_fit(park, owner, groups, candidates[index].cells, snapshots);
+            if (root_alternatives) future_fit_values[index] = fit;
             diagnostics.future_fit_snapshots += FUTURE_FIT_SNAPSHOT_COUNT;
-            if (fit > best_fit + 1e-15L ||
-                (fabsl(fit - best_fit) <= 1e-15L &&
-                 placement_increment_less(candidates[index], candidates[best_index]))) {
+            if (fit > best_fit + 1e-15L || (fabsl(fit - best_fit) <= 1e-15L &&
+                                            placement_increment_less(candidates[index], candidates[best_index]))) {
                 best_fit = fit;
                 best_index = index;
             }
         }
         diagnostics.future_fit_evaluated_turns++;
-    }
-
-    // 旧connected配置が既に料金判定を通る場合だけ候補を追加する。
-    // 開発100 seedでエラーの尾が出た高外周率盤面は初期地形で静的に除外する。
-    // Reject→Acceptは起こさず、周長・丸め後料金・future-fitの保護を全て維持する。
-    int old_best_index = best_index;
-    optional<PlacementCandidate> polished_choice;
-    bool old_connected = candidates[old_best_index].source == PlacementSource::ConnectedGrowth ||
-                         candidates[old_best_index].source == PlacementSource::GrowAndTrim;
-    ll old_fee = round_payment(arrival_v, p, candidates[old_best_index].perimeter);
-    bool connected_polish_candidate =
-        root_alternatives != nullptr && p >= DENSE_BOX_MIN_GROUP_SIZE &&
-        old_connected && old_fee > opportunity_cost &&
-        candidates[old_best_index].perimeter > minimum_perimeter;
-    if (connected_polish_candidate) {
-        diagnostics.connected_polish_candidate_turns++;
-    }
-    if (connected_polish_candidate && !case_connected_polish_enabled) {
-        diagnostics.connected_polish_static_filtered_turns++;
-    }
-    if (connected_polish_candidate && case_connected_polish_enabled) {
-        diagnostics.connected_polish_eligible_turns++;
-        vector<vector<Cell>> dense_regions;
-        // dense全盤面走査は改善上限Uが1万以上の先着24回へ限定する。
-        // 安いdescentはこの予算から分離し、全eligibleで近傍数prefilterまで実行する。
-        ll maximum_fee_gain =
-            round_payment(arrival_v, p, minimum_perimeter) - old_fee;
-        if (maximum_fee_gain < DENSE_BOX_MIN_MAXIMUM_FEE_GAIN) {
-            diagnostics.dense_box_value_filtered_turns++;
-        } else if (case_dense_box_attempts >= DENSE_BOX_ATTEMPT_LIMIT_PER_CASE) {
-            diagnostics.dense_box_budget_skips++;
-        } else {
-            case_dense_box_attempts++;
-            diagnostics.dense_box_eligible_turns++;
-            dense_regions = make_dense_box_trim_candidates(
-                park, owner, p, minimum_perimeter,
-                candidates[old_best_index].perimeter,
-                incremental_cell, absolute_cell, incremental_prefix,
-                absolute_prefix, diagnostics);
-        }
-        // dense/descentを周長tier別に圧縮し、短いtierから保護判定する。
-        map<int, PlacementShortlistBuilder> polish_builders;
-        auto consider_polished_region = [&](vector<Cell> &region, PlacementSource source) {
-            int perimeter = calc_perimeter(region, n);
-            ll fee = round_payment(arrival_v, p, perimeter);
-            if (fee <= old_fee) {
-                if (source == PlacementSource::DenseBoxTrim) {
-                    diagnostics.dense_box_nonimproving_candidates++;
-                } else if (source == PlacementSource::PerimeterDescent) {
-                    diagnostics.perimeter_descent_nonimproving_candidates++;
-                }
-                return;
-            }
-            long double incremental_cost = 0.0L;
-            long double absolute_cost = 0.0L;
-            for (auto [x, y] : region) {
-                incremental_cost += incremental_cell[x][y];
-                absolute_cost += absolute_cell[x][y];
-            }
-            incremental_cost -= (4 * p - perimeter) * candidate_arrival_level;
-            absolute_cost -= (4 * p - perimeter) * candidate_release_level;
-            int quadrant = placement_quadrant(region, n);
-            long long order = enumeration_order++;
-            polish_builders[perimeter].consider(
-                perimeter, incremental_cost, absolute_cost, order, quadrant,
-                source, [&] { return region; });
-        };
-
-        // 旧領域を最小限だけ変形する候補を先に入れる。同周長・同costなら、
-        // 盤面を大きく飛び移るdense案より局所swapを固定tie-breakで優先する。
-        vector<vector<Cell>> descent_regions = make_perimeter_descent_candidates(
-            park, owner, candidates[old_best_index].cells,
-            incremental_cell, absolute_cell, diagnostics);
-        for (vector<Cell> &region : descent_regions) {
-            consider_polished_region(region, PlacementSource::PerimeterDescent);
-        }
-        for (vector<Cell> &region : dense_regions) {
-            consider_polished_region(region, PlacementSource::DenseBoxTrim);
-        }
-
-        long double old_fit = -numeric_limits<long double>::infinity();
-        if (future_fit_available && !polish_builders.empty()) {
-            if (!common_snapshots) {
-                common_snapshots =
-                    make_future_fit_snapshots(future_demand, current_s, arrival_t);
-            }
-            if (used_future_fit) {
-                old_fit = future_fit_values[old_best_index];
-            } else {
-                old_fit = evaluate_compact_fit(
-                    park, owner, groups, candidates[old_best_index].cells,
-                    *common_snapshots);
-                diagnostics.future_fit_snapshots += FUTURE_FIT_SNAPSHOT_COUNT;
-                diagnostics.future_fit_evaluated_turns++;
-            }
-        }
-
-        // 最短tierが保護条件で落ちても、次tierの安全な改善を試す。
-        for (const auto &[perimeter, builder] : polish_builders) {
-            vector<PlacementCandidate> tier_candidates = builder.finalize();
-            diagnostics.shortlisted_candidates += tier_candidates.size();
-            if (tier_candidates.empty()) continue;
-            int tier_best = -1;
-            long double tier_best_fit = -numeric_limits<long double>::infinity();
-            if (future_fit_available) {
-                for (int index = 0; index < (int)tier_candidates.size(); index++) {
-                    long double fit = evaluate_compact_fit(
-                        park, owner, groups, tier_candidates[index].cells,
-                        *common_snapshots);
-                    diagnostics.future_fit_snapshots += FUTURE_FIT_SNAPSHOT_COUNT;
-                    if (tier_best == -1 || fit > tier_best_fit + 1e-15L ||
-                        (fabsl(fit - tier_best_fit) <= 1e-15L &&
-                         placement_increment_less(tier_candidates[index],
-                                                  tier_candidates[tier_best]))) {
-                        tier_best_fit = fit;
-                        tier_best = index;
-                    }
-                }
-            } else {
-                for (int index = 0; index < (int)tier_candidates.size(); index++) {
-                    if (tier_best == -1 ||
-                        placement_increment_less(tier_candidates[index],
-                                                 tier_candidates[tier_best])) {
-                        tier_best = index;
-                    }
-                }
-            }
-            if (tier_best == -1) continue;
-            PlacementSource polished_source = tier_candidates[tier_best].source;
-            if (!future_fit_available || tier_best_fit + 1e-15L >= old_fit) {
-                int perimeter_improvement =
-                    candidates[old_best_index].perimeter - perimeter;
-                if (polished_source == PlacementSource::DenseBoxTrim) {
-                    diagnostics.dense_box_perimeter_improvement += perimeter_improvement;
-                } else if (polished_source == PlacementSource::PerimeterDescent) {
-                    diagnostics.perimeter_descent_perimeter_improvement +=
-                        perimeter_improvement;
-                }
-                polished_choice = std::move(tier_candidates[tier_best]);
-                break;
-            }
-            if (polished_source == PlacementSource::DenseBoxTrim) {
-                diagnostics.dense_box_future_fit_rejections++;
-            } else if (polished_source == PlacementSource::PerimeterDescent) {
-                diagnostics.perimeter_descent_future_fit_rejections++;
-            }
+        if (!same_region(candidates[incremental_best].cells, candidates[best_index].cells)) {
+            diagnostics.future_fit_changed_placements++;
         }
     }
 
-    if (!same_region(candidates[incremental_best].cells,
-                     candidates[old_best_index].cells)) {
-        diagnostics.future_fit_changed_placements++;
-    }
-    if (polished_choice &&
-        !same_region(candidates[old_best_index].cells, polished_choice->cells)) {
-        diagnostics.connected_polish_changed_placements++;
-    }
-    const PlacementCandidate &final_view =
-        polished_choice ? *polished_choice : candidates[old_best_index];
-    if (!same_region(final_view.cells, candidates[absolute_best].cells)) {
+    if (!same_region(candidates[best_index].cells, candidates[absolute_best].cells)) {
         diagnostics.final_changed_from_absolute++;
     }
-
-    // 実ターンだけはrollout比較用に旧primaryを含む次点を最大2件返す。
-    // polish案へ替えた場合も旧connected配置を第1rollback候補として必ず保持する。
-    if (root_alternatives) {
+    // 実ターンだけは、同じ評価済みshortlistから通常配置の次点も返す。
+    // 仮想未来では再帰的にroot比較しないため、次点候補は要求されない。
+    if (root_alternatives && candidates.size() >= 2) {
         vector<char> chosen(candidates.size(), false);
-        chosen[old_best_index] = true;
-        if (polished_choice) {
-            root_alternatives->push_back(
-                NormalPlacementChoice{candidates[old_best_index].cells,
-                                      candidates[old_best_index].perimeter,
-                                      candidates[old_best_index].source});
-        }
+        chosen[best_index] = true;
         while ((int)root_alternatives->size() < ROOT_ROLLOUT_NORMAL_ALTERNATIVE_LIMIT) {
             int alternative_index = -1;
             for (int index = 0; index < (int)candidates.size(); index++) {
@@ -3077,23 +2274,14 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
             if (alternative_index == -1) break;
             chosen[alternative_index] = true;
             root_alternatives->push_back(
-                NormalPlacementChoice{candidates[alternative_index].cells,
-                                      candidates[alternative_index].perimeter,
+                NormalPlacementChoice{candidates[alternative_index].cells, candidates[alternative_index].perimeter,
                                       candidates[alternative_index].source});
         }
     }
-    PlacementCandidate choice = polished_choice ? std::move(*polished_choice)
-                                                : std::move(candidates[old_best_index]);
-    if (choice.source == PlacementSource::ConnectedGrowth ||
-        choice.source == PlacementSource::GrowAndTrim ||
-        choice.source == PlacementSource::DenseBoxTrim ||
-        choice.source == PlacementSource::PerimeterDescent) {
+    PlacementCandidate choice = std::move(candidates[best_index]);
+    if (choice.source == PlacementSource::ConnectedGrowth || choice.source == PlacementSource::GrowAndTrim) {
         diagnostics.fallback_successes++;
         if (choice.source == PlacementSource::GrowAndTrim) diagnostics.grow_and_trim_successes++;
-        if (choice.source == PlacementSource::DenseBoxTrim) diagnostics.dense_box_successes++;
-        if (choice.source == PlacementSource::PerimeterDescent) {
-            diagnostics.perimeter_descent_successes++;
-        }
     } else {
         diagnostics.compact_successes++;
         if (choice.source == PlacementSource::ExtendedTemplate) {
@@ -3141,8 +2329,6 @@ void accumulate_placement_diagnostics(TemporalPlacementDiagnostics &total,
     total.actual_rejected_candidate_fee += part.actual_rejected_candidate_fee;
     total.future_fit_evaluated_turns += part.future_fit_evaluated_turns;
     total.future_fit_changed_placements += part.future_fit_changed_placements;
-    total.connected_polish_changed_placements +=
-        part.connected_polish_changed_placements;
     total.incremental_changed_from_absolute += part.incremental_changed_from_absolute;
     total.final_changed_from_absolute += part.final_changed_from_absolute;
     total.anchors_checked += part.anchors_checked;
@@ -3165,40 +2351,6 @@ void accumulate_placement_diagnostics(TemporalPlacementDiagnostics &total,
         part.grow_and_trim_perimeter_worsened_candidates;
     total.grow_and_trim_shortlisted_candidates += part.grow_and_trim_shortlisted_candidates;
     total.grow_and_trim_successes += part.grow_and_trim_successes;
-    total.connected_polish_candidate_turns +=
-        part.connected_polish_candidate_turns;
-    total.connected_polish_static_filtered_turns +=
-        part.connected_polish_static_filtered_turns;
-    total.connected_polish_eligible_turns +=
-        part.connected_polish_eligible_turns;
-    total.dense_box_eligible_turns += part.dense_box_eligible_turns;
-    total.dense_box_value_filtered_turns += part.dense_box_value_filtered_turns;
-    total.dense_box_budget_skips += part.dense_box_budget_skips;
-    total.dense_box_anchors_checked += part.dense_box_anchors_checked;
-    total.dense_box_feasible_anchors += part.dense_box_feasible_anchors;
-    total.dense_box_shortlisted_anchors += part.dense_box_shortlisted_anchors;
-    total.dense_box_component_failures += part.dense_box_component_failures;
-    total.dense_box_trim_attempts += part.dense_box_trim_attempts;
-    total.dense_box_trimmed_cells += part.dense_box_trimmed_cells;
-    total.dense_box_trim_failures += part.dense_box_trim_failures;
-    total.dense_box_nonimproving_candidates += part.dense_box_nonimproving_candidates;
-    total.dense_box_duplicate_candidates += part.dense_box_duplicate_candidates;
-    total.dense_box_candidates += part.dense_box_candidates;
-    total.dense_box_future_fit_rejections += part.dense_box_future_fit_rejections;
-    total.dense_box_perimeter_improvement += part.dense_box_perimeter_improvement;
-    total.dense_box_successes += part.dense_box_successes;
-    total.perimeter_descent_attempts += part.perimeter_descent_attempts;
-    total.perimeter_descent_prefilter_rejections +=
-        part.perimeter_descent_prefilter_rejections;
-    total.perimeter_descent_steps += part.perimeter_descent_steps;
-    total.perimeter_descent_candidates += part.perimeter_descent_candidates;
-    total.perimeter_descent_nonimproving_candidates +=
-        part.perimeter_descent_nonimproving_candidates;
-    total.perimeter_descent_future_fit_rejections +=
-        part.perimeter_descent_future_fit_rejections;
-    total.perimeter_descent_perimeter_improvement +=
-        part.perimeter_descent_perimeter_improvement;
-    total.perimeter_descent_successes += part.perimeter_descent_successes;
     total.shortlisted_candidates += part.shortlisted_candidates;
     total.future_fit_snapshots += part.future_fit_snapshots;
 }
@@ -3206,13 +2358,7 @@ void accumulate_placement_diagnostics(TemporalPlacementDiagnostics &total,
 void remove_selected_placement_success(TemporalPlacementDiagnostics &diagnostics) {
     if (diagnostics.fallback_successes > 0) {
         diagnostics.fallback_successes--;
-        if (diagnostics.dense_box_successes > 0) {
-            diagnostics.dense_box_successes--;
-        } else if (diagnostics.perimeter_descent_successes > 0) {
-            diagnostics.perimeter_descent_successes--;
-        } else if (diagnostics.grow_and_trim_successes > 0) {
-            diagnostics.grow_and_trim_successes--;
-        }
+        if (diagnostics.grow_and_trim_successes > 0) diagnostics.grow_and_trim_successes--;
         return;
     }
     if (diagnostics.compact_successes > 0) diagnostics.compact_successes--;
@@ -3222,33 +2368,13 @@ void remove_selected_placement_success(TemporalPlacementDiagnostics &diagnostics
 void replace_selected_placement_success(TemporalPlacementDiagnostics &diagnostics,
                                         PlacementSource source) {
     remove_selected_placement_success(diagnostics);
-    if (source == PlacementSource::ConnectedGrowth || source == PlacementSource::GrowAndTrim ||
-        source == PlacementSource::DenseBoxTrim || source == PlacementSource::PerimeterDescent) {
+    if (source == PlacementSource::ConnectedGrowth || source == PlacementSource::GrowAndTrim) {
         diagnostics.fallback_successes++;
         if (source == PlacementSource::GrowAndTrim) diagnostics.grow_and_trim_successes++;
-        if (source == PlacementSource::DenseBoxTrim) diagnostics.dense_box_successes++;
-        if (source == PlacementSource::PerimeterDescent) diagnostics.perimeter_descent_successes++;
     } else {
         diagnostics.compact_successes++;
         if (source == PlacementSource::ExtendedTemplate) diagnostics.extended_template_successes++;
     }
-}
-
-// polish採用でbaseline周長が短くなっても、旧connectedが持っていたroot探索機会を
-// 消さないためのrollback view。polish時は旧primaryをalternatives先頭へ必ず入れる。
-// 探索発火と移動先rankingだけ旧形状を参照し、direct gainは改善後baselineと比較する。
-const NormalPlacementChoice *connected_polish_rollback(
-    const ArrivalDecision &decision,
-    const vector<NormalPlacementChoice> &normal_alternatives) {
-    bool polished = decision.diagnostics.dense_box_successes == 1 ||
-                    decision.diagnostics.perimeter_descent_successes == 1;
-    if (!polished || normal_alternatives.empty()) return nullptr;
-    const NormalPlacementChoice &rollback = normal_alternatives.front();
-    if (rollback.source != PlacementSource::ConnectedGrowth &&
-        rollback.source != PlacementSource::GrowAndTrim) {
-        return nullptr;
-    }
-    return &rollback;
 }
 
 // 到着組の通常入場判定。高価な配置探索の前後で料金と機会損失を比較する。
@@ -3262,9 +2388,6 @@ ArrivalDecision evaluate_arrival_decision(const vs &park, const vvi &decision_ow
                                           const vector<vector<Shape>> &compact_shapes,
                                           vector<NormalPlacementChoice> *root_alternatives = nullptr) {
     ArrivalDecision result;
-    // 実到着と仮想未来で同じ倍率を掛け、rollout内だけ価格尺度がずれることを防ぐ。
-    opportunity_cost *=
-        (long double)case_dlp_scale_milli / DLP_SCALE_DENOMINATOR;
     if (root_alternatives) root_alternatives->clear();
     const GroupState &arrival = groups[arrival_id];
     int minimum_perimeter = compact_shapes[arrival.p].front().perimeter;
@@ -3275,11 +2398,9 @@ ArrivalDecision evaluate_arrival_decision(const vs &park, const vvi &decision_ow
     }
 
     optional<NormalPlacementChoice> placement =
-        choose_temporally_coherent_region(
-            park, decision_owner, groups, current_s, arrival.t,
-            arrival.p, arrival.v,
-            opportunity_cost, theta, remaining_groups, compact_shapes[arrival.p],
-            result.diagnostics, root_alternatives);
+        choose_temporally_coherent_region(park, decision_owner, groups, current_s, arrival.t, arrival.p, theta,
+                                          remaining_groups, compact_shapes[arrival.p], result.diagnostics,
+                                          root_alternatives);
     if (!placement) {
         result.status = ArrivalStatus::NoRegion;
         return result;
@@ -3345,8 +2466,6 @@ struct LossDiagnostics {
     // 最小テンプレート、拡張テンプレート、連結成長、分類不能の順。
     array<int, 4> accepted_by_source{};
     int accepted_grow_and_trim = 0;
-    int accepted_dense_box_trim = 0;
-    int accepted_perimeter_descent = 0;
 
     ll offered_ideal_fee = 0;
     ll offered_cell_time = 0;
@@ -3391,12 +2510,6 @@ struct LossDiagnostics {
     ll accepted_grow_and_trim_ideal_fee = 0;
     ll accepted_grow_and_trim_initial_fee = 0;
     ll accepted_grow_and_trim_perimeter_excess = 0;
-    ll accepted_dense_box_trim_ideal_fee = 0;
-    ll accepted_dense_box_trim_initial_fee = 0;
-    ll accepted_dense_box_trim_perimeter_excess = 0;
-    ll accepted_perimeter_descent_ideal_fee = 0;
-    ll accepted_perimeter_descent_initial_fee = 0;
-    ll accepted_perimeter_descent_perimeter_excess = 0;
     ll accepted_free_cells_sum = 0;
     ll rejected_feasible_free_cells_sum = 0;
     ll rejected_unplaceable_free_cells_sum = 0;
@@ -3437,25 +2550,20 @@ __attribute__((noinline)) void observe_loss(
             diagnostics.accepted_plan_mismatches++;
         }
 
-        int fallback_detail_sources =
-            decision.diagnostics.grow_and_trim_successes +
-            decision.diagnostics.dense_box_successes +
-            decision.diagnostics.perimeter_descent_successes;
         int source = 3;
         if (decision.diagnostics.compact_successes == 1 &&
             decision.diagnostics.extended_template_successes == 0 &&
-            decision.diagnostics.fallback_successes == 0 &&
-            fallback_detail_sources == 0) {
+            decision.diagnostics.fallback_successes == 0) {
             source = 0;
         } else if (decision.diagnostics.compact_successes == 1 &&
                    decision.diagnostics.extended_template_successes == 1 &&
-                   decision.diagnostics.fallback_successes == 0 &&
-                   fallback_detail_sources == 0) {
+                   decision.diagnostics.fallback_successes == 0) {
             source = 1;
         } else if (decision.diagnostics.compact_successes == 0 &&
                    decision.diagnostics.extended_template_successes == 0 &&
                    decision.diagnostics.fallback_successes == 1 &&
-                   fallback_detail_sources <= 1) {
+                   (decision.diagnostics.grow_and_trim_successes == 0 ||
+                    decision.diagnostics.grow_and_trim_successes == 1)) {
             source = 2;
         } else {
             diagnostics.accepted_source_mismatches++;
@@ -3470,20 +2578,6 @@ __attribute__((noinline)) void observe_loss(
             diagnostics.accepted_grow_and_trim_ideal_fee += ideal_fee;
             diagnostics.accepted_grow_and_trim_initial_fee += initial_fee;
             diagnostics.accepted_grow_and_trim_perimeter_excess +=
-                plan.arrival_perimeter - minimum_perimeter;
-        }
-        if (decision.diagnostics.dense_box_successes == 1) {
-            diagnostics.accepted_dense_box_trim++;
-            diagnostics.accepted_dense_box_trim_ideal_fee += ideal_fee;
-            diagnostics.accepted_dense_box_trim_initial_fee += initial_fee;
-            diagnostics.accepted_dense_box_trim_perimeter_excess +=
-                plan.arrival_perimeter - minimum_perimeter;
-        }
-        if (decision.diagnostics.perimeter_descent_successes == 1) {
-            diagnostics.accepted_perimeter_descent++;
-            diagnostics.accepted_perimeter_descent_ideal_fee += ideal_fee;
-            diagnostics.accepted_perimeter_descent_initial_fee += initial_fee;
-            diagnostics.accepted_perimeter_descent_perimeter_excess +=
                 plan.arrival_perimeter - minimum_perimeter;
         }
         diagnostics.accepted_opportunity_cost += opportunity_cost;
@@ -3884,8 +2978,7 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
                                          bool no_region_pushout, int shortlist_per_metric,
                                          const vector<vector<Shape>> &compact_shapes,
                                          RescueDiagnostics &diagnostics) {
-    // 全最小周長アンカーの池合法性を行bit maskでまとめて判定し、
-    // 合法anchorだけをO(1)の累積和で評価する。
+    // 全最小周長アンカーをまずO(1)の累積和だけで評価する。
     // 「衝突セル数が少ない」「セル按分した概算移動費が小さい」の2基準でtop-kを取り、
     // その和集合についてだけ正確なblocker集合・移動費・直接利益を計算する。
     int n = park.size();
@@ -3894,10 +2987,12 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
     int minimum_perimeter = shapes.front().perimeter;
     ll compact_fee = round_payment(arrival.v, arrival.p, minimum_perimeter);
 
+    vector<char> pond(n * n, false);
     vector<vi> occupied_prefix(n + 1, vi(n + 1));
     vector<vector<long double>> fractional_prefix(n + 1, vector<long double>(n + 1));
     for (int x = 0; x < n; x++) {
         for (int y = 0; y < n; y++) {
+            pond[x * n + y] = park[x][y] == '#';
             int id = owner[x][y];
             long double fractional =
                 id == -1 ? 0.0L : (long double)move_cost(groups[id].v, r_milli) / groups[id].p;
@@ -3908,7 +3003,7 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
                 fractional_prefix[x][y];
         }
     }
-    LegalAnchorIndex pond_anchor_index(park, nullptr);
+    vector<vi> pond_prefix = make_flag_prefix(pond, n);
 
     auto occupied_better = [](const RescueTargetSeed &lhs, const RescueTargetSeed &rhs) {
         return tie(lhs.occupied_cells, lhs.fractional_move_cost, lhs.order) <
@@ -3937,14 +3032,14 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
         const Shape &shape = shapes[shape_index];
         if (shape.perimeter != minimum_perimeter) break;
         for (int base_x = 0; base_x + shape.h <= n; base_x++) {
-            int base_y_count = n - shape.w + 1;
-            diagnostics.target_anchors += base_y_count;
-            uint64_t legal_base_y = pond_anchor_index.legal_base_y_mask(shape, base_x);
-            while (legal_base_y != 0) {
-                int base_y = __builtin_ctzll(legal_base_y);
-                legal_base_y &= legal_base_y - 1;
+            for (int base_y = 0; base_y + shape.w <= n; base_y++) {
+                diagnostics.target_anchors++;
                 const Rect &a = shape.main_rect;
                 const Rect &b = shape.extra_rect;
+                if (rectangle_sum(pond_prefix, base_x + a.x, base_y + a.y, a.h, a.w) != 0 ||
+                    rectangle_sum(pond_prefix, base_x + b.x, base_y + b.y, b.h, b.w) != 0) {
+                    continue;
+                }
                 int occupied = rectangle_sum(occupied_prefix, base_x + a.x, base_y + a.y, a.h, a.w) +
                                rectangle_sum(occupied_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
                 long double fractional =
@@ -4712,7 +3807,7 @@ bool confirm_root_override(
         diagnostics.root_confirmation_policy_steps += 2LL * scenario.size();
         ll future_delta = challenger_outcome.fee - protected_outcome.fee;
         future_delta_sum += future_delta;
-        positive_scenario[scenario_index] = root_scenario_positive(direct_delta, future_delta);
+        positive_scenario[scenario_index] = (i128)direct_delta + future_delta > 0;
         diagnostics.root_confirmation_positive_scenarios += positive_scenario[scenario_index];
     }
     diagnostics.root_confirmation_scenarios += ROOT_CONFIRM_SCENARIO_COUNT;
@@ -4722,9 +3817,10 @@ bool confirm_root_override(
     }
 
     i128 margin_times_scenarios =
-        root_margin_scaled(ROOT_CONFIRM_SCENARIO_COUNT, direct_delta, future_delta_sum);
+        (i128)ROOT_CONFIRM_SCENARIO_COUNT * direct_delta +
+        future_delta_sum;
     long double holdout_margin =
-        root_margin_fee(margin_times_scenarios, ROOT_CONFIRM_SCENARIO_COUNT);
+        (long double)margin_times_scenarios / ROOT_CONFIRM_SCENARIO_COUNT;
     diagnostics.root_confirmation_holdout_margin += holdout_margin;
     if (margin_times_scenarios > 0) {
         diagnostics.root_confirmation_approved++;
@@ -4784,20 +3880,10 @@ optional<RootActionResult> choose_root_action_with_rescue(
     const vector<vector<Shape>> &compact_shapes, const vector<vector<Shape>> &all_shapes,
     int &confirmations_used, bool &root_screen_evaluated, RescueDiagnostics &diagnostics) {
     root_screen_evaluated = false;
-    // Push-outの即時利益gateにも通常admissionと同じケース固定倍率を適用する。
-    opportunity_cost *=
-        (long double)case_dlp_scale_milli / DLP_SCALE_DENOMINATOR;
     const GroupState &arrival = groups[arrival_id];
     int minimum_perimeter = compact_shapes[arrival.p].front().perimeter;
-    const NormalPlacementChoice *polish_rollback =
-        connected_polish_rollback(baseline, normal_alternatives);
-    int compact_rescue_trigger_perimeter = baseline.perimeter;
-    if (polish_rollback) {
-        chmax(compact_rescue_trigger_perimeter, polish_rollback->perimeter);
-    }
     bool compact_rescue = baseline.status == ArrivalStatus::Accepted && baseline.cells &&
-                          compact_rescue_trigger_perimeter >
-                              minimum_perimeter + COMPACT_PERIMETER_MARGIN;
+                          baseline.perimeter > minimum_perimeter + COMPACT_PERIMETER_MARGIN;
     bool no_region_pushout = ENABLE_NO_REGION_PUSHOUT && baseline.status == ArrivalStatus::NoRegion &&
                              !baseline.cells;
     if (!compact_rescue && !no_region_pushout) {
@@ -4876,9 +3962,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
     bool rollout_ready = false;
     bool stop_after_primary = false;
     const vector<Cell> &preferred_destination_cells =
-        mode == RescueMode::NoRegionPushOut
-            ? preexisting_free_cells
-            : (polish_rollback ? polish_rollback->cells : *baseline.cells);
+        mode == RescueMode::NoRegionPushOut ? preexisting_free_cells : *baseline.cells;
 
     // shortlist順に目標領域を修復する。探索予算か候補2案のどちらかを使い切れば止める。
     for (const RescueTarget &target : targets) {
@@ -5070,7 +4154,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
             array<ll, RESCUE_ROLLOUT_SCENARIO_COUNT> future_delta{};
             ll margin_twice = 0;
         };
-        // margin_twiceは名前を維持するが、値は1000倍した現在差と重み付き未来差の和。
+        // margin_twice = 2×現在の直接差 + 2シナリオの未来料金差。
         // 除算せず整数のまま比較し、同点順序と丸め誤差を固定する。
         vector<CandidateRolloutEvaluation> evaluations(candidates.size());
         for (int candidate_index = 0; candidate_index < (int)candidates.size(); candidate_index++) {
@@ -5085,19 +4169,15 @@ optional<RootActionResult> choose_root_action_with_rescue(
                 diagnostics.rollout_rescue_acceptances += rescue_outcome.acceptances;
                 evaluation.future_delta[scenario] = rescue_outcome.fee - baseline_outcomes[scenario].fee;
             }
-            evaluation.margin_twice = root_margin_scaled_ll(
-                RESCUE_ROLLOUT_SCENARIO_COUNT, candidate.direct_gain,
-                evaluation.future_delta[0] + evaluation.future_delta[1]);
+            evaluation.margin_twice = 2 * candidate.direct_gain + evaluation.future_delta[0] +
+                                      evaluation.future_delta[1];
             diagnostics.rollout_slot_scenario_0_future_delta[candidate_index] +=
                 evaluation.future_delta[0];
             diagnostics.rollout_slot_scenario_1_future_delta[candidate_index] +=
                 evaluation.future_delta[1];
-            diagnostics.rollout_slot_margin[candidate_index] +=
-                root_margin_fee(evaluation.margin_twice, RESCUE_ROLLOUT_SCENARIO_COUNT);
-            bool first_accepts =
-                root_scenario_positive(candidate.direct_gain, evaluation.future_delta[0]);
-            bool second_accepts =
-                root_scenario_positive(candidate.direct_gain, evaluation.future_delta[1]);
+            diagnostics.rollout_slot_margin[candidate_index] += 0.5L * evaluation.margin_twice;
+            bool first_accepts = candidate.direct_gain + evaluation.future_delta[0] > 0;
+            bool second_accepts = candidate.direct_gain + evaluation.future_delta[1] > 0;
             if (first_accepts != second_accepts) {
                 if (candidate_index == 0) {
                     diagnostics.rollout_candidate_0_disagreements++;
@@ -5124,12 +4204,9 @@ optional<RootActionResult> choose_root_action_with_rescue(
         diagnostics.rollout_scenario_1_future_delta += best_evaluation.future_delta[1];
         long double future_mean =
             0.5L * (best_evaluation.future_delta[0] + best_evaluation.future_delta[1]);
-        long double rollout_margin =
-            root_margin_fee(best_evaluation.margin_twice, RESCUE_ROLLOUT_SCENARIO_COUNT);
-        bool first_accepts =
-            root_scenario_positive(best_candidate.direct_gain, best_evaluation.future_delta[0]);
-        bool second_accepts =
-            root_scenario_positive(best_candidate.direct_gain, best_evaluation.future_delta[1]);
+        long double rollout_margin = 0.5L * best_evaluation.margin_twice;
+        bool first_accepts = best_candidate.direct_gain + best_evaluation.future_delta[0] > 0;
+        bool second_accepts = best_candidate.direct_gain + best_evaluation.future_delta[1] > 0;
         if (first_accepts != second_accepts) diagnostics.rollout_scenario_disagreements++;
         if (no_region_pushout) {
             diagnostics.pushout_scenario_0_future_delta += best_evaluation.future_delta[0];
@@ -5140,8 +4217,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
         if (candidates.size() == 2) {
             ll width_one_margin = max(0LL, evaluations[0].margin_twice);
             ll width_two_margin = max(width_one_margin, evaluations[1].margin_twice);
-            diagnostics.rollout_width_predicted_gain += root_margin_fee(
-                width_two_margin - width_one_margin, RESCUE_ROLLOUT_SCENARIO_COUNT);
+            diagnostics.rollout_width_predicted_gain += 0.5L * (width_two_margin - width_one_margin);
         }
 
         ll best_root_margin_twice = 0;
@@ -5190,9 +4266,9 @@ optional<RootActionResult> choose_root_action_with_rescue(
                     alternative_evaluation.future_delta[scenario] =
                         alternative_outcome.fee - baseline_outcomes[scenario].fee;
                 }
-                alternative_evaluation.margin_twice = root_margin_scaled_ll(
-                    RESCUE_ROLLOUT_SCENARIO_COUNT, alternative_direct_gain,
-                    alternative_evaluation.future_delta[0] + alternative_evaluation.future_delta[1]);
+                alternative_evaluation.margin_twice =
+                    2 * alternative_direct_gain + alternative_evaluation.future_delta[0] +
+                    alternative_evaluation.future_delta[1];
                 diagnostics.root_alternative_direct_gain += alternative_direct_gain;
                 diagnostics.root_alternative_scenario_0_future_delta +=
                     alternative_evaluation.future_delta[0];
@@ -5201,12 +4277,11 @@ optional<RootActionResult> choose_root_action_with_rescue(
                 long double alternative_future_mean =
                     0.5L * (alternative_evaluation.future_delta[0] + alternative_evaluation.future_delta[1]);
                 diagnostics.root_alternative_future_mean += alternative_future_mean;
-                diagnostics.root_alternative_margin += root_margin_fee(
-                    alternative_evaluation.margin_twice, RESCUE_ROLLOUT_SCENARIO_COUNT);
-                bool alternative_first_accepts = root_scenario_positive(
-                    alternative_direct_gain, alternative_evaluation.future_delta[0]);
-                bool alternative_second_accepts = root_scenario_positive(
-                    alternative_direct_gain, alternative_evaluation.future_delta[1]);
+                diagnostics.root_alternative_margin += 0.5L * alternative_evaluation.margin_twice;
+                bool alternative_first_accepts =
+                    alternative_direct_gain + alternative_evaluation.future_delta[0] > 0;
+                bool alternative_second_accepts =
+                    alternative_direct_gain + alternative_evaluation.future_delta[1] > 0;
                 if (alternative_first_accepts != alternative_second_accepts) {
                     diagnostics.root_alternative_disagreements++;
                 }
@@ -5222,8 +4297,8 @@ optional<RootActionResult> choose_root_action_with_rescue(
                 }
             }
 
-            long double screen_gain = root_margin_fee(
-                best_root_margin_twice - protected_margin_twice, RESCUE_ROLLOUT_SCENARIO_COUNT);
+            long double screen_gain =
+                0.5L * (best_root_margin_twice - protected_margin_twice);
             diagnostics.root_expanded_predicted_gain += screen_gain;
             if (selected_kind == RootActionKind::NormalAlternative) {
                 diagnostics.root_screen_v3_overrides++;
@@ -5414,9 +4489,9 @@ optional<RootActionResult> choose_normal_root_action(
             diagnostics.normal_root_policy_steps += scenarios.arrivals[scenario].size();
             evaluation.future_delta[scenario] = outcome.fee - baseline_outcomes[scenario].fee;
         }
-        evaluation.margin_twice = root_margin_scaled_ll(
-            ROOT_SCREEN_SCENARIO_COUNT, direct_gain,
-            accumulate(evaluation.future_delta.begin(), evaluation.future_delta.end(), 0LL));
+        evaluation.margin_twice =
+            ROOT_SCREEN_SCENARIO_COUNT * direct_gain +
+            accumulate(evaluation.future_delta.begin(), evaluation.future_delta.end(), 0LL);
 
         int alternative_index = alternative_plans.size();
         alternative_plans.push_back(std::move(plan));
@@ -5436,7 +4511,8 @@ optional<RootActionResult> choose_normal_root_action(
     assert(selected_kind == RootActionKind::NormalAlternative);
     diagnostics.normal_root_screen_overrides++;
     diagnostics.normal_root_screen_selected_alternative++;
-    long double screen_gain = root_margin_fee(best_margin_twice, ROOT_SCREEN_SCENARIO_COUNT);
+    long double screen_gain =
+        (long double)best_margin_twice / ROOT_SCREEN_SCENARIO_COUNT;
     diagnostics.root_confirmation_screen_gain += screen_gain;
     RootBranchView baseline_branch{&baseline_plan, &baseline_owner, 0};
     RootBranchView challenger_branch{
@@ -5577,58 +4653,6 @@ int main() {
         grass_cells += count(row.begin(), row.end(), '.');
     }
 
-    // Eは芝セルから池または盤外へ出る4近傍辺数、Gは芝セル数である。
-    // 保存済みv29のcase別結果から作った排他的portfolioを初期盤面だけで選ぶ。
-    // 0.55未満はDLP 1.30、0.55以上0.70未満は1.25、0.70以上0.80未満は
-    // 旧full、0.80以上はDLPを変えず候補生成だけを広げたplacement p2とする。
-    // さらに0.70以上0.80未満かつR<0.060だけ、保存cacheのsearch/validationで
-    // ともに改善したroot未来重み0.1の第5expertへ置き換える。
-    // 到着列や途中scoreを見てexpertを変更しない。
-    constexpr int DX[4] = {-1, 1, 0, 0};
-    constexpr int DY[4] = {0, 0, -1, 1};
-    int exposed_boundary_edges = 0;
-    for (int x = 0; x < N; x++) {
-        for (int y = 0; y < N; y++) {
-            if (park[x][y] != '.') continue;
-            for (int dir = 0; dir < 4; dir++) {
-                int nx = x + DX[dir];
-                int ny = y + DY[dir];
-                if (!inside(nx, ny, N, N) || park[nx][ny] == '#') {
-                    exposed_boundary_edges++;
-                }
-            }
-        }
-    }
-    int scaled_boundary = 100 * exposed_boundary_edges;
-    if (scaled_boundary < DLP_SMOOTH_BOUNDARY_THRESHOLD_PERCENT * grass_cells) {
-        case_static_expert = 0;
-        case_dlp_scale_milli = DLP_SMOOTH_SCALE_MILLI;
-        case_placement_config = CasePlacementConfig{};
-    } else if (scaled_boundary < DLP_MODERATE_BOUNDARY_THRESHOLD_PERCENT * grass_cells) {
-        case_static_expert = 1;
-        case_dlp_scale_milli = DLP_MODERATE_SCALE_MILLI;
-        case_placement_config = CasePlacementConfig{};
-    } else if (scaled_boundary < HARD_PLACEMENT_BOUNDARY_THRESHOLD_PERCENT * grass_cells) {
-        case_static_expert = 2;
-        case_dlp_scale_milli = DLP_CONSTRAINED_SCALE_MILLI;
-        case_placement_config = CasePlacementConfig{};
-    } else {
-        case_static_expert = 3;
-        case_dlp_scale_milli = DLP_CONSTRAINED_SCALE_MILLI;
-        case_placement_config = CasePlacementConfig{5, 8, 24, 12, 8, 500};
-    }
-    if (scaled_boundary >= DLP_MODERATE_BOUNDARY_THRESHOLD_PERCENT * grass_cells &&
-        scaled_boundary < HARD_PLACEMENT_BOUNDARY_THRESHOLD_PERCENT * grass_cells &&
-        r_milli < 60) {
-        case_static_expert = 4;
-        case_dlp_scale_milli = DLP_CONSTRAINED_SCALE_MILLI;
-        case_placement_config = CasePlacementConfig{};
-        case_root_future_weight_milli = ROOT_DIRECT_FUTURE_WEIGHT_MILLI;
-    }
-    // 保存100 seedでpolishの大損tailがなかったsmooth expertだけを有効化する。
-    // expert判定後は到着列を見ず、ケース中ずっと固定する。
-    case_connected_polish_enabled = case_static_expert == 0;
-
     // owner[x][y]は池・空きセルを-1、占有セルを組IDで表す。
     // 退去queueは終了時刻の小さい順に、現在盤面から消す組を管理する。
     vvi owner(N, vi(N, -1));
@@ -5718,18 +4742,11 @@ int main() {
         // rescueが候補を出さずscreenもしていない場合だけ、通常配置次点の単独比較を行う。
         // コンテスト進行度を4区間に分け、各区間で高々1回に制限する。
         int minimum_perimeter = compact_shapes[P].front().perimeter;
-        const NormalPlacementChoice *polish_rollback =
-            connected_polish_rollback(baseline_arrival, baseline_alternatives);
-        int normal_root_trigger_perimeter = baseline_arrival.perimeter;
-        if (polish_rollback) {
-            chmax(normal_root_trigger_perimeter, polish_rollback->perimeter);
-        }
         int normal_root_window = min(3, turn * 4 / M);
         bool normal_root_gate =
             !ROOT_PROTECTED_ONLY && !expanded_action && !rescue_root_screen_evaluated && remaining_groups > 0 &&
             baseline_arrival.status == ArrivalStatus::Accepted && baseline_arrival.cells &&
-            normal_root_trigger_perimeter > minimum_perimeter &&
-            !baseline_alternatives.empty() &&
+            baseline_arrival.perimeter > minimum_perimeter && !baseline_alternatives.empty() &&
             !normal_root_window_used[normal_root_window];
         if (normal_root_gate) {
             normal_root_window_used[normal_root_window] = true;
@@ -5920,27 +4937,6 @@ int main() {
     int grow_and_trim_source_error =
         max(0, loss_diagnostics.accepted_grow_and_trim -
                    loss_diagnostics.accepted_by_source[2]);
-    int dense_box_source_error =
-        max(0, loss_diagnostics.accepted_dense_box_trim -
-                   loss_diagnostics.accepted_by_source[2]);
-    int perimeter_descent_source_error =
-        max(0, loss_diagnostics.accepted_perimeter_descent -
-                   loss_diagnostics.accepted_by_source[2]);
-    int connected_polish_choice_error =
-        max(0, placement_diagnostics.dense_box_successes +
-                   placement_diagnostics.perimeter_descent_successes -
-                   placement_diagnostics.fallback_successes);
-    int connected_polish_static_partition_error =
-        placement_diagnostics.connected_polish_candidate_turns -
-        placement_diagnostics.connected_polish_static_filtered_turns -
-        placement_diagnostics.connected_polish_eligible_turns;
-    int dense_box_gate_partition_error =
-        placement_diagnostics.connected_polish_eligible_turns -
-        placement_diagnostics.dense_box_eligible_turns -
-        placement_diagnostics.dense_box_value_filtered_turns -
-        placement_diagnostics.dense_box_budget_skips;
-    int dense_box_attempt_count_error =
-        case_dense_box_attempts - placement_diagnostics.dense_box_eligible_turns;
     int pushout_status_identity_error =
         ENABLE_NO_REGION_PUSHOUT
             ? rescue_diagnostics.pushout_eligible - shadow_diagnostics.no_region_rejected -
@@ -5984,33 +4980,6 @@ int main() {
     runtime_diagnostics.add_diagnostic(final_loss_wall_begin, final_loss_cpu_begin);
     RuntimeSnapshot runtime = snapshot_runtime(runtime_diagnostics);
     cerr << "accepted=" << accepted_count << " rejected=" << rejected_count
-         << " case_static_expert=" << case_static_expert
-         << " case_dlp_scale_milli=" << case_dlp_scale_milli
-         << " case_placement_global_shortlist=" << case_placement_config.global_shortlist
-         << " case_placement_shortlist_limit=" << case_placement_config.shortlist_limit
-         << " case_connected_growth_seed_limit="
-         << case_placement_config.connected_growth_seed_limit
-         << " case_grow_and_trim_extra_cells="
-         << case_placement_config.grow_and_trim_extra_cells
-         << " case_grow_and_trim_candidate_limit="
-         << case_placement_config.grow_and_trim_candidate_limit
-         << " case_future_fit_min_weight_milli="
-         << case_placement_config.future_fit_min_weight_milli
-         << " case_root_future_weight_milli=" << case_root_future_weight_milli
-         << " case_connected_polish_enabled="
-         << case_connected_polish_enabled
-         << " dense_box_min_group_size=" << DENSE_BOX_MIN_GROUP_SIZE
-         << " dense_box_extra_cells=" << DENSE_BOX_EXTRA_CELLS
-         << " dense_box_perimeter_margin=" << DENSE_BOX_PERIMETER_MARGIN
-         << " dense_box_global_anchor_limit=" << DENSE_BOX_GLOBAL_ANCHOR_LIMIT
-         << " dense_box_total_anchor_limit=" << DENSE_BOX_TOTAL_ANCHOR_LIMIT
-         << " dense_box_min_maximum_fee_gain="
-         << DENSE_BOX_MIN_MAXIMUM_FEE_GAIN
-         << " dense_box_attempt_limit_per_case="
-         << DENSE_BOX_ATTEMPT_LIMIT_PER_CASE
-         << " perimeter_descent_max_steps=" << PERIMETER_DESCENT_MAX_STEPS
-         << " static_exposed_boundary_edges=" << exposed_boundary_edges
-         << " static_grass_cells=" << grass_cells
          << " pushout_enabled=" << ENABLE_NO_REGION_PUSHOUT
          << " pushout_eligible=" << rescue_diagnostics.pushout_eligible
          << " pushout_area_insufficient=" << rescue_diagnostics.pushout_area_insufficient
@@ -6251,8 +5220,6 @@ int main() {
          << placement_diagnostics.actual_rejected_candidate_fee
          << " placement_future_fit_turns=" << placement_diagnostics.future_fit_evaluated_turns
          << " placement_future_fit_changes=" << placement_diagnostics.future_fit_changed_placements
-         << " placement_connected_polish_changes="
-         << placement_diagnostics.connected_polish_changed_placements
          << " placement_incremental_changes_from_absolute=" << placement_diagnostics.incremental_changed_from_absolute
          << " placement_final_changes_from_absolute=" << placement_diagnostics.final_changed_from_absolute
          << " placement_anchors_checked=" << placement_diagnostics.anchors_checked
@@ -6281,50 +5248,6 @@ int main() {
          << " grow_and_trim_shortlisted_candidates="
          << placement_diagnostics.grow_and_trim_shortlisted_candidates
          << " grow_and_trim_choices=" << placement_diagnostics.grow_and_trim_successes
-         << " connected_polish_candidate_turns="
-         << placement_diagnostics.connected_polish_candidate_turns
-         << " connected_polish_static_filtered_turns="
-         << placement_diagnostics.connected_polish_static_filtered_turns
-         << " connected_polish_eligible_turns="
-         << placement_diagnostics.connected_polish_eligible_turns
-         << " dense_box_eligible_turns=" << placement_diagnostics.dense_box_eligible_turns
-         << " dense_box_value_filtered_turns="
-         << placement_diagnostics.dense_box_value_filtered_turns
-         << " dense_box_budget_skips=" << placement_diagnostics.dense_box_budget_skips
-         << " dense_box_anchors_checked=" << placement_diagnostics.dense_box_anchors_checked
-         << " dense_box_feasible_anchors=" << placement_diagnostics.dense_box_feasible_anchors
-         << " dense_box_shortlisted_anchors="
-         << placement_diagnostics.dense_box_shortlisted_anchors
-         << " dense_box_component_failures="
-         << placement_diagnostics.dense_box_component_failures
-         << " dense_box_trim_attempts=" << placement_diagnostics.dense_box_trim_attempts
-         << " dense_box_trimmed_cells=" << placement_diagnostics.dense_box_trimmed_cells
-         << " dense_box_trim_failures=" << placement_diagnostics.dense_box_trim_failures
-         << " dense_box_nonimproving_candidates="
-         << placement_diagnostics.dense_box_nonimproving_candidates
-         << " dense_box_duplicate_candidates="
-         << placement_diagnostics.dense_box_duplicate_candidates
-         << " dense_box_candidates=" << placement_diagnostics.dense_box_candidates
-         << " dense_box_future_fit_rejections="
-         << placement_diagnostics.dense_box_future_fit_rejections
-         << " dense_box_perimeter_improvement="
-         << placement_diagnostics.dense_box_perimeter_improvement
-         << " dense_box_choices=" << placement_diagnostics.dense_box_successes
-         << " perimeter_descent_attempts="
-         << placement_diagnostics.perimeter_descent_attempts
-         << " perimeter_descent_prefilter_rejections="
-         << placement_diagnostics.perimeter_descent_prefilter_rejections
-         << " perimeter_descent_steps=" << placement_diagnostics.perimeter_descent_steps
-         << " perimeter_descent_candidates="
-         << placement_diagnostics.perimeter_descent_candidates
-         << " perimeter_descent_nonimproving_candidates="
-         << placement_diagnostics.perimeter_descent_nonimproving_candidates
-         << " perimeter_descent_future_fit_rejections="
-         << placement_diagnostics.perimeter_descent_future_fit_rejections
-         << " perimeter_descent_perimeter_improvement="
-         << placement_diagnostics.perimeter_descent_perimeter_improvement
-         << " perimeter_descent_choices="
-         << placement_diagnostics.perimeter_descent_successes
          << " placement_shortlisted_candidates=" << placement_diagnostics.shortlisted_candidates
          << " placement_future_fit_snapshots=" << placement_diagnostics.future_fit_snapshots
          << " decomp_static_largest_component=" << static_largest_component
@@ -6388,20 +5311,12 @@ int main() {
          << " decomp_accepted_extended_count=" << loss_diagnostics.accepted_by_source[1]
          << " decomp_accepted_growth_count=" << loss_diagnostics.accepted_by_source[2]
          << " decomp_accepted_grow_and_trim_count=" << loss_diagnostics.accepted_grow_and_trim
-         << " decomp_accepted_dense_box_trim_count="
-         << loss_diagnostics.accepted_dense_box_trim
-         << " decomp_accepted_perimeter_descent_count="
-         << loss_diagnostics.accepted_perimeter_descent
          << " decomp_accepted_unclassified_count=" << loss_diagnostics.accepted_by_source[3]
          << " decomp_accepted_minimum_ideal_fee=" << loss_diagnostics.accepted_source_ideal_fee[0]
          << " decomp_accepted_extended_ideal_fee=" << loss_diagnostics.accepted_source_ideal_fee[1]
          << " decomp_accepted_growth_ideal_fee=" << loss_diagnostics.accepted_source_ideal_fee[2]
          << " decomp_accepted_grow_and_trim_ideal_fee="
          << loss_diagnostics.accepted_grow_and_trim_ideal_fee
-         << " decomp_accepted_dense_box_trim_ideal_fee="
-         << loss_diagnostics.accepted_dense_box_trim_ideal_fee
-         << " decomp_accepted_perimeter_descent_ideal_fee="
-         << loss_diagnostics.accepted_perimeter_descent_ideal_fee
          << " decomp_accepted_unclassified_ideal_fee="
          << loss_diagnostics.accepted_source_ideal_fee[3]
          << " decomp_accepted_minimum_initial_fee=" << loss_diagnostics.accepted_source_initial_fee[0]
@@ -6409,10 +5324,6 @@ int main() {
          << " decomp_accepted_growth_initial_fee=" << loss_diagnostics.accepted_source_initial_fee[2]
          << " decomp_accepted_grow_and_trim_initial_fee="
          << loss_diagnostics.accepted_grow_and_trim_initial_fee
-         << " decomp_accepted_dense_box_trim_initial_fee="
-         << loss_diagnostics.accepted_dense_box_trim_initial_fee
-         << " decomp_accepted_perimeter_descent_initial_fee="
-         << loss_diagnostics.accepted_perimeter_descent_initial_fee
          << " decomp_accepted_unclassified_initial_fee="
          << loss_diagnostics.accepted_source_initial_fee[3]
          << " decomp_accepted_perimeter_excess=" << loss_diagnostics.accepted_perimeter_excess
@@ -6428,10 +5339,6 @@ int main() {
          << loss_diagnostics.accepted_source_perimeter_excess[2]
          << " decomp_accepted_grow_and_trim_perimeter_excess="
          << loss_diagnostics.accepted_grow_and_trim_perimeter_excess
-         << " decomp_accepted_dense_box_trim_perimeter_excess="
-         << loss_diagnostics.accepted_dense_box_trim_perimeter_excess
-         << " decomp_accepted_perimeter_descent_perimeter_excess="
-         << loss_diagnostics.accepted_perimeter_descent_perimeter_excess
          << " decomp_accepted_unclassified_perimeter_excess="
          << loss_diagnostics.accepted_source_perimeter_excess[3]
          << " decomp_accepted_free_cells_sum=" << loss_diagnostics.accepted_free_cells_sum
@@ -6470,13 +5377,6 @@ int main() {
          << " grow_and_trim_completion_funnel_error=" << grow_and_trim_completion_funnel_error
          << " grow_and_trim_perimeter_partition_error=" << grow_and_trim_perimeter_partition_error
          << " grow_and_trim_source_error=" << grow_and_trim_source_error
-         << " dense_box_source_error=" << dense_box_source_error
-         << " perimeter_descent_source_error=" << perimeter_descent_source_error
-         << " connected_polish_choice_error=" << connected_polish_choice_error
-         << " connected_polish_static_partition_error="
-         << connected_polish_static_partition_error
-         << " dense_box_gate_partition_error=" << dense_box_gate_partition_error
-         << " dense_box_attempt_count_error=" << dense_box_attempt_count_error
          << fixed << setprecision(6)
          << " decomp_accepted_opportunity=" << loss_diagnostics.accepted_opportunity_cost
          << " decomp_upper_rejected_opportunity=" << loss_diagnostics.upper_rejected_opportunity_cost
