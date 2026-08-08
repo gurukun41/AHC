@@ -55,6 +55,26 @@ constexpr array<int, 4> ORTHOGONAL_DY = {0, 0, -1, 1};
 constexpr int BOARD_SIDE_LIMIT = 50;
 static_assert(BOARD_SIDE_LIMIT < 64, "1行をuint64_tへ格納できる必要がある");
 
+// owner盤面はN=50固定なので、50本のvectorではなく1本の連続領域で持つ。
+// owner[x][y]の既存APIを保ちつつ、rolloutやroot比較での盤面copyを
+// 51回のheap確保から1回へ減らし、moveはvector本体の移譲だけにする。
+struct OwnerGrid {
+    vector<int> cells;
+
+    OwnerGrid() : cells(BOARD_SIDE_LIMIT * BOARD_SIDE_LIMIT, -1) {}
+
+    int *operator[](int x) { return cells.data() + x * BOARD_SIDE_LIMIT; }
+    const int *operator[](int x) const {
+        return cells.data() + x * BOARD_SIDE_LIMIT;
+    }
+    constexpr int size() const { return BOARD_SIDE_LIMIT; }
+};
+
+// 盤面値と2次元累積和の一時領域。51本の小vector確保を避ける。
+template <typename T>
+using FixedGrid =
+    array<array<T, BOARD_SIDE_LIMIT + 1>, BOARD_SIDE_LIMIT + 1>;
+
 // 対話入出力の待機時間を除いて、解法本体に使った時間を測る。
 // スコア計算には一切使わず、最後のstderr診断にのみ出力する。
 struct RuntimeDiagnostics {
@@ -316,6 +336,7 @@ constexpr uint64_t ROOT_ROLLOUT_SEQUENCE_BLOCK_SIZE = 1000003ULL;
 constexpr int ROOT_ROLLOUT_SEQUENCE_BLOCKS_PER_BATCH = ROOT_CONFIRM_SCENARIO_COUNT / 2;
 constexpr int BOARD_MASK_WORDS =
     (BOARD_SIDE_LIMIT * BOARD_SIDE_LIMIT + 63) / 64;
+using BoardMask = array<uint64_t, BOARD_MASK_WORDS>;
 
 // 下記の診断配列とscreen集計は2本の未来・最大2候補を明示的に参照する。
 // 定数だけを変更して添字と集計式がずれる事故をcompile時に防ぐ。
@@ -452,9 +473,9 @@ vector<Cell> materialize_shape(const Shape &shape, int base_x, int base_y) {
 
 // 池または既存組で使用中のセルを1とした二次元累積和。
 // テンプレートの合法性を矩形2個の和としてO(1)で調べるために使う。
-vector<vi> make_blocked_prefix(const vs &park, const vvi &owner) {
+FixedGrid<int> make_blocked_prefix(const vs &park, const OwnerGrid &owner) {
     int n = park.size();
-    vector<vi> prefix(n + 1, vi(n + 1));
+    FixedGrid<int> prefix{};
     for (int x = 0; x < n; x++) {
         for (int y = 0; y < n; y++) {
             int blocked = (park[x][y] == '#' || owner[x][y] != -1);
@@ -464,30 +485,31 @@ vector<vi> make_blocked_prefix(const vs &park, const vvi &owner) {
     return prefix;
 }
 
-int rectangle_sum(const vector<vi> &prefix, int x, int y, int h, int w) {
-    if (h == 0 || w == 0) return 0;
-    return prefix[x + h][y + w] - prefix[x][y + w] - prefix[x + h][y] + prefix[x][y];
-}
-
-long double rectangle_sum(const vector<vector<long double>> &prefix, int x, int y, int h, int w) {
-    if (h == 0 || w == 0) return 0.0L;
-    return prefix[x + h][y + w] - prefix[x][y + w] - prefix[x + h][y] + prefix[x][y];
+template <typename T>
+T rectangle_sum(const FixedGrid<T> &prefix, int x, int y, int h, int w) {
+    if (h == 0 || w == 0) return T{};
+    return prefix[x + h][y + w] - prefix[x][y + w] -
+           prefix[x + h][y] + prefix[x][y];
 }
 
 // N=50を1行1ワードに収め、templateの合法anchorだけをbase_y昇順で列挙する。
 // invalid_start[w][k][x]のbit yは、xから2^k行のどこかで
 // [y,y+w)に池または占有セルがあることを表す。行方向は冪長sparse tableなので、
 // 任意の高さを重なる2区間のORで厳密に照会できる。
+// 実際に照会された矩形幅だけを遅延構築し、各到着で未使用の幅を作らない。
 // 累積和版と合法集合・base_x/base_y順を変えず、不合法anchorの個別照会だけを省く。
 struct LegalAnchorIndex {
     static constexpr int MAX_N = BOARD_SIDE_LIMIT;
     static constexpr int LOG_N = 6;
 
     int n = 0;
-    array<array<array<uint64_t, MAX_N>, LOG_N>, MAX_N + 1> invalid_start{};
+    array<uint64_t, MAX_N> blocked_rows{};
+    array<bool, MAX_N + 1> built_width{};
+    int maximum_base_width = 0;
+    // 未構築幅の領域は読まないため、122KB全体のzero fillを避ける。
+    array<array<array<uint64_t, MAX_N>, LOG_N>, MAX_N + 1> invalid_start;
 
-    LegalAnchorIndex(const vs &park, const vvi *owner) : n(park.size()) {
-        array<uint64_t, MAX_N> blocked_rows{};
+    LegalAnchorIndex(const vs &park, const OwnerGrid *owner) : n(park.size()) {
         for (int x = 0; x < n; x++) {
             for (int y = 0; y < n; y++) {
                 if (park[x][y] == '#' || (owner != nullptr && (*owner)[x][y] != -1)) {
@@ -496,29 +518,42 @@ struct LegalAnchorIndex {
             }
         }
 
-        // bit yを「この行の幅w窓[y,y+w)が塞がる」にする。
-        for (int x = 0; x < n; x++) {
-            uint64_t blocked_windows = 0;
-            for (int w = 1; w <= n; w++) {
-                blocked_windows |= blocked_rows[x] >> (w - 1);
-                invalid_start[w][0][x] = blocked_windows;
-            }
-        }
-        for (int w = 1; w <= n; w++) {
-            for (int level = 1; level < LOG_N; level++) {
-                int half = 1 << (level - 1);
-                int length = 2 * half;
-                for (int x = 0; x + length <= n; x++) {
-                    invalid_start[w][level][x] =
-                        invalid_start[w][level - 1][x] |
-                        invalid_start[w][level - 1][x + half];
+    }
+
+    void ensure_width(int width) {
+        if (built_width[width]) return;
+
+        // bit yを「この行の幅width窓[y,y+width)が塞がる」にする。
+        // 幅k-1の結果へ右端1列だけ足せばよいので、照会幅ごとに
+        // offset=0..k-1をやり直さない。途中幅のlevel 0も後の照会へ再利用する。
+        for (int next_width = maximum_base_width + 1;
+             next_width <= width; next_width++) {
+            for (int x = 0; x < n; x++) {
+                if (next_width == 1) {
+                    invalid_start[next_width][0][x] = blocked_rows[x];
+                } else {
+                    invalid_start[next_width][0][x] =
+                        invalid_start[next_width - 1][0][x] |
+                        (blocked_rows[x] >> (next_width - 1));
                 }
             }
         }
+        maximum_base_width = max(maximum_base_width, width);
+        for (int level = 1; level < LOG_N; level++) {
+            int half = 1 << (level - 1);
+            int length = 2 * half;
+            for (int x = 0; x + length <= n; x++) {
+                invalid_start[width][level][x] =
+                    invalid_start[width][level - 1][x] |
+                    invalid_start[width][level - 1][x + half];
+            }
+        }
+        built_width[width] = true;
     }
 
-    uint64_t rectangle_invalid_base_y(const Rect &rect, int base_x) const {
+    uint64_t rectangle_invalid_base_y(const Rect &rect, int base_x) {
         if (rect.h == 0 || rect.w == 0) return 0;
+        ensure_width(rect.w);
         int level = 31 - __builtin_clz(rect.h);
         int length = 1 << level;
         int x = base_x + rect.x;
@@ -529,7 +564,7 @@ struct LegalAnchorIndex {
         return invalid >> rect.y;
     }
 
-    uint64_t legal_base_y_mask(const Shape &shape, int base_x) const {
+    uint64_t legal_base_y_mask(const Shape &shape, int base_x) {
         uint64_t invalid = rectangle_invalid_base_y(shape.main_rect, base_x) |
                            rectangle_invalid_base_y(shape.extra_rect, base_x);
         int base_y_count = n - shape.w + 1;
@@ -538,55 +573,51 @@ struct LegalAnchorIndex {
     }
 };
 
-// テンプレートが1つも置けない場合の完全なフォールバック。
-// 各空き連結成分をBFSし、先頭pセルを取る。BFSのprefixは常に連結なので、
-// pセル以上の空き連結成分が存在すれば必ず合法領域を返せる。
-optional<vector<Cell>> find_connected_region(const vs &park, const vvi &owner, int p) {
-    int n = park.size();
-    vvb visited(n, vb(n));
+bool same_region(const vector<Cell> &lhs, const vector<Cell> &rhs) {
+    if (lhs.size() != rhs.size()) return false;
+    if (lhs == rhs) return true;
 
-    for (int start_x = 0; start_x < n; start_x++) {
-        for (int start_y = 0; start_y < n; start_y++) {
-            if (park[start_x][start_y] == '#' || owner[start_x][start_y] != -1 || visited[start_x][start_y]) {
-                continue;
+    auto make_unique_mask = [](const vector<Cell> &cells,
+                               BoardMask &mask) {
+        for (auto [x, y] : cells) {
+            if (!inside(x, y, BOARD_SIDE_LIMIT, BOARD_SIDE_LIMIT)) {
+                return false;
             }
-
-            queue<Cell> que;
-            vector<Cell> region;
-            visited[start_x][start_y] = true;
-            que.emplace(start_x, start_y);
-
-            while (!que.empty()) {
-                auto [x, y] = que.front();
-                que.pop();
-                region.emplace_back(x, y);
-                if ((int)region.size() == p) return region;
-
-                for (int dir = 0; dir < 4; dir++) {
-                    int nx = x + ORTHOGONAL_DX[dir];
-                    int ny = y + ORTHOGONAL_DY[dir];
-                    if (!inside(nx, ny, n, n) || visited[nx][ny]) continue;
-                    if (park[nx][ny] == '#' || owner[nx][ny] != -1) continue;
-                    visited[nx][ny] = true;
-                    que.emplace(nx, ny);
-                }
-            }
+            int index = x * BOARD_SIDE_LIMIT + y;
+            uint64_t bit = 1ULL << (index & 63);
+            if (mask[index >> 6] & bit) return false;
+            mask[index >> 6] |= bit;
         }
+        return true;
+    };
+    BoardMask lhs_mask{}, rhs_mask{};
+    if (make_unique_mask(lhs, lhs_mask) &&
+        make_unique_mask(rhs, rhs_mask)) {
+        return lhs_mask == rhs_mask;
     }
-    return nullopt;
+
+    // 現行producerは全て盤内・重複なしだが、helper単体の従来multiset意味も保つ。
+    vector<Cell> sorted_lhs = lhs;
+    vector<Cell> sorted_rhs = rhs;
+    sort(sorted_lhs.begin(), sorted_lhs.end());
+    sort(sorted_rhs.begin(), sorted_rhs.end());
+    return sorted_lhs == sorted_rhs;
 }
 
-bool same_region(vector<Cell> lhs, vector<Cell> rhs) {
-    if (lhs.size() != rhs.size()) return false;
-    sort(lhs.begin(), lhs.end());
-    sort(rhs.begin(), rhs.end());
-    return lhs == rhs;
+BoardMask make_board_mask(const vector<Cell> &cells, int n) {
+    BoardMask mask{};
+    for (auto [x, y] : cells) {
+        int index = x * n + y;
+        mask[index >> 6] |= 1ULL << (index & 63);
+    }
+    return mask;
 }
 
 int calc_perimeter(const vector<Cell> &cells, int n) {
-    vector<char> in_region(n * n, false);
+    BoardMask in_region{};
     for (auto [x, y] : cells) {
-        in_region[x * n + y] = true;
+        int index = x * n + y;
+        in_region[index >> 6] |= 1ULL << (index & 63);
     }
 
     int perimeter = 0;
@@ -594,7 +625,9 @@ int calc_perimeter(const vector<Cell> &cells, int n) {
         for (int dir = 0; dir < 4; dir++) {
             int nx = x + ORTHOGONAL_DX[dir];
             int ny = y + ORTHOGONAL_DY[dir];
-            if (!inside(nx, ny, n, n) || !in_region[nx * n + ny]) {
+            int next = nx * n + ny;
+            if (!inside(nx, ny, n, n) ||
+                !(in_region[next >> 6] & (1ULL << (next & 63)))) {
                 perimeter++;
             }
         }
@@ -656,13 +689,13 @@ ll move_cost(ll v, int r_milli) {
     return max((ll)(numerator / 2000), 1LL);
 }
 
-void clear_cells(vvi &owner, const vector<Cell> &cells) {
+void clear_cells(OwnerGrid &owner, const vector<Cell> &cells) {
     for (auto [x, y] : cells) {
         owner[x][y] = -1;
     }
 }
 
-void place_cells(vvi &owner, const vector<Cell> &cells, int id) {
+void place_cells(OwnerGrid &owner, const vector<Cell> &cells, int id) {
     for (auto [x, y] : cells) {
         owner[x][y] = id;
     }
@@ -670,7 +703,7 @@ void place_cells(vvi &owner, const vector<Cell> &cells, int id) {
 
 // 行動確定後にだけ空き最大連結成分を測る診断関数。
 // 配置候補の生成には使わないため、診断対象のアルゴリズムへ影響しない。
-__attribute__((noinline)) int largest_free_component(const vs &park, const vvi &owner) {
+__attribute__((noinline)) int largest_free_component(const vs &park, const OwnerGrid &owner) {
     int n = park.size();
     vector<char> visited(n * n, false);
     int largest = 0;
@@ -1760,10 +1793,10 @@ bool validate_connected_region(const vector<Cell> &cells, int n);
 // 連結性を壊す関節点を避けながら境界セルを削る。
 // 削除後の周長変化が良いセルを優先し、pセルへ戻した領域を追加候補として返す。
 optional<vector<Cell>> trim_connected_region(
-    const vs &park, const vvi &owner, const vector<Cell> &grown, int p,
+    const vs &park, const OwnerGrid &owner, const vector<Cell> &grown, int p,
     long long &trimmed_cells,
-    const vector<vector<long double>> *primary_removal_cost = nullptr,
-    const vector<vector<long double>> *secondary_removal_cost = nullptr) {
+    const FixedGrid<long double> *primary_removal_cost = nullptr,
+    const FixedGrid<long double> *secondary_removal_cost = nullptr) {
     int n = park.size();
     vector<char> selected(n * n, false);
     vector<int> growth_order(n * n, -1);
@@ -1893,11 +1926,11 @@ optional<vector<Cell>> trim_connected_region(
 // 全anchorはfree集合の周長までbitsetで安価に採点し、Tarjan trimは上位16件だけに限定する。
 // ここでは候補を返すだけで、旧Acceptedの保護・料金増・future-fit非悪化は呼び出し側で確認する。
 vector<vector<Cell>> make_dense_box_trim_candidates(
-    const vs &park, const vvi &owner, int p, int minimum_perimeter,
-    int old_perimeter, const vector<vector<long double>> &incremental_cell,
-    const vector<vector<long double>> &absolute_cell,
-    const vector<vector<long double>> &incremental_prefix,
-    const vector<vector<long double>> &absolute_prefix,
+    const vs &park, const OwnerGrid &owner, int p, int minimum_perimeter,
+    int old_perimeter, const FixedGrid<long double> &incremental_cell,
+    const FixedGrid<long double> &absolute_cell,
+    const FixedGrid<long double> &incremental_prefix,
+    const FixedGrid<long double> &absolute_prefix,
     TemporalPlacementDiagnostics &diagnostics) {
     struct DenseBoxAnchor {
         int base_x = 0;
@@ -1928,7 +1961,7 @@ vector<vector<Cell>> make_dense_box_trim_candidates(
         min(old_perimeter - 2, minimum_perimeter + DENSE_BOX_PERIMETER_MARGIN);
     if (maximum_box_perimeter < minimum_perimeter) return {};
 
-    vector<vi> blocked_prefix = make_blocked_prefix(park, owner);
+    FixedGrid<int> blocked_prefix = make_blocked_prefix(park, owner);
     array<uint64_t, 50> free_rows{};
     for (int x = 0; x < n; x++) {
         for (int y = 0; y < n; y++) {
@@ -2117,7 +2150,7 @@ struct RegionSwapNeighborhood {
 };
 
 RegionSwapNeighborhood make_region_swap_neighborhood(
-    const vs &park, const vvi &owner, const vector<char> &selected) {
+    const vs &park, const OwnerGrid &owner, const vector<char> &selected) {
     int n = park.size();
     RegionSwapNeighborhood result;
     result.selected_neighbors.assign(n * n, 0);
@@ -2200,9 +2233,9 @@ vector<char> find_region_articulation(const vector<char> &selected, int n) {
 }
 
 optional<RegionSwap> find_best_strict_region_swap(
-    const vs &park, const vvi &owner, const vector<char> &selected,
-    const vector<vector<long double>> &incremental_cell,
-    const vector<vector<long double>> &absolute_cell,
+    const vs &park, const OwnerGrid &owner, const vector<char> &selected,
+    const FixedGrid<long double> &incremental_cell,
+    const FixedGrid<long double> &absolute_cell,
     bool *prefilter_rejected = nullptr,
     long long *remove_prefilter_rejections = nullptr) {
     if (prefilter_rejected) *prefilter_rejected = false;
@@ -2273,7 +2306,7 @@ vector<Cell> materialize_selected_region(const vector<char> &selected, int n) {
 
 // swap構築側でも合法frontierだけを加えるが、各実体化後に面積以外の
 // 池・占有・重複・盤外・4連結をまとめて再検証し、探索バグを局所化する。
-bool validate_free_connected_region(const vs &park, const vvi &owner,
+bool validate_free_connected_region(const vs &park, const OwnerGrid &owner,
                                     const vector<Cell> &cells) {
     int n = park.size();
     if (!validate_connected_region(cells, n)) return false;
@@ -2287,9 +2320,9 @@ bool validate_free_connected_region(const vs &park, const vvi &owner,
 // 非関節セルだけを外し、k_add_after>k_removeのときだけ反映する。
 // 終端形がfuture-fitで落ちても浅い改善を失わないよう全中間形を返す。
 vector<vector<Cell>> make_perimeter_descent_candidates(
-    const vs &park, const vvi &owner, const vector<Cell> &initial,
-    const vector<vector<long double>> &incremental_cell,
-    const vector<vector<long double>> &absolute_cell,
+    const vs &park, const OwnerGrid &owner, const vector<Cell> &initial,
+    const FixedGrid<long double> &incremental_cell,
+    const FixedGrid<long double> &absolute_cell,
     TemporalPlacementDiagnostics &diagnostics) {
     diagnostics.perimeter_descent_attempts++;
     bool small_group =
@@ -2334,11 +2367,11 @@ vector<vector<Cell>> make_perimeter_descent_candidates(
 }
 
 vector<vector<Cell>> make_connected_growth_candidates(
-    const vs &park, const vvi &owner, int p,
+    const vs &park, const OwnerGrid &owner, int p,
     vector<vector<Cell>> &grow_and_trim_candidates,
     TemporalPlacementDiagnostics &diagnostics) {
     // 処理順:
-    // 1. 空き連結成分を抽出する。
+    // 1. 空き連結成分を抽出し、最初のpセルprefixを完全fallbackとして残す。
     // 2. 障害物・盤面端からの距離を求める。
     // 3. 各成分の端・対角・障害物距離から最大16または24個のseedを選ぶ。
     // 4. 選択済み隣接数が多いセルを優先し、連結なままpセルへ成長させる。
@@ -2355,11 +2388,11 @@ vector<vector<Cell>> make_connected_growth_candidates(
         }
         candidates.push_back(std::move(*candidate));
     };
-    add_candidate(find_connected_region(park, owner, p));
-
-    // pセル以上を含む空き連結成分だけを候補にする。
+    // pセル以上を含む空き連結成分だけを候補にする。従来のfallback BFSと
+    // 同じ開始・近傍順で最初のpセルも保存し、盤面全体の二重BFSを避ける。
     vvb visited(n, vb(n));
     vector<vector<Cell>> components;
+    optional<vector<Cell>> fallback_candidate;
     for (int start_x = 0; start_x < n; start_x++) {
         for (int start_y = 0; start_y < n; start_y++) {
             if (visited[start_x][start_y] || park[start_x][start_y] == '#' || owner[start_x][start_y] != -1) {
@@ -2373,6 +2406,9 @@ vector<vector<Cell>> make_connected_growth_candidates(
                 auto [x, y] = que.front();
                 que.pop();
                 component.emplace_back(x, y);
+                if (!fallback_candidate && (int)component.size() == p) {
+                    fallback_candidate = component;
+                }
                 for (int dir = 0; dir < 4; dir++) {
                     int nx = x + ORTHOGONAL_DX[dir];
                     int ny = y + ORTHOGONAL_DY[dir];
@@ -2387,6 +2423,7 @@ vector<vector<Cell>> make_connected_growth_candidates(
             }
         }
     }
+    add_candidate(std::move(fallback_candidate));
     vi component_order(components.size());
     iota(component_order.begin(), component_order.end(), 0);
     sort(component_order.begin(), component_order.end(),
@@ -2637,9 +2674,9 @@ int placement_quadrant(const vector<Cell> &cells, int n) {
     return 2 * lower_half + right_half;
 }
 
-long double compact_fit_utility(const vs &park, const vvi &owner,
+long double compact_fit_utility(const vs &park, const OwnerGrid &owner,
                                 const vector<GroupState> &groups,
-                                const vector<char> &in_candidate,
+                                const BoardMask &in_candidate,
                                 ll snapshot_time) {
     // DPの各値は「そのセルを右下端とする最大空き正方形の一辺」。
     // 2,3,4,...,12四方を置ける位置数を数え、大きい正方形ほどside^2で重く評価する。
@@ -2647,19 +2684,24 @@ long double compact_fit_utility(const vs &park, const vvi &owner,
     int n = park.size();
     constexpr int MAX_SIDE = FUTURE_FIT_SIDES.back();
     array<int, MAX_SIDE + 2> histogram{};
-    vector<int> previous(n + 1), current(n + 1);
+    array<int, BOARD_SIDE_LIMIT + 1> first_row{};
+    array<int, BOARD_SIDE_LIMIT + 1> second_row{};
+    auto *previous = &first_row;
+    auto *current = &second_row;
 
     for (int x = 0; x < n; x++) {
-        fill(current.begin(), current.end(), 0);
+        fill(current->begin(), current->begin() + n + 1, 0);
         for (int y = 0; y < n; y++) {
             int cell = x * n + y;
             int occupied_by = owner[x][y];
             bool is_free = park[x][y] == '#'
                                ? false
-                               : !in_candidate[cell] && (occupied_by == -1 || groups[occupied_by].t < snapshot_time);
+                               : !(in_candidate[cell >> 6] & (1ULL << (cell & 63))) &&
+                                     (occupied_by == -1 || groups[occupied_by].t < snapshot_time);
             if (!is_free) continue;
-            current[y + 1] = 1 + min({previous[y + 1], current[y], previous[y]});
-            histogram[min(current[y + 1], MAX_SIDE)]++;
+            (*current)[y + 1] =
+                1 + min({(*previous)[y + 1], (*current)[y], (*previous)[y]});
+            histogram[min((*current)[y + 1], MAX_SIDE)]++;
         }
         swap(previous, current);
     }
@@ -2670,9 +2712,18 @@ long double compact_fit_utility(const vs &park, const vvi &owner,
     }
     long double weighted_utility = 0.0L;
     long double weight_sum = 0.0L;
+    // 同じ配置可能数は多数の候補・snapshotで繰り返す。実際に現れた正の値だけを
+    // 初回にlog1pし、未使用の0..2500全域を先に計算する初回turnのスパイクを避ける。
+    static array<long double,
+                 BOARD_SIDE_LIMIT * BOARD_SIDE_LIMIT + 1>
+        log1p_count{};
     for (int side : FUTURE_FIT_SIDES) {
         long double weight = (long double)side * side;
-        weighted_utility += weight * log1pl((long double)at_least[side]);
+        int count = at_least[side];
+        if (count > 0 && log1p_count[count] == 0.0L) {
+            log1p_count[count] = log1pl((long double)count);
+        }
+        weighted_utility += weight * log1p_count[count];
         weight_sum += weight;
     }
     return weighted_utility / weight_sum;
@@ -2703,12 +2754,11 @@ array<ll, FUTURE_FIT_SNAPSHOT_COUNT> make_future_fit_snapshots(const Conditional
 }
 
 long double evaluate_compact_fit(
-    const vs &park, const vvi &owner, const vector<GroupState> &groups,
+    const vs &park, const OwnerGrid &owner, const vector<GroupState> &groups,
     const vector<Cell> &candidate,
     const array<ll, FUTURE_FIT_SNAPSHOT_COUNT> &snapshots) {
     int n = park.size();
-    vector<char> in_candidate(n * n, false);
-    for (auto [x, y] : candidate) in_candidate[x * n + y] = true;
+    BoardMask in_candidate = make_board_mask(candidate, n);
 
     long double sum = 0.0L;
     long double minimum = numeric_limits<long double>::infinity();
@@ -2727,7 +2777,7 @@ long double evaluate_compact_fit(
     return (1.0L - minimum_weight) * average + minimum_weight * minimum;
 }
 
-optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park, const vvi &owner,
+optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park, const OwnerGrid &owner,
                                                                   const vector<GroupState> &groups, ll current_s,
                                                                   ll arrival_t, int p, ll arrival_v,
                                                                   long double opportunity_cost, long double theta,
@@ -2760,8 +2810,8 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
 
     // incremental_cellは候補追加による境界コストの増分、absolute_cellは
     // 配置後に残る境界の不整合そのものを表す。後者もshortlistへ1件必ず残す。
-    vector<vector<long double>> incremental_cell(n, vector<long double>(n));
-    vector<vector<long double>> absolute_cell(n, vector<long double>(n));
+    FixedGrid<long double> incremental_cell{};
+    FixedGrid<long double> absolute_cell{};
     for (int x = 0; x < n; x++) {
         for (int y = 0; y < n; y++) {
             if (park[x][y] != '.' || owner[x][y] != -1) continue;
@@ -2787,8 +2837,8 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
         }
     }
 
-    auto make_prefix = [&](const vector<vector<long double>> &values) {
-        vector<vector<long double>> prefix(n + 1, vector<long double>(n + 1));
+    auto make_prefix = [&](const FixedGrid<long double> &values) {
+        FixedGrid<long double> prefix{};
         for (int x = 0; x < n; x++) {
             for (int y = 0; y < n; y++) {
                 prefix[x + 1][y + 1] = values[x][y] + prefix[x][y + 1] + prefix[x + 1][y] - prefix[x][y];
@@ -2796,8 +2846,8 @@ optional<NormalPlacementChoice> choose_temporally_coherent_region(const vs &park
         }
         return prefix;
     };
-    vector<vector<long double>> incremental_prefix = make_prefix(incremental_cell);
-    vector<vector<long double>> absolute_prefix = make_prefix(absolute_cell);
+    FixedGrid<long double> incremental_prefix = make_prefix(incremental_cell);
+    FixedGrid<long double> absolute_prefix = make_prefix(absolute_cell);
 
     PlacementShortlistBuilder shortlist_builder;
     long long enumeration_order = 0;
@@ -3368,7 +3418,7 @@ const NormalPlacementChoice *connected_polish_rollback(
 // 2. 連結なpセルを作れなければNoRegion。
 // 3. 実際に選んだ周長での料金<=機会損失なら拒否。
 // 3段階を全て通過した場合だけAcceptedとする。
-ArrivalDecision evaluate_arrival_decision(const vs &park, const vvi &decision_owner,
+ArrivalDecision evaluate_arrival_decision(const vs &park, const OwnerGrid &decision_owner,
                                           const vector<GroupState> &groups, int arrival_id, ll current_s,
                                           int remaining_groups, long double theta, long double opportunity_cost,
                                           const vector<vector<Shape>> &compact_shapes,
@@ -3683,19 +3733,7 @@ __attribute__((noinline)) void finalize_loss_diagnostics(
     }
 }
 
-// 再配置探索中の領域を最大50×50bitで表す。重複判定をword単位で行える。
-using BoardMask = array<uint64_t, BOARD_MASK_WORDS>;
-
-BoardMask make_board_mask(const vector<Cell> &cells, int n) {
-    BoardMask mask{};
-    for (auto [x, y] : cells) {
-        int index = x * n + y;
-        mask[index >> 6] |= 1ULL << (index & 63);
-    }
-    return mask;
-}
-
-BoardMask make_occupied_mask(const vvi &owner) {
+BoardMask make_occupied_mask(const OwnerGrid &owner) {
     int n = owner.size();
     BoardMask mask{};
     for (int x = 0; x < n; x++) {
@@ -3719,8 +3757,8 @@ void merge_mask(BoardMask &destination, const BoardMask &source) {
     for (int word = 0; word < BOARD_MASK_WORDS; word++) destination[word] |= source[word];
 }
 
-vector<vi> make_flag_prefix(const vector<char> &flag, int n) {
-    vector<vi> prefix(n + 1, vi(n + 1));
+FixedGrid<int> make_flag_prefix(const vector<char> &flag, int n) {
+    FixedGrid<int> prefix{};
     for (int x = 0; x < n; x++) {
         for (int y = 0; y < n; y++) {
             prefix[x + 1][y + 1] =
@@ -3991,10 +4029,11 @@ struct RescueTarget {
     long long order = 0;
 };
 
-vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
+vector<RescueTarget> make_rescue_targets(const vs &park, const OwnerGrid &owner,
                                          const vector<GroupState> &groups, int arrival_id, int r_milli,
                                          ll baseline_score, long double direct_gain_threshold,
                                          bool no_region_pushout, int shortlist_per_metric,
+                                         LegalAnchorIndex &pond_anchor_index,
                                          const vector<vector<Shape>> &compact_shapes,
                                          RescueDiagnostics &diagnostics) {
     // 全最小周長アンカーの池合法性を行bit maskでまとめて判定し、
@@ -4007,8 +4046,8 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
     int minimum_perimeter = shapes.front().perimeter;
     ll compact_fee = round_payment(arrival.v, arrival.p, minimum_perimeter);
 
-    vector<vi> occupied_prefix(n + 1, vi(n + 1));
-    vector<vector<long double>> fractional_prefix(n + 1, vector<long double>(n + 1));
+    FixedGrid<int> occupied_prefix{};
+    FixedGrid<long double> fractional_prefix{};
     for (int x = 0; x < n; x++) {
         for (int y = 0; y < n; y++) {
             int id = owner[x][y];
@@ -4021,8 +4060,6 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
                 fractional_prefix[x][y];
         }
     }
-    LegalAnchorIndex pond_anchor_index(park, nullptr);
-
     auto occupied_better = [](const RescueTargetSeed &lhs, const RescueTargetSeed &rhs) {
         return tie(lhs.occupied_cells, lhs.fractional_move_cost, lhs.order) <
                tie(rhs.occupied_cells, rhs.fractional_move_cost, rhs.order);
@@ -4152,6 +4189,7 @@ vector<RescueTarget> make_rescue_targets(const vs &park, const vvi &owner,
 struct RescueDestination {
     vector<Cell> cells;
     BoardMask mask{};
+    uint64_t region_hash = 0;
     int perimeter = 0;
     int fallback_overlap = 0;
     int cleared_overlap = 0;
@@ -4164,7 +4202,7 @@ struct RescueDestination {
 // 退去時刻が近い組を隣接させると同時期に大きな空きが生まれやすいため、この値を小さくする。
 // cell_maskで候補内部の辺は除き、空きセルの残存確率は0として扱う。
 long double rescue_destination_temporal_cost(const vector<Cell> &cells, const BoardMask &cell_mask,
-                                             const vs &park, const vvi &base_owner,
+                                             const vs &park, const OwnerGrid &base_owner,
                                              const vector<GroupState> &groups, int mover_id,
                                              ll current_s, long double theta) {
     int n = park.size();
@@ -4190,8 +4228,9 @@ long double rescue_destination_temporal_cost(const vector<Cell> &cells, const Bo
 }
 
 vector<RescueDestination> make_rescue_destinations(
-    const vs &park, const vvi &base_owner, const vector<GroupState> &groups, int mover_id, int arrival_id,
-    ll current_s, long double theta, const vector<Cell> &baseline_cells, const vector<char> &cleared_mask,
+    const vs &park, const OwnerGrid &base_owner, const vector<GroupState> &groups, int mover_id, int arrival_id,
+    ll current_s, long double theta, const FixedGrid<int> &blocked_prefix,
+    const FixedGrid<int> &fallback_prefix, const FixedGrid<int> &cleared_prefix,
     const vector<vector<Shape>> &all_shapes, int &remaining_destination_anchors,
     int anchor_limit, int legal_limit, int destination_limit,
     RescueDiagnostics &diagnostics) {
@@ -4200,13 +4239,10 @@ vector<RescueDestination> make_rescue_destinations(
     // 到着組の通常配置との重なり、今回空ける領域の再利用、退去時刻境界で順位付けする。
     int n = park.size();
     const GroupState &group = groups[mover_id];
-    vector<vi> blocked_prefix = make_blocked_prefix(park, base_owner);
-    vector<char> fallback_mask(n * n, false);
-    for (auto [x, y] : baseline_cells) fallback_mask[x * n + y] = true;
-    vector<vi> fallback_prefix = make_flag_prefix(fallback_mask, n);
-    vector<vi> cleared_prefix = make_flag_prefix(cleared_mask, n);
 
     const vector<Shape> &shapes = all_shapes[group.p];
+    uint64_t group_region_hash = placement_region_hash(group.cells);
+    BoardMask group_mask = make_board_mask(group.cells, n);
     ll previous_fee = round_payment(group.v, group.p, group.max_perimeter);
     vector<int> eligible_shapes;
     for (int shape_index = 0; shape_index < (int)shapes.size(); shape_index++) {
@@ -4233,6 +4269,7 @@ vector<RescueDestination> make_rescue_destinations(
     }
 
     vector<RescueDestination> legal;
+    legal.reserve(legal_limit);
     long long local_order = 0;
     int sampled_anchors = 0;
     while (remaining_destination_anchors > 0 && sampled_anchors < anchor_limit &&
@@ -4263,11 +4300,12 @@ vector<RescueDestination> make_rescue_destinations(
             }
 
             vector<Cell> cells = materialize_shape(shape, base_x, base_y);
-            if (same_region(cells, group.cells)) continue;
             uint64_t hash = placement_region_hash(cells);
+            BoardMask mask = make_board_mask(cells, n);
+            if (hash == group_region_hash && mask == group_mask) continue;
             bool duplicate = false;
             for (const RescueDestination &existing : legal) {
-                if (placement_region_hash(existing.cells) == hash && same_region(existing.cells, cells)) {
+                if (existing.region_hash == hash && existing.mask == mask) {
                     duplicate = true;
                     break;
                 }
@@ -4280,10 +4318,9 @@ vector<RescueDestination> make_rescue_destinations(
                                   rectangle_sum(cleared_prefix, base_x + b.x, base_y + b.y, b.h, b.w);
             int lower_half = 2 * base_x + shape.h >= n;
             int right_half = 2 * base_y + shape.w >= n;
-            BoardMask mask = make_board_mask(cells, n);
             long double temporal_cost = rescue_destination_temporal_cost(
                 cells, mask, park, base_owner, groups, mover_id, current_s, theta);
-            legal.push_back({std::move(cells), mask, shape.perimeter, fallback_overlap, cleared_overlap,
+            legal.push_back({std::move(cells), mask, hash, shape.perimeter, fallback_overlap, cleared_overlap,
                              2 * lower_half + right_half, temporal_cost, local_order++});
             diagnostics.destination_candidates++;
         }
@@ -4300,9 +4337,13 @@ vector<RescueDestination> make_rescue_destinations(
     sort(legal.begin(), legal.end(), better);
 
     vector<RescueDestination> result;
+    result.reserve(destination_limit);
     auto add = [&](const RescueDestination &candidate) {
         for (const RescueDestination &existing : result) {
-            if (same_region(existing.cells, candidate.cells)) return;
+            if (existing.region_hash == candidate.region_hash &&
+                existing.mask == candidate.mask) {
+                return;
+            }
         }
         result.push_back(candidate);
     };
@@ -4329,7 +4370,7 @@ struct RescueBeamState {
     long long order = 0;
 };
 
-optional<vector<int>> repair_rescue_blockers(const vvi &base_owner, const vector<GroupState> &groups,
+optional<vector<int>> repair_rescue_blockers(const OwnerGrid &base_owner, const vector<GroupState> &groups,
                                              const vector<int> &blockers,
                                              const vector<vector<RescueDestination>> &pools,
                                              int &remaining_nodes, RescueDiagnostics &diagnostics) {
@@ -4447,13 +4488,13 @@ optional<vector<int>> repair_rescue_blockers(const vvi &base_owner, const vector
 // rescue探索が作った計画を、探索時の近似値に依存せず最初から検証する。
 // 移動元を全て消してから、各移動先と到着領域について面積・連結性・池・重複・周長を確認し、
 // 既存組の料金損と実際の移動費も再計算する。ここを通った計画だけをrollout候補にする。
-bool validate_and_build_rescue_owner(const TurnPlan &plan, const vs &park, const vvi &owner,
+// final_ownerは呼び出し元で実ownerから直接copy構築し、不要な既定値fillを挟まない。
+bool validate_and_build_rescue_owner(const TurnPlan &plan, const vs &park,
                                      const vector<GroupState> &groups, int arrival_id, int r_milli,
-                                     vvi &final_owner, ll &fee_loss, ll &movement_cost_sum) {
+                                     OwnerGrid &final_owner, ll &fee_loss, ll &movement_cost_sum) {
     if (plan.moves.empty() || !plan.arrival || groups[arrival_id].active) return false;
     int n = park.size();
     vector<char> moved(groups.size(), false);
-    final_owner = owner;
     for (const MovePlan &move : plan.moves) {
         if (move.id < 0 || move.id >= (int)groups.size() || moved[move.id] || !groups[move.id].active) {
             return false;
@@ -4562,30 +4603,65 @@ RescueRolloutScenarios make_rescue_rollout_scenarios(
 
     uint64_t sequence_offset = rescue_sequence_offset(groups, arrival_id, current_s);
     const long double size_width = sqrtl(150.0L) - 2.0L;
+    constexpr int TIME_MASK_WORDS =
+        (ARRIVAL_TIME_HORIZON + 1 + 63) / 64;
+    array<uint64_t, TIME_MASK_WORDS> observed_time_mask{};
+    for (int id = 0; id <= arrival_id; id++) {
+        for (ll time : {groups[id].s, groups[id].t}) {
+            observed_time_mask[time >> 6] |= 1ULL << (time & 63);
+        }
+    }
+
+    // 反対変数の2シナリオは同じ潜在thetaを使うため、pairごとに一度だけ求める。
+    vector<long double> generation_theta_by_pair(scenario_count / 2, theta);
+    if (posterior_predictive) {
+        for (int pair_index = 0; pair_index < scenario_count / 2; pair_index++) {
+            long double pair_quantile =
+                (2.0L * pair_index + 1.0L) / scenario_count;
+            generation_theta_by_pair[pair_index] =
+                theta_estimator.posterior_quantile(
+                    current_s, remaining_groups, pair_quantile);
+        }
+    }
 
     for (int scenario = 0; scenario < scenario_count; scenario++) {
         int pair_index = scenario / 2;
         bool antithetic = scenario % 2 == 1;
         // ここで選ぶ潜在thetaは未来入力の生成だけに使う。
         // 仮想オンライン方策が見るthetaは、生成した到着を1件ずつ観測した体で下で再推定する。
-        long double generation_theta = theta;
-        if (posterior_predictive) {
-            long double pair_quantile = (2.0L * pair_index + 1.0L) / scenario_count;
-            generation_theta =
-                theta_estimator.posterior_quantile(current_s, remaining_groups, pair_quantile);
-        }
+        long double generation_theta = generation_theta_by_pair[pair_index];
         ConditionalFutureDemand future_demand(current_s, generation_theta);
+
+        // 同じscenario内では試行が変わっても未来分布と開始可能時刻数は不変である。
+        // 48点の重みと丸め後滞在時間を一度だけ作り、全attemptで再利用する。
+        long double total_weight = 0.0L;
+        array<long double, THETA_QUADRATURE_STEPS> node_weight{};
+        array<ll, THETA_QUADRATURE_STEPS> node_duration{};
+        for (int node_index = 0; node_index < THETA_QUADRATURE_STEPS;
+             node_index++) {
+            const auto &node = future_demand.nodes[node_index];
+            ll duration =
+                max(1LL, (ll)llroundl(node.stay_duration - 1.0L) + 1);
+            ll maximum_start = ARRIVAL_TIME_HORIZON - duration;
+            long double available_starts =
+                max(0LL, maximum_start - current_s);
+            node_duration[node_index] = duration;
+            node_weight[node_index] = node.joint_weight * available_starts;
+            total_weight += node_weight[node_index];
+        }
         // screenの第1ペアはsequence block 0を使う。
         // confirmationはbatch 1の互いに素な4区間を、反対変数の各組へ1区間ずつ割り当てる。
         uint64_t sequence_block =
             (uint64_t)batch * ROOT_ROLLOUT_SEQUENCE_BLOCKS_PER_BATCH + pair_index;
         uint64_t sequence_block_offset = sequence_block * ROOT_ROLLOUT_SEQUENCE_BLOCK_SIZE;
 
-        set<ll> used_times;
-        for (int id = 0; id <= arrival_id; id++) {
-            used_times.insert(groups[id].s);
-            used_times.insert(groups[id].t);
-        }
+        auto used_time_mask = observed_time_mask;
+        auto time_is_used = [&](ll time) {
+            return (used_time_mask[time >> 6] >> (time & 63)) & 1ULL;
+        };
+        auto mark_time_used = [&](ll time) {
+            used_time_mask[time >> 6] |= 1ULL << (time & 63);
+        };
 
         vector<RawArrival> generated;
         generated.reserve(remaining_groups);
@@ -4601,16 +4677,6 @@ RescueRolloutScenarios make_rescue_rollout_scenarios(
             long double size_quantile = quantile(5);
             long double value_quantile = quantile(7);
 
-            long double total_weight = 0.0L;
-            array<long double, THETA_QUADRATURE_STEPS> node_weight{};
-            for (int node_index = 0; node_index < THETA_QUADRATURE_STEPS; node_index++) {
-                const auto &node = future_demand.nodes[node_index];
-                ll duration = max(1LL, (ll)llroundl(node.stay_duration - 1.0L) + 1);
-                ll maximum_start = ARRIVAL_TIME_HORIZON - duration;
-                long double available_starts = max(0LL, maximum_start - current_s);
-                node_weight[node_index] = node.joint_weight * available_starts;
-                total_weight += node_weight[node_index];
-            }
             if (total_weight <= 0.0L) continue;
 
             long double target = duration_quantile * total_weight;
@@ -4623,7 +4689,7 @@ RescueRolloutScenarios make_rescue_rollout_scenarios(
                     break;
                 }
             }
-            ll duration = max(1LL, (ll)llroundl(future_demand.nodes[chosen_node].stay_duration - 1.0L) + 1);
+            ll duration = node_duration[chosen_node];
             ll maximum_start = ARRIVAL_TIME_HORIZON - duration;
             ll start_count = maximum_start - current_s;
             if (start_count <= 0) continue;
@@ -4635,9 +4701,9 @@ RescueRolloutScenarios make_rescue_rollout_scenarios(
             long double noise = 0.8L * inverse_standard_normal(value_quantile);
             long double raw_v = p * powl((long double)duration, 0.9L) * exp2l(noise);
             ll v = clamp((ll)llroundl(raw_v), 1LL, 100000000LL);
-            if (used_times.count(start) || used_times.count(end)) continue;
-            used_times.insert(start);
-            used_times.insert(end);
+            if (time_is_used(start) || time_is_used(end)) continue;
+            mark_time_used(start);
+            mark_time_used(end);
             generated.push_back({start, end, p, v, attempt});
         }
         // 必要なのは「残り全組を開始時刻で並べた先頭」である。
@@ -4648,14 +4714,20 @@ RescueRolloutScenarios make_rescue_rollout_scenarios(
             return result;
         }
 
-        sort(generated.begin(), generated.end(), [](const RawArrival &lhs, const RawArrival &rhs) {
+        auto arrival_less = [](const RawArrival &lhs, const RawArrival &rhs) {
             if (lhs.s != rhs.s) return lhs.s < rhs.s;
             if (lhs.t != rhs.t) return lhs.t < rhs.t;
             return lhs.order < rhs.order;
-        });
+        };
+        int rollout_length = min(rollout_horizon, remaining_groups);
+        if (rollout_length < (int)generated.size()) {
+            nth_element(generated.begin(), generated.begin() + rollout_length,
+                        generated.end(), arrival_less);
+            generated.resize(rollout_length);
+        }
+        sort(generated.begin(), generated.end(), arrival_less);
 
         ThetaEstimator rollout_theta_estimator = theta_estimator;
-        int rollout_length = min(rollout_horizon, remaining_groups);
         for (const RawArrival &raw : generated) {
             int remaining_after = remaining_groups - (int)result.arrivals[scenario].size() - 1;
             rollout_theta_estimator.observe(raw.t - raw.s);
@@ -4669,16 +4741,15 @@ RescueRolloutScenarios make_rescue_rollout_scenarios(
 
 // 1つのroot actionを適用した直後から始まる、仮想未来専用の盤面状態。
 struct RescueRolloutState {
-    vvi owner;
+    OwnerGrid owner;
     vector<GroupState> groups;
     priority_queue<pair<ll, int>, vector<pair<ll, int>>, greater<pair<ll, int>>> departures;
 };
 
-RescueRolloutState make_rescue_rollout_state(const vvi &final_owner, const vector<GroupState> &groups,
+RescueRolloutState make_rescue_rollout_state(const OwnerGrid &final_owner, const vector<GroupState> &groups,
                                              int arrival_id, const TurnPlan &plan, int synthetic_count) {
-    RescueRolloutState state;
-    state.owner = final_owner;
-    state.groups = groups;
+    // owner/groupsを直接copy構築し、既定値で埋めた直後の全上書きを避ける。
+    RescueRolloutState state{final_owner, groups, {}};
     state.groups.reserve(state.groups.size() + synthetic_count);
     for (const MovePlan &move : plan.moves) {
         GroupState &moved = state.groups[move.id];
@@ -4705,7 +4776,7 @@ struct RescueRolloutOutcome {
 // 1本の仮想到着列を、指定されたroot action後の盤面から通常方策だけで進める。
 // 未来ターンでは再配置探索を再帰的に呼ばず、受け入れた組の料金合計だけをbranch間で比較する。
 RescueRolloutOutcome evaluate_rescue_rollout_branch(
-    const vs &park, const vvi &final_owner, const vector<GroupState> &groups, int arrival_id,
+    const vs &park, const OwnerGrid &final_owner, const vector<GroupState> &groups, int arrival_id,
     const TurnPlan &plan, const vector<RescueSyntheticArrival> &scenario, int grass_cells,
     const DensityModel &density_model, SampledDlpShadowModel &sampled_dlp_model,
     const vector<vector<Shape>> &compact_shapes) {
@@ -4761,7 +4832,7 @@ RescueRolloutOutcome evaluate_rescue_rollout_branch(
 // direct_vs_baselineには現在ターンだけのbaseline比を入れる。
 struct RootBranchView {
     const TurnPlan *plan = nullptr;
-    const vvi *final_owner = nullptr;
+    const OwnerGrid *final_owner = nullptr;
     ll direct_vs_baseline = 0;
 };
 
@@ -4871,7 +4942,7 @@ enum class RescueMode {
 // 合法性を再検証済みのrescue案。direct_gainは通常案との差で、未来価値はまだ含まない。
 struct PreparedRescueCandidate {
     TurnPlan plan;
-    vvi final_owner;
+    OwnerGrid final_owner;
     vector<int> blockers;
     ll compact_fee = 0;
     ll direct_gain = 0;
@@ -4886,12 +4957,13 @@ struct PreparedRescueCandidate {
 // 5. baselineとrescueだけのscreen勝者を通常配置次点が上回った場合だけ、独立holdoutで再確認する。
 // 採用できる案がなければnulloptを返し、呼び出し元は通常案をそのまま使う。
 optional<RootActionResult> choose_root_action_with_rescue(
-    const vs &park, const vvi &owner, const vector<GroupState> &groups, int arrival_id, ll current_s,
+    const vs &park, const OwnerGrid &owner, const vector<GroupState> &groups, int arrival_id, ll current_s,
     int remaining_groups, int r_milli, long double theta, const ThetaEstimator &theta_estimator,
     const DensityModel &density_model, SampledDlpShadowModel &sampled_dlp_model,
     int grass_cells, long double opportunity_cost,
     const ArrivalDecision &baseline,
     const vector<NormalPlacementChoice> &normal_alternatives,
+    LegalAnchorIndex &pond_anchor_index,
     const vector<vector<Shape>> &compact_shapes, const vector<vector<Shape>> &all_shapes,
     int &confirmations_used, bool &root_screen_evaluated, RescueDiagnostics &diagnostics) {
     root_screen_evaluated = false;
@@ -4961,7 +5033,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
         park, owner, groups, arrival_id, r_milli, baseline_score, direct_gain_threshold,
         no_region_pushout,
         no_region_pushout ? PUSHOUT_TARGET_SHORTLIST_PER_METRIC : RESCUE_TARGET_SHORTLIST_PER_METRIC,
-        compact_shapes, diagnostics);
+        pond_anchor_index, compact_shapes, diagnostics);
     if (targets.empty()) {
         diagnostics.no_economic_target++;
         if (no_region_pushout) diagnostics.pushout_no_economic_target++;
@@ -4990,6 +5062,12 @@ optional<RootActionResult> choose_root_action_with_rescue(
         mode == RescueMode::NoRegionPushOut
             ? preexisting_free_cells
             : (polish_rollback ? polish_rollback->cells : *baseline.cells);
+    vector<char> preferred_destination_mask(park.size() * park.size(), false);
+    for (auto [x, y] : preferred_destination_cells) {
+        preferred_destination_mask[x * park.size() + y] = true;
+    }
+    FixedGrid<int> fallback_prefix =
+        make_flag_prefix(preferred_destination_mask, park.size());
 
     // shortlist順に目標領域を修復する。探索予算か候補2案のどちらかを使い切れば止める。
     for (const RescueTarget &target : targets) {
@@ -5002,7 +5080,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
         chmax(diagnostics.maximum_blockers, (int)target.blockers.size());
 
         // 到着領域に衝突するblockerを全て一時撤去し、到着組を先に固定した盤面を作る。
-        vvi base_owner = owner;
+        OwnerGrid base_owner = owner;
         vector<char> cleared_mask(park.size() * park.size(), false);
         for (int id : target.blockers) {
             for (auto [x, y] : groups[id].cells) cleared_mask[x * park.size() + y] = true;
@@ -5021,6 +5099,11 @@ optional<RootActionResult> choose_root_action_with_rescue(
             continue;
         }
 
+        // 同じtargetの全blockerは同一の固定盤面・優先領域・撤去領域を見る。
+        // 3枚の累積和をblockerごとに作り直さず、このtarget内で共有する。
+        FixedGrid<int> blocked_prefix = make_blocked_prefix(park, base_owner);
+        FixedGrid<int> cleared_prefix = make_flag_prefix(cleared_mask, park.size());
+
         // blockerごとの移動先候補poolを作り、その直積から重ならない組合せを探す。
         vector<vector<RescueDestination>> pools;
         pools.reserve(target.blockers.size());
@@ -5028,7 +5111,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
         for (int id : target.blockers) {
             vector<RescueDestination> pool = make_rescue_destinations(
                 park, base_owner, groups, id, arrival_id, current_s, theta,
-                preferred_destination_cells, cleared_mask,
+                blocked_prefix, fallback_prefix, cleared_prefix,
                 all_shapes, remaining_destination_anchors, destination_anchor_limit,
                 destination_legal_limit, destination_limit, diagnostics);
             if (pool.empty()) {
@@ -5054,10 +5137,10 @@ optional<RootActionResult> choose_root_action_with_rescue(
         plan.immediate_gain = compact_fee - target.movement_cost;
 
         // 探索中の差分更新を信用せず、完成計画を元盤面から再構築して検算する。
-        vvi final_owner;
+        OwnerGrid final_owner = owner;
         ll fee_loss = 0;
         ll checked_movement_cost = 0;
-        if (!validate_and_build_rescue_owner(plan, park, owner, groups, arrival_id, r_milli, final_owner,
+        if (!validate_and_build_rescue_owner(plan, park, groups, arrival_id, r_milli, final_owner,
                                              fee_loss, checked_movement_cost) ||
             fee_loss != 0 || checked_movement_cost != target.movement_cost ||
             plan.immediate_gain - baseline_score <= 0) {
@@ -5164,7 +5247,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
         }
 
         // 全行動を同じ2本の未来で評価するため、まず通常案の未来料金を基準値として計算する。
-        vvi baseline_final_owner = owner;
+        OwnerGrid baseline_final_owner = owner;
         if (baseline.cells) place_cells(baseline_final_owner, *baseline.cells, arrival_id);
         TurnPlan baseline_plan = make_arrival_plan(baseline);
         array<RescueRolloutOutcome, RESCUE_ROLLOUT_SCENARIO_COUNT> baseline_outcomes;
@@ -5276,7 +5359,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
 
         vector<TurnPlan> alternative_plans;
         vector<ArrivalDecision> alternative_decisions;
-        vector<vvi> alternative_owners;
+        vector<OwnerGrid> alternative_owners;
         alternative_plans.reserve(available_alternatives.size());
         alternative_decisions.reserve(available_alternatives.size());
         alternative_owners.reserve(available_alternatives.size());
@@ -5289,7 +5372,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
                 alternative_decision.fee = round_payment(arrival.v, arrival.p, choice.perimeter);
                 replace_selected_placement_success(alternative_decision.diagnostics, choice.source);
                 TurnPlan alternative_plan = make_arrival_plan(alternative_decision);
-                vvi alternative_owner = owner;
+                OwnerGrid alternative_owner = owner;
                 place_cells(alternative_owner, *alternative_decision.cells, arrival_id);
 
                 CandidateRolloutEvaluation alternative_evaluation;
@@ -5436,7 +5519,7 @@ optional<RootActionResult> choose_root_action_with_rescue(
 // 高価なので、呼び出し側が「各進行度区間で最大1回」に絞ったターンだけ実行する。
 // 2シナリオscreenで勝った後、独立holdoutでも勝った場合にだけ次点案を返す。
 optional<RootActionResult> choose_normal_root_action(
-    const vs &park, const vvi &owner, const vector<GroupState> &groups, int arrival_id,
+    const vs &park, const OwnerGrid &owner, const vector<GroupState> &groups, int arrival_id,
     ll current_s, int remaining_groups, long double theta, const ThetaEstimator &theta_estimator,
     const DensityModel &density_model, SampledDlpShadowModel &sampled_dlp_model,
     int grass_cells, const ArrivalDecision &baseline,
@@ -5482,7 +5565,7 @@ optional<RootActionResult> choose_normal_root_action(
     diagnostics.normal_root_turns_by_action_count[action_count]++;
 
     // baselineの未来料金を先に計算し、全次点案で同じ基準・同じシナリオを共有する。
-    vvi baseline_owner = owner;
+    OwnerGrid baseline_owner = owner;
     place_cells(baseline_owner, *baseline.cells, arrival_id);
     TurnPlan baseline_plan = make_arrival_plan(baseline);
     array<RescueRolloutOutcome, ROOT_SCREEN_SCENARIO_COUNT> baseline_outcomes;
@@ -5500,7 +5583,7 @@ optional<RootActionResult> choose_normal_root_action(
     };
     vector<TurnPlan> alternative_plans;
     vector<ArrivalDecision> alternative_decisions;
-    vector<vvi> alternative_owners;
+    vector<OwnerGrid> alternative_owners;
     alternative_plans.reserve(available_alternatives.size());
     alternative_decisions.reserve(available_alternatives.size());
     alternative_owners.reserve(available_alternatives.size());
@@ -5517,7 +5600,7 @@ optional<RootActionResult> choose_normal_root_action(
         decision.fee = round_payment(arrival.v, arrival.p, choice.perimeter);
         replace_selected_placement_success(decision.diagnostics, choice.source);
         TurnPlan plan = make_arrival_plan(decision);
-        vvi final_owner = owner;
+        OwnerGrid final_owner = owner;
         place_cells(final_owner, *decision.cells, arrival_id);
 
         NormalEvaluation evaluation;
@@ -5576,30 +5659,36 @@ optional<RootActionResult> choose_normal_root_action(
 // セルの重複・盤外を拒否し、4近傍BFSで全セルへ到達できるかを厳密に確認する。
 bool validate_connected_region(const vector<Cell> &cells, int n) {
     if (cells.empty()) return false;
-    vector<char> in_region(n * n, false);
+    BoardMask remaining{};
     for (auto [x, y] : cells) {
         if (!inside(x, y, n, n)) return false;
         int cell = x * n + y;
-        if (in_region[cell]) return false;
-        in_region[cell] = true;
+        uint64_t bit = 1ULL << (cell & 63);
+        if (remaining[cell >> 6] & bit) return false;
+        remaining[cell >> 6] |= bit;
     }
-    vector<char> visited(n * n, false);
-    queue<Cell> que;
-    que.push(cells.front());
-    visited[cells.front().first * n + cells.front().second] = true;
+    // tailへ書いた要素だけをheadから読むため、2500要素のzero fillは不要。
+    array<int, BOARD_SIDE_LIMIT * BOARD_SIDE_LIMIT> queue;
+    int head = 0;
+    int tail = 0;
+    int first = cells.front().first * n + cells.front().second;
+    remaining[first >> 6] &= ~(1ULL << (first & 63));
+    queue[tail++] = first;
     int reached = 0;
-    while (!que.empty()) {
-        auto [x, y] = que.front();
-        que.pop();
+    while (head < tail) {
+        int cell = queue[head++];
+        int x = cell / n;
+        int y = cell % n;
         reached++;
         for (int dir = 0; dir < 4; dir++) {
             int nx = x + ORTHOGONAL_DX[dir];
             int ny = y + ORTHOGONAL_DY[dir];
             if (!inside(nx, ny, n, n)) continue;
             int next = nx * n + ny;
-            if (!in_region[next] || visited[next]) continue;
-            visited[next] = true;
-            que.emplace(nx, ny);
+            uint64_t bit = 1ULL << (next & 63);
+            if (!(remaining[next >> 6] & bit)) continue;
+            remaining[next >> 6] &= ~bit;
+            queue[tail++] = next;
         }
     }
     return reached == (int)cells.size();
@@ -5608,7 +5697,7 @@ bool validate_connected_region(const vector<Cell> &cells, int n) {
 // 採用済み計画を実盤面へ反映する。
 // 複数組の場所交換も許すため、移動元を全て消してから移動先を一括配置する。
 // max_perimeterは料金履歴なので、再配置後の周長との最大値を保存する。
-void apply_plan(int arrival_id, TurnPlan &plan, vvi &owner, vector<GroupState> &groups) {
+void apply_plan(int arrival_id, TurnPlan &plan, OwnerGrid &owner, vector<GroupState> &groups) {
     for (const MovePlan &move : plan.moves) {
         clear_cells(owner, groups[move.id].cells);
     }
@@ -5660,7 +5749,8 @@ int main() {
     int N, M;
     ld R;
     cin >> N >> M >> R;
-    assert(0 < N && N <= BOARD_SIDE_LIMIT);
+    // OwnerGridとBoardMaskは公式制約のN=50へ固定している。
+    assert(N == BOARD_SIDE_LIMIT);
     int r_milli = (int)llroundl(R * 1000.0L);
     vs park(N);
     for (string &row : park) cin >> row;
@@ -5668,6 +5758,9 @@ int main() {
 
     auto preprocess_wall_begin = RuntimeDiagnostics::WallClock::now();
     clock_t preprocess_cpu_begin = clock();
+
+    // 池だけを見るrescue target用indexはケース中不変なので、全turnで共有する。
+    LegalAnchorIndex pond_anchor_index(park, nullptr);
 
     // 面積ごとに全テンプレートと、通常配置で優先する最小周長+4以内のテンプレートを作る。
     vector<vector<Shape>> compact_shapes(151);
@@ -5722,7 +5815,7 @@ int main() {
 
     // owner[x][y]は池・空きセルを-1、占有セルを組IDで表す。
     // 退去queueは終了時刻の小さい順に、現在盤面から消す組を管理する。
-    vvi owner(N, vi(N, -1));
+    OwnerGrid owner;
     vector<GroupState> groups(M);
     priority_queue<pair<ll, int>, vector<pair<ll, int>>, greater<pair<ll, int>>> departures;
     int accepted_count = 0;
@@ -5806,7 +5899,8 @@ int main() {
             park, owner, groups, i, S, remaining_groups, r_milli, theta,
             theta_estimator, density_model, sampled_dlp_model,
             grass_cells, shadow.opportunity_cost,
-            baseline_arrival, baseline_alternatives, compact_shapes, all_shapes,
+            baseline_arrival, baseline_alternatives, pond_anchor_index,
+            compact_shapes, all_shapes,
             root_confirmations_used, rescue_root_screen_evaluated, rescue_diagnostics);
 
         // rescueが候補を出さずscreenもしていない場合だけ、通常配置次点の単独比較を行う。
