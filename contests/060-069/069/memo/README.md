@@ -16,7 +16,7 @@
 
 | ファイル | 分類 | 主な内容 |
 |---|---|---|
-| [current-state.md](current-state.md) | 現在 | 現行コード、baseline方策、作業ツリー、直近v31〜v33、次の判断 |
+| [current-state.md](current-state.md) | 現在 | 現行コード、baseline方策、作業ツリー、直近v31〜v38、次の判断 |
 | [../implementation-overview.md](../implementation-overview.md) | 現行full構造の設計資料 | commit `5145bc7`のfull全体フローを基準に、現行の静的5-expert、connected polish、合法anchor索引、各判断層、改善接点を同期 |
 | [key-lessons.md](key-lessons.md) | 知見 | 成功・失敗から再利用できる設計原則、採用・棄却一覧 |
 | [submissions.md](submissions.md) | 公式提出 | AtCoder提出の時系列、スコア、実行時間、比較上の注意 |
@@ -42,6 +42,12 @@
 | [20260807-connected-polish-root-v31.md](experiments/20260807-connected-polish-root-v31.md) | 100 seed完了・新最高・source凍結・bootstrap区間は0をまたぐ | old Accepted connected限定のdense/swap周長改善 + `.70<=E/G<.80 && R<.060`限定root expert |
 | [20260807-connected-polish-plateau-v32.md](experiments/20260807-connected-polish-plateau-v32.md) | 100 seed完了・raw合計2位・v31比`-0.003378%`・source凍結 | smooth限定polish + 高価値dense予算 + locked zero-gain plateau escape + 将来形状Pareto guard |
 | [20260808-static-polish-gate-v33.md](experiments/20260808-static-polish-gate-v33.md) | 100 seed完了・新最高・反実仮想と完全一致・source凍結 | 非smooth停止を維持し、smoothだけv31のdense `U>=10,000` + strict descent + scalar future-fitへ復元 |
+| [20260808-strict-tie-multistart-v34.md](experiments/20260808-strict-tie-multistart-v34.md) | 100 seed完了・v33比`-0.010752%`で棄却・コード撤去済み | v33 strict descentを保持し、同一最大gainの次点だけを固定8/8予算でlimited-discrepancy探索 |
+| [20260808-small-group-strict-descent-v35.md](experiments/20260808-small-group-strict-descent-v35.md) | 100 seed完了・現行incumbent・v33比`+0.033179%`・19/81/0・source完全復元 | denseの`P>=50`を維持し、既存strict descentだけをsmooth小規模connectedへ一般化 |
+| [20260808-free-space-backbone-small-descent-v36.md](experiments/20260808-free-space-backbone-small-descent-v36.md) | 100 seed完了・v35比`-0.046348%`・8/88/4・棄却・コード撤去済み | v35 smooth経路を完全保護したが、非smoothの空き骨格保護descentで4件の後続tailが小改善を上回った |
+| [20260808-expected-overlap-future-fit-v37.md](experiments/20260808-expected-overlap-future-fit-v37.md) | 3000 caseでv35比`-0.004618%`・棄却・コード撤去済み | `残り未来組数 × 今回の退去までの到着確率 >= 1`だけ通常placementのfuture-fitを使うhard gate |
+| [20260808-spatial-template-shadow-v38.md](experiments/20260808-spatial-template-shadow-v38.md) | 100 / 3000 case完了・v35比`-0.196676% / -0.119609%`・棄却・コード撤去済み | 公式P分布と最良周長の連結template列からセル別configuration shadowを作り、同一料金候補だけを順位付け |
+| [20260808-v35-maintenance-audit.md](experiments/20260808-v35-maintenance-audit.md) | v35方策維持・correctness監査完了・保守整理 | tester照合、数値境界、状態遷移を監査し、候補順とログ互換を保つ共通化・命名整理だけを実施 |
 
 ## 旧memoの正確な分割履歴
 

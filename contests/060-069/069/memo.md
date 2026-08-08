@@ -10,7 +10,7 @@
 
 通常はここまででよい。過去の主要結論は[memo/key-lessons.md](memo/key-lessons.md)、公式提出は[memo/submissions.md](memo/submissions.md)にある。
 
-full solverの処理全体と現行の静的5-expert / smooth限定v31 connected polish / `LegalAnchorIndex`差分は[implementation-overview.md](implementation-overview.md)に分離している。現行sourceと実行状態は[memo/current-state.md](memo/current-state.md)と最新実験記録を正本にする。
+full solverの処理全体と現行の静的5-expert / smooth connected polish / small-group strict descent / `LegalAnchorIndex`差分は[implementation-overview.md](implementation-overview.md)に分離している。棄却・撤去済みv38のcompact-template spatial shadowも同資料と[実験記録](memo/experiments/20260808-spatial-template-shadow-v38.md)に履歴として残す。v35方策を維持したcorrectness監査・保守整理は[maintenance記録](memo/experiments/20260808-v35-maintenance-audit.md)、現行sourceと実行状態は[memo/current-state.md](memo/current-state.md)を正本にする。
 
 ## 全文履歴
 

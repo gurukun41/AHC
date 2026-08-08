@@ -6,13 +6,21 @@
 
 - ブランチ: `069`
 - v33区切りコミット: `AHC069: checkpoint v33 smooth-gated solver`（親HEADは`1fb776e`）
-- HEADの`main.cpp`は再配置を外した軽量版。現在の未コミット`main.cpp`は、v32で正だった非smooth停止を維持し、smoothだけv31のdense / strict descent / scalar future-fitへ戻した6,534行のv33実行済みsourceである。freeze SHA-256は`3709a9de4a71111ff1a116ecfde7c4fd349a459b1bb179275d1e5ccf22d6461d`。
+- HEADはv33区切りsourceである。実測incumbentはv35で、100 seed平均`66,438,655.07`、3000 case平均`68,007,828.3783`である。v37は3000 caseでv35比`-0.004618%`となり撤去済み。v38は100 / 3000 caseでv35比`-0.196676% / -0.119609%`となりnon-incumbentと判定した。ユーザーの明示指示によりv38固有差分を撤去してv35正本へ復元した後、correctness監査と挙動保存整理だけを加えた。現在の未コミット`main.cpp`はv35方策等価の6,677行、SHA-256 `0878466f475c52b4d6cbfa2f56aa8fa642cd6f040491c46adb49307883057652`である。詳細は[maintenance記録](experiments/20260808-v35-maintenance-audit.md)。
 - 現在実装はtheta推定、sampled DLP、template / connected / grow-and-trim、future-fit、Compact rescue、NoRegion Push-out、root rolloutを全て持つ。初期芝セル数を`G`、芝から池・盤外へ出る4近傍辺数を`E`とし、DLPを`E/G<0.55`で1.30、`0.55<=E/G<0.70`で1.25、その他で1.00に固定する。`E/G>=0.80`だけplacementを保存p2設定`5/8/24/12/8/0.50`へ替え、`.70<=E/G<.80 && R<.060`だけ第五expertとしてroot未来差重みを1.00から0.10へ下げる。実到着・仮想到着・Push-out経済gateへ同じDLP倍率を各1回適用する。
-- v33のplacement polishは、実ターンで従来方策が経済的にAcceptした`P>=50`のConnectedGrowth / GrowAndTrimのうち、初期`E/G<0.55`のsmooth expertだけを対象にする。denseは理論最大料金改善`U>=10,000`かつcase最大24実走査、strict 1-swap descentは別予算で最大8 stepとする。
-- dense / descent候補は丸め後料金strict増を必須にし、短い周長tierから既存の3 snapshot scalar future-fitで旧connected以上の候補だけを採用する。old rollback、旧root/rescue発火条件を維持し、synthetic rolloutでは追加探索しない。v32固有のzero plateau、24要素Pareto、component-capacity guardはsource・診断を含め撤去済み。
+- v33のplacement polishは、実ターンで従来方策が経済的にAcceptした`P>=50`のConnectedGrowth / GrowAndTrimのうち、初期`E/G<0.55`のsmooth expertだけを対象にした。v35ではdenseの理論最大料金改善`U>=10,000`・case最大24実走査・`P>=50`を維持し、strict 1-swap descentだけ面積gateから分離して全eligibleへ最大8 step適用する。
+- dense / descent候補は丸め後料金strict増を必須にし、異周長polishにはv35の3 snapshot square-fit非悪化guardを維持する。通常shortlistもv35の境界costと3 snapshot square future-fitで順位付けする。admission、候補集合、料金、repacking、root発火もv35正本どおりである。
+- v34の同一最大gain次点分岐はユーザーの100 seedで平均`66,409,477.31`、v33比`-714,127 (-0.010752%)`・3勝95分2敗だったため棄却し、sourceから完全撤去した。追加枝の即時fee gain`+30,216`に対して後続影響`-744,343`であり、負seedだけを除くpost-hoc gateは作らない。詳細は[v34記録](experiments/20260808-strict-tie-multistart-v34.md)。
+- v35は新しい候補枝・source・expertを追加しない。`P<50`でも既存と同じstrict料金増、3 snapshot scalar future-fit非悪化、old/root rollback、synthetic無効を通す。各removeでfrontier最大近傍数がremove近傍数以下なら正gain不可能なので、全add scanを意味保存で省く。100 seedではv33比`+2,203,649 (+0.033179%)`・19勝81分0敗だった。改善の93.205%はseed 42に集中するため、負seedなしの安全信号と効果量の集中を分けて扱う。詳細は[v35実装・実測記録](experiments/20260808-small-group-strict-descent-v35.md)。
+- v36は完了済みAHC上位解の「強い骨格を固定し、その中だけ局所改善する」原則を採用し、非smoothかつ`P<50`だけ空き骨格保護付きstrict descentへ開放した。100 seedではv35比`-3,079,288 (-0.046348%)`・8勝88分4敗。smooth 70 seedは完全同点だった一方、非smoothの正差`+41,707`を4敗の負差`-3,120,995`が上回ったため棄却した。seed別・`E/G`別のpost-hoc gateは追加せず、v36固有のBFS、非smooth枝、診断を全撤去して実行時v35へbyte単位で復元済み。詳細は[v36実装・実測・撤去記録](experiments/20260808-free-space-backbone-small-descent-v36.md)。
+- v37は`Rq>=1`だけ通常future-fitを使うhard gateだった。3000 caseは合計`204,014,063,376`、v35の`204,023,485,135`比`-9,421,759 (-0.004618%)`。問題構造上も期待未来損失は`Rq`へ連続で、1に不連続点がないため撤去した。詳細は[v37記録](experiments/20260808-expected-overlap-future-fit-v37.md)。
+- v38は`V/P=D^0.9 2^Z`を使い、`E[2^Z]`を解析積分し、開始時刻条件付き`E[D^0.9]`とcompactnessから各configuration列の期待料金を作った。同面積classの全合法列へfractionalに流すセル価格を試したが、3000 caseでv35比`-244,030,711 (-0.119609%)`、1433勝0分1567敗だった。評価turnの57.734%で既存選択を変更し、solver CPU平均は`2083.124ms`だったため、精度・計算量とも昇格根拠なしとし、固有コードを全撤去した。詳細は[v38実装・実測・撤去記録](experiments/20260808-spatial-template-shadow-v38.md)。
 - 通常template placementとrescue targetは、N=50の行bitset + 行方向OR sparse tableから合法anchorだけを従来順に列挙する`LegalAnchorIndex`を使う。合法集合、tie-break、診断上の論理anchor数は旧累積和版と同じ。実測では内部solver CPU meanが`1644.464ms`から`1240.126ms`へ短縮した。
-- 最新の100 seed実行正本はv33の[result_20260808_012614.json](../pahcer/json/result_20260808_012614.json)。comment `test`、seed 0〜99を100/100 AC、合計`6,641,661,858`、平均`66,416,618.58`、WA 0。保存されている100/100 ACの141 run中でraw合計1位である。
-- v31比は`+7,256,274 (+0.109373%)`・14勝71分15敗、v32比は`+7,480,376 (+0.112755%)`・28勝47分25敗。直前4-expert比は`+19,720,811 (+0.297810%)`・48勝34分18敗である。
+- 現行incumbentの100 seed正本はv35の[result_20260808_030825.json](../pahcer/json/result_20260808_030825.json)。comment `test`、seed 0〜99を100/100 AC、合計`6,643,865,507`、平均`66,438,655.07`、WA 0。v33の[result_20260808_012614.json](../pahcer/json/result_20260808_012614.json)比`+2,203,649 (+0.033179%)`・19勝81分0敗、negative gross 0、seed ratio p05 / worstはともに1.0である。
+- v35の3000 case正本は[result_20260808_180959.json](../pahcer/json/result_20260808_180959.json)。3000/3000 AC、合計`204,023,485,135`、平均`68,007,828.3783`である。v37は[result_20260808_193707.json](../pahcer/json/result_20260808_193707.json)。
+- v38の100 case正本は[result_20260808_204340.json](../pahcer/json/result_20260808_204340.json)。100/100 AC、合計`6,630,798,632`、平均`66,307,986.32`、v35比`-13,066,875 (-0.196676%)`・46勝0分54敗。3000 case正本は[result_20260808_225925.json](../pahcer/json/result_20260808_225925.json)。3000/3000 AC、合計`203,779,454,424`、平均`67,926,484.8080`、v35比`-244,030,711 (-0.119609%)`・1433勝0分1567敗である。
+- v36の100 seed正本は[result_20260808_105054.json](../pahcer/json/result_20260808_105054.json)。comment `test`、100/100 AC、合計`6,640,786,219`、平均`66,407,862.19`、WA 0。v35比`-3,079,288 (-0.046348%)`・8勝88分4敗、ratio p05は1.0、worstは`0.966510`。変更12 seedのうち4敗（seed 25 / 44 / 87 / 91）が悪化を支配し、特にseed 44は`-1,569,199`だった。
+- v35はv31比`+9,459,923 (+0.142589%)`、v32比`+9,684,025 (+0.145972%)`、直前4-expert比`+21,924,460 (+0.331088%)`である。なおv33自身のv31 / v32 / 4-expert比は`+7,256,274 / +7,480,376 / +19,720,811`だった。
 - v31差の初期`E/G`別集計は`<.55: +18,587,452`、`.55-.625: +526,864`、`.625-.70: -1,711,877`、`.70-.80: -298,990`、`>=.80: -4,638,912`。同じ開発100 seed上のpost-hocなのでfresh推定ではないが、v32でpolishをsmoothだけへ限定する根拠とした。
 - v32−v31の初期`E/G`別差は`<.55: -7,480,376`、`.55-.625: -526,864`、`.625-.70: +1,711,877`、`.70-.80: +1,432,349`、`>=.80: +4,638,912`。非smooth 30 seedの`+7,256,274`がsmooth 70 seedの`-7,480,376`をほぼ相殺した。静的保護は合計で正、smooth側の同時変更は合計で負だが、dense予算・Pareto・plateauの個別寄与は未分離である。
 - v31のconnected polishはeligible `15,815`回、dense実走査`2,368`回、dense / descent最終choice `158 / 504`、placement polish change `690`回。内部solver CPUはmean `1200.498ms`、p95 `1629.677ms`、max `1916.647ms`、2秒超0/100だった。
@@ -35,11 +43,11 @@ finalでは、baseline Acceptedの29.84%が教師上Reject有利、経済Reject�
 
 v26の最終source/binary/config/input/oracle hashは実行前に固定済みであり、[v26実験記録](experiments/20260803-fallback-phase-v26.md)を正本とする。v26 `main.cpp`のSHA-256は`7ee9165b5b7075bb4cef5980631320fbf4efea92e850e0af89a1cc93fb04fb9a`である。
 
-## 旧full比較基準、v31、v32、現在のv33
+## 旧full比較基準、v31、v32、v33、棄却v34、incumbent v35、非incumbent v36
 
 過去のfull baselineは、theta推定、sampled DLP、`Lmin..Lmin+4` template、raw BFS、multi-start connected growth、grow-and-trim、future-fit、Compact rescue、NoRegion Push-out、root rolloutを含む。100 seed oracleは`pahcer/json/result_20260803_003818.json`、合計`6,515,194,836`。復元sourceは`main-optuna-final.cpp`、SHA-256は`086cb6cc2e24848c77a4b766ab8dde433dbf16469095cca557f848bdff091c6a`である。
 
-静的DLP版は平均`66,163,871.34`、そこへ4領域expertと`LegalAnchorIndex`を統合した版は`66,219,410.47`。v31は第五root expertとconnected polishを統合して`66,344,055.84`、v32はsmooth限定、価値予算、plateau、Pareto guardを追加して`66,341,814.82`。現在v33は非smooth停止だけをv32から残し、smoothをv31へ戻して`66,416,618.58`。実行前のcasewise反実仮想と実測が一致した。さらに一つ前の軽量hybridは`66,036,150.29`。全て同じ開発100 seedでありfresh性能と混同しない。
+静的DLP版は平均`66,163,871.34`、そこへ4領域expertと`LegalAnchorIndex`を統合した版は`66,219,410.47`。v31は第五root expertとconnected polishを統合して`66,344,055.84`、v32はsmooth限定、価値予算、plateau、Pareto guardを追加して`66,341,814.82`。v33は非smooth停止だけをv32から残し、smoothをv31へ戻して`66,416,618.58`であり、実行前のcasewise反実仮想と実測が一致した。v34は`66,409,477.31`で棄却済み。v35は小規模strict descentを追加して`66,438,655.07`となり新incumbentである。v36は非smooth小規模へ空き骨格保護付きdescentを追加したが`66,407,862.19`で、v35比`-0.046348%`のため非incumbentである。さらに一つ前の軽量hybridは`66,036,150.29`。実測値は全て同じ開発100 seedでありfresh性能と混同しない。
 
 ## 実行済みのv29 Optuna最終調整
 
@@ -88,8 +96,30 @@ cell×time空間DLPのFullはcausal Control比`-3.9804%`、SameFeeは`-4.5265%`�
 - seed 0単独では判断しない。100 seed paired比較を最小の行動確認に使い、高分散な性能・model判断では公式generatorから独立seedを自動生成してtrain / validation / finalを分ける。
 - Pahcer wallだけでなく、コード内`timing_solver_cpu_ms`を確認する。
 - 日本語コメントを同期し、不要になった実験コードは削除する。
-- 大規模seed生成・複数seed比較・Optuna探索はユーザーが実行する。v31・v32・v33はエージェントの単一smokeとユーザーの100 seedを実行済み。v33結果確認では記録だけを同期し、解答を追加実行・変更していない。
+- 大規模seed生成・複数seed比較・Optuna探索はユーザーが実行する。v37 / v38の3000 caseもユーザーが実行し、いずれもv35維持と判定した。v38ではエージェントが全設計・静的監査後にseed 0を一度だけsmokeし、ユーザーが100 caseを`pahcer-studio`、3000 caseを`pahcer_config.toml`と`tools/in_big`で実行済みである。
 
 ## 再開時の注意
 
-v26/v27/v28/v29は固定artifactで実行・分析済みで、当時のv28 source SHA-256は`21d4397e0a0dc3b86df4599d107cb942ca735df5b51bc24761cf0e92e3d945d3`。最新の100 seed実行正本はv33の`result_20260808_012614.json`。現在`main.cpp`は実行前freezeと同じSHA-256 `3709a9de4a71111ff1a116ecfde7c4fd349a459b1bb179275d1e5ccf22d6461d`を保つ。旧full baseline、直前lean、静的DLP、4-expert、v31、v32、v33を混同しない。次の明示指示なしに解答source・方針・定数を変更せず、追加実行も行わない。
+v26/v27/v28/v29は固定artifactで実行・分析済みで、当時のv28 source SHA-256は`21d4397e0a0dc3b86df4599d107cb942ca735df5b51bc24761cf0e92e3d945d3`。incumbentの100 seed正本はv35の`result_20260808_030825.json`、3000 case正本は`result_20260808_180959.json`、棄却v37は`result_20260808_193707.json`、non-incumbent v38は100 case `result_20260808_204340.json`と3000 case `result_20260808_225925.json`である。現在`main.cpp`はv35の候補・順序・判定を維持したmaintenance版で、行数・SHA-256は冒頭と[maintenance記録](experiments/20260808-v35-maintenance-audit.md)を正本とする。実測scoreの正本は引き続き[v35記録](experiments/20260808-small-group-strict-descent-v35.md)である。旧full baseline、直前lean、静的DLP、4-expert、v31〜v38を混同しない。新しい明示指示なしにsource・方針・定数を変更しない。
+
+## v38 freeze・実行結果とv35復元
+
+- `main.cpp`: 6,993行、source SHA-256 `8edfb91ea48efdab43e75ea39eede0ed2b0bb966368b064e106afa73f08a7959`。
+- release binary: `/private/tmp/ahc069-spatial-template-shadow-v38`、SHA-256 `7e1f764e4b567095be9bfc8a0660bf05442afcbe4ad865f9b08943b5bcd2a171`。
+- 静的検証: Apple Clang 17、C++17/C++20、`-O2 -DNDEBUG -Wall -Wextra -Wshadow -Wpedantic -fsyntax-only`を警告0でpass。C++20 static analyzerは指摘0、`git diff --check`もpass。
+- freeze前の解答プログラム実行: 0回。freeze後にエージェントがseed 0を1回smokeし、ユーザーが100 / 3000 caseを実行した。
+- 100 case: `6,630,798,632`、平均`66,307,986.32`、v35比`-0.196676%`。
+- 3000 case: `203,779,454,424`、平均`67,926,484.8080`、v35比`-0.119609%`。
+- 3000 case結果確定時の`main.cpp`は上記v38 SHA-256と一致していた。
+- その後のユーザー明示指示によりv38固有差分を撤去し、v35の6,654行・SHA-256
+  `1a5f652b17ca8de08b34920ea35f1928cfea7008dc98a4c7138b933e22d3db60`へ一度byte一致で復元した。
+- 復元から下記maintenance開始までの解答プログラム実行: 0回。
+
+## v35 correctness監査・maintenance整理
+
+- 上記byte復元後、ユーザーの明示指示によりv35の全状態遷移と公式tester境界を監査した。Critical / High / Mediumの修正必須バグは0件。
+- 4近傍配列、N=50制約、固定scenario数、Shape展開、5-expert設定を一元化し、root marginの古い名前と恒等処理を整理した。
+- 候補集合・列挙順・tie-break・評価式・閾値・stderr key・stdout protocolは変更していない。
+- 整理後`main.cpp`: 6,677行、SHA-256 `0878466f475c52b4d6cbfa2f56aa8fa642cd6f040491c46adb49307883057652`。
+- C++17 / C++20警告付き構文検査、全A/B switch、Clang static analyzer、`git diff --check`は全て指摘0。
+- 大規模case実行は行わない。source freeze後にseed 0を1 caseだけsmokeする場合も、その結果から追加変更しない。

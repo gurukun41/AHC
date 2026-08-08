@@ -1,6 +1,6 @@
-# AHC069 full + 静的5-expert + smooth限定connected polish実装の全貌
+# AHC069 full + 静的5-expert + small-group strict descent実装の全貌
 
-> **現在との対応:** 本文はcommit `5145bc7`の5,434行full solverを構造基準にする。現在の6,534行`main.cpp`は、v32で正だった非smoothのpolish停止を維持し、smooth expertだけ実測済みv31のdense / strict descent / scalar future-fitへ戻したv33実行済みsourceである。追加差分は§3.1、§6.7、[4-expert実装記録](memo/experiments/20260807-static-portfolio-anchor-index.md)、[v31実行記録](memo/experiments/20260807-connected-polish-root-v31.md)、[v32実行記録](memo/experiments/20260807-connected-polish-plateau-v32.md)、[v33実行記録](memo/experiments/20260808-static-polish-gate-v33.md)を参照する。
+> **現在との対応:** 本文はcommit `5145bc7`の5,434行full solverを構造基準にする。実測incumbentの方策は、smooth expertのstrict descentを小規模connectedへ一般化したv35であり、現在sourceはその挙動保存maintenance版である。v37のremaining hard gateは3000 caseと問題構造の再検討後に撤去した。v38のcompact-template configuration shadowも100 / 3000 caseでv35比`-0.196676% / -0.119609%`となり撤去済みである。現行差分と棄却履歴は§3.1、§6.6、§6.7、[v35記録](memo/experiments/20260808-small-group-strict-descent-v35.md)、[maintenance記録](memo/experiments/20260808-v35-maintenance-audit.md)、[棄却v37記録](memo/experiments/20260808-expected-overlap-future-fit-v37.md)、[v38記録](memo/experiments/20260808-spatial-template-shadow-v38.md)を参照する。
 
 この文書は、full solverの全判断層と改善接点を確認するための設計資料である。
 実験の時系列を残す `memo/`、次の会話へ状態を渡す `current-state.md` とは目的が異なる。
@@ -11,8 +11,8 @@
 ## 0. この文書が表すスナップショット
 
 - 現在対象: [main.cpp](main.cpp)
-- 現在ソース SHA-256: `3709a9de4a71111ff1a116ecfde7c4fd349a459b1bb179275d1e5ccf22d6461d`
-- 現在ソース行数: 6,534行
+- 現在ソース SHA-256: `0878466f475c52b4d6cbfa2f56aa8fa642cd6f040491c46adb49307883057652`
+- 現在ソース行数: 6,677行
 - 構造の基準Git object: `5145bc7:contests/060-069/069/main.cpp`
 - ブランチ: `069`
 - v33区切りコミット: `AHC069: checkpoint v33 smooth-gated solver`（親HEADは`1fb776e`）
@@ -21,7 +21,7 @@
 - 作成日: 2026-08-03 JST
 - 最終同期日: 2026-08-08 JST
 
-本文の構造基準はcommit `5145bc7` に保存された上記Git objectである。現在は一度軽量solverへ移った後fullへ戻し、実行済みの静的DLP倍率版、静的4-expert、意味保存anchor索引、限定root expertとconnected near-template polish、v32のplateau実験を経て、v33で静的smooth gateとv31 polishを合成した。各過去実験のsource・結果は `memo/experiments/` と対応artifactに残る。
+本文の構造基準はcommit `5145bc7` に保存された上記Git objectである。現在は一度軽量solverへ移った後fullへ戻し、実行済みの静的DLP倍率版、静的4-expert、意味保存anchor索引、限定root expertとconnected near-template polish、v32のplateau実験を経て、v33で静的smooth gateとv31 polishを合成した。v34の同一最大gain分岐、v36の非smooth空き骨格保護、v37の`Rq>=1` gate、v38のconfiguration shadowはいずれも撤去済みである。実測incumbent v35はstrict descentをsmooth小規模connectedへ一般化した版であり、現在sourceは候補集合・順序・判定を変えず共通不変条件と命名を整理したmaintenance版である。
 
 2026-08-05に、`main.cpp`を触らないOptuna調整用の`main-optuna-v29.cpp`とdriverを別途追加し、2026-08-06にユーザーが固定手順を実行した。全blockが独立validationでbaselineへ戻り、最終出力も`main.cpp`とbyte一致したため、この文書が説明する通常提出baseline自体には含まれない。仕様と結果は `memo/experiments/20260805-optuna-final-v29.md` にある。
 
@@ -34,6 +34,12 @@
 実行済みv32は[result_20260808_003555.json](pahcer/json/result_20260808_003555.json)で100/100 AC、合計`6,634,181,482`、平均`66,341,814.82`。v31比`-0.003378%`、39勝18分43敗で、保存済み100/100 AC 140 run中raw合計2位である。非smooth 30 seedの`+7.256M`がsmooth 70 seedの`-7.480M`をほぼ相殺した。残差・文献・全コード経路の独立read-only監査はblocking 0で、実行時sourceはSHA-256 `b3399f41a7ebb719147cf5909f37cecf2355b549e73c6e33e90952621b898928`に凍結されていた。
 
 実行済みv33は[result_20260808_012614.json](pahcer/json/result_20260808_012614.json)で100/100 AC、合計`6,641,661,858`、平均`66,416,618.58`。v31比`+0.109373%`、v32比`+0.112755%`で、保存済み100/100 AC 141 run中raw合計1位である。非smooth 30 seedのv32方策とsmooth 70 seedのv31方策を既存`E/G<.55`境界で選び、100/100 seedでcasewise反実仮想と一致した。新しい`.625`境界はpost-hocになるため採用していない。同じ開発集合を再利用しておりfresh保証ではない。
+
+実行済みv34は[result_20260808_023641.json](pahcer/json/result_20260808_023641.json)で100/100 AC、合計`6,640,947,731`、平均`66,409,477.31`。v33比`-0.010752%`、3勝95分2敗だったため棄却し、同一最大gain分岐は完全撤去した。
+
+実行済みv35は[result_20260808_030825.json](pahcer/json/result_20260808_030825.json)で100/100 AC、合計`6,643,865,507`、平均`66,438,655.07`。v33比`+2,203,649 (+0.033179%)`、19勝81分0敗で新incumbentである。seed 42を除いても18勝81分0敗・`+149,729`だが、合計改善の93.205%はseed 42の`+2,053,920`に集中する。同じ開発100 seedを繰り返し参照しており、負seedなしの安全信号とfresh一般化保証を混同しない。
+
+棄却v36は、非smoothかつ`P<50`へ空き連結成分数を増やさないstrict descentを限定導入した。100 seedは[result_20260808_105054.json](pahcer/json/result_20260808_105054.json)で100/100 AC、合計`6,640,786,219`、平均`66,407,862.19`。v35比`-3,079,288 (-0.046348%)`・8勝88分4敗で、smooth 70 seedは完全同点だったが非smoothの4敗が悪化を支配した。seed別gateは追加せず、v36固有のBFS、非smooth枝、診断を全撤去して上記v35へ完全復元した。
 
 ## 1. 一枚で見る全体フロー
 
@@ -415,58 +421,51 @@ absolute_cost:
 
 hashで絞った後にセル集合も比較し、同一領域を除く。shortlist内はすべて同じ周長なので、同じ `P,V` なら料金も同じである。
 
-### 6.6 future-fit
+### 6.6 棄却済みv38: compact-template configuration shadow
 
-候補が2件以上あり、未来組と十分な未来到着確率があるときだけ、今回の滞在中に始まる未来到着質量の、
+以下は棄却・撤去済みv38の実験仕様であり、現在のv35 sourceには含まれない。v38では、残り組数を`R`、未到着の1組が今回の退去`T`までに始まる条件付き確率を`q=A(T)`とした。今回の占有と時間的に重なる未来到着数の条件付き期待値を`Rq`とし、`Rq=1`のhard gateを置かず、`R>0, T-S>1, q>0`なら今回の滞在中に始まる未来到着質量の`1/6, 3/6, 5/6`分位を3 snapshotにした。
 
-~~~text
-1/6, 3/6, 5/6
-~~~
-
-分位を3 snapshotにする。
-
-各snapshotでは、
-
-- 今回の候補セルは占有扱い
-- 既存組は `t < snapshot` なら空き扱い
-- 一辺 `2,3,4,5,6,8,10,12` の空き正方形を置ける位置数をDPで数える
-
-とし、
+公式生成式は、滞在時間`D`、`Z~N(0,0.8^2)`に対して、丸めと上限を除けば
 
 ~~~text
-U(snapshot)
-  = Σ_side side^2 × log(1 + count_side) / Σ_side side^2
-
-future_fit
-  = (1-w) × average(U)
-  + w × min(U)
-
-w = 0.25（通常expert）または0.50（E/G>=0.80 expert）
+V/P = D^0.9 2^Z
 ~~~
 
-を最大化する。同点はincremental cost順である。
+である。`E[2^Z]`を対数正規平均として解析積分し、開始時刻で条件付けた`E[D^0.9]`を既存48点length求積から得る。面積は`P=round(U^2)`の等確率16層中点で決定的に積分する。
+
+各snapshot・面積probeでは、既存組のうち`t < snapshot`だけを解放し、`Lmin, Lmin+2, Lmin+4`の順に最初に合法anchorを持つ周長tierを選ぶ。そのtierの全compact-template anchorをconfiguration列とみなし、未来1組を全列へ一様に流すfractional解を作る。列の期待料金を使用する`P`セルへ均等配分し、各セルのmarginal bid priceを得る。
+
+v38での現在候補`C`の空間costは、3 snapshotのセル価格を候補セル上で合計して`Rq/3`を掛けた値だった。
+
+~~~text
+spatial_cost(C)
+  = Rq / 3 × Σ_snapshot Σ_(cell in C) bid_price(snapshot, cell)
+~~~
+
+実到着の通常shortlistは全て同じ周長・同じ料金なので、このcostを最小化し、数値同点だけincremental costへ戻した。admissionや異周長比較には使わず、非有限ならその到着だけ旧square-fitへfallbackする設計だった。
+
+v38当時もsynthetic rolloutは計算量を固定するため、従来の一辺`2,3,4,5,6,8,10,12`の空き正方形数によるfuture-fitを維持した。connected polishも異周長の直接料金差を持つため、旧配置以上というv35のsquare-fit guardを維持した。変更境界は「実到着・通常shortlist・同一料金」に限ったが、100 / 3000 caseで負、評価turnの57.734%で選択変更、CPUも増加したため固有コードを全撤去した。詳細は[v38記録](memo/experiments/20260808-spatial-template-shadow-v38.md)にある。
 
 ### 6.7 connected near-template polish
 
 従来のtemplate / connected候補選択とfuture-fitを最後まで実行した後、実ターンのold primaryが次を全て満たす場合だけ追加探索する。
 
-- 初期`E/G<0.55`のsmooth expert 0
-- `P>=50`
 - sourceが`ConnectedGrowth`または`GrowAndTrim`
 - 旧丸め後料金がscaled opportunity costをstrictに上回る
 - 旧周長が`Lmin`より大きい
+- 初期`E/G<0.55`のsmooth expertである
 
-初期盤面だけでsmoothかを固定し、到着列や途中scoreでは切り替えない。v31の100 seed差は`E/G<.55`で`+18.59M`、`.625-.70`で`-1.71M`、`>=.80`で`-4.64M`だったため、正の中心を残しつつ大損tailが出た地形を静的に保護する。これは繰り返し参照した同じ開発集合上のpost-hoc根拠であり、fresh性能推定ではない。
+初期盤面だけでsmoothかを固定し、到着列や途中scoreでは切り替えない。v31の100 seed差は`E/G<.55`で`+18.59M`、`.625-.70`で`-1.71M`、`>=.80`で`-4.64M`だったため、正の中心を残しつつ非smoothの大損tailを静的に保護する。開発集合の繰り返し参照はfresh性能推定ではない。
 
 synthetic rolloutでは発火しない。root内の数百policy stepへ局所探索と全盤面box走査を掛けず、未来比較方策の計算量を従来どおりに保つためである。
 
-主候補のdense deformationは、理論最大料金改善`U=fee(V,P,Lmin)-old_fee`が10,000以上で、ケース中の実dense走査が24回未満のときだけ発火する。`P<=h*w<=P+16`、`2(h+w)<=min(Lold-2,Lmin+4)`のboxを全anchor走査し、50-bit free rowからbox内free集合の周長`4q-2e`を計算する。global上位12と四象限補完を合わせた最大16 anchorだけを正確に調べる。box内にPセル以上のfree成分があれば、ちょうどPならそのまま、より大きければTarjan関節点を毎回再計算しながらPまで削る。incremental優先とabsolute優先の2種類を作り、面積、連結性、池、占有、旧周長strict改善を再検証する。Uを通過した実走査だけが24回予算を消費する。
+主候補のdense deformationはsmoothかつ`P>=50`に限り、理論最大料金改善`U=fee(V,P,Lmin)-old_fee`が10,000以上で、ケース中の実dense走査が24回未満のときだけ発火する。`P<=h*w<=P+16`、`2(h+w)<=min(Lold-2,Lmin+4)`のboxを全anchor走査し、50-bit free rowからbox内free集合の周長`4q-2e`を計算する。global上位12と四象限補完を合わせた最大16 anchorだけを正確に調べる。box内にPセル以上のfree成分があれば、ちょうどPならそのまま、より大きければTarjan関節点を毎回再計算しながらPまで削る。incremental優先とabsolute優先の2種類を作り、面積、連結性、池、占有、旧周長strict改善を再検証する。Uを通過した実走査だけが24回予算を消費し、`P<50`はdense予算を消費しない。
 
-補助候補のperimeter descentは、old selectedの非関節セルと合法frontierセルを交換する。先にfrontierの最大selected近傍数とselected境界の最小近傍数を求め、前者が後者以下なら正のswapは不可能なのでTarjanと全組合せを省く。必要条件を通った後、削除前近傍数`k_r`、削除後の追加近傍数`k_a`に対して`k_a>k_r`だけを選ぶので、各stepの周長差は`-2(k_a-k_r)<0`である。最大8 step反復し、終端だけでなく全strict降下中間形を候補にする。保存15,330試行の最大は6 stepであり、旧候補を失わずworst caseを抑えつつ、深い形のfuture-fitが落ちても浅い短縮を残せる。descentはdense予算と分離して全eligibleへ適用する。
+補助候補のperimeter descentは、old selectedの非関節セルと合法frontierセルを交換する。先にfrontierの最大selected近傍数とselected境界の最小近傍数を求め、前者が後者以下なら正のswapは不可能なのでTarjanと全組合せを省く。必要条件を通った後も、各removeの近傍数以上のadd次数がfrontier全体に存在しなければ、そのremoveの全pairを省く。removeでadd側近傍数は増えないため、この追加prefilterは正gain候補とtie順を変えない。削除前近傍数`k_r`、削除後の追加近傍数`k_a`に対して`k_a>k_r`だけを選ぶので、各stepの周長差は`-2(k_a-k_r)<0`である。最大8 step反復し、終端だけでなく全strict降下中間形を候補にする。保存15,330試行の最大は6 stepであり、深い形のfuture-fitが落ちても浅い短縮を残せる。descentはdenseの面積gateと予算から分離し、smooth expertでは全Pへ適用する。非smoothでは全Pで無効である。
 
-denseとdescentは周長tier別の共通shortlistへ入れる。丸め後料金がoldよりstrictに高い候補だけを短い周長tierから評価し、各tierでは通常placementと同じ3 future snapshotのscalar future-fitを最大化する。tier最良がoldのscalar値以上なら採用し、不合格なら次tier、最後までなければoldへ戻る。既に通常候補比較でoldを評価済みならその値を再利用する。
+v35はgreedy descentの候補幅・最大gain選択・`gain / incremental / absolute / セル座標`順をv33から変えない。v34で試した同一最大gain次点分岐は、100 seedでv33比`-0.010752%`だったためsource・診断ごと撤去済みである。小規模組にも同じ1本のgreedy列だけを適用し、新しいselectorやcase gateを足さない。v31保存軌跡で`P<50`のconnected shape lossは全体の約6.31%であり、これは当時impact/CPUのため対象外だった残差を、同じ因果境界のまま拾う一般化である。
 
-polishを選んでもold connectedをroot runner-upの先頭に残し、旧周長をCompact rescueとnormal-rootの発火参照、旧cellsをrescue移動先rankingへ使う。rescueのdirect gain自体は改善後polish料金と比較する。これはglobal scoreの数学的単調性ではないが、RejectをAcceptへ変えず、即時料金、既存future-fit proxy、旧root探索機会を同時に保護する限定更新である。v32で試したzero-gain plateau、24要素Pareto、component-capacity guardはsmooth 70 seedの合成差が負だったため現行sourceから撤去した。
+polishを選んでもold connectedをroot runner-upの先頭に残し、旧周長をCompact rescueとnormal-rootの発火参照、旧cellsをrescue移動先rankingへ使う。rescueのdirect gain自体は改善後polish料金と比較する。候補は丸め後料金がoldよりstrictに高い最短周長tierだけを採用し、未来到着質量が正ならv35と同じ3 snapshot scalar future-fitの非悪化も要求する。現在が最終組なら未来guardを停止し、tier内は既存退去時刻境界costで選ぶ。v32で試したzero-gain plateau、24要素Pareto、component-capacity guardと、v34のsame-gain分岐は現行sourceから撤去した。
 
 ### 6.8 通常runner-up
 
@@ -708,7 +707,7 @@ baselineのroot探索には次の制約がある。
 | 静的DLP expert | `E/G<.55`は1.30、`.55<=E/G<.70`は1.25、その他1.00 |
 | 静的placement expert | `E/G>=.80`だけ候補幅・growth・minimum future-fitをp2へ切替 |
 | 静的root expert | `.70<=E/G<.80 && R<.060`だけ未来料金差重みを1.00から0.10へ切替 |
-| connected polish | `E/G<.55`の実ターンでold Accepted connectedかつ`P>=50`だけ有効。dense `U>=10,000`・最大24実走査、strict descent最大8 step |
+| connected polish | smooth実ターンだけ有効。denseは`P>=50`・`U>=10,000`・最大24実走査、strict descentは全Pで最大8 step。非smoothは無効 |
 | grow-and-trim | 有効 |
 | NoRegion Push-out | 有効 |
 | root actions / rescue | 有効 |
@@ -773,8 +772,9 @@ reconstructed raw score
 - trimによる周長改善・同値・悪化
 - shortlist件数
 - incremental最良とabsolute最良の差
-- future-fitが選択を変えた回数
-- connected polishのcandidate / static filter / eligible、dense anchor / trim funnel、perimeter descent step / tier
+- future-fitの時間関連turn、期待重複到着数合計、`Rq<1` filter、実評価、選択変更回数
+- connected polishのcandidate / static filter / eligible、dense size/value/budget gate、dense anchor / trim funnel、perimeter descent step / tier
+- remove単位の正gain不可能prefilter、小規模descentのattempt / step / candidate / future-fit reject / 最終choice / 周長改善 / fee gain
 - strict料金増候補、future-fit rollback、polishがbaselineを変えた回数
 - 最終採用source
 
@@ -827,8 +827,9 @@ v28の新規1200 seed収集buildでは、solver CPUは平均1,668.175ms、p95 2,
 - temporal DLPはセル位置、連結性、池、空き形状を見ない。
 - 通常 placement は最小templateが1件でも置けると、connected-growthを比較しない。
 - 通常shortlistは周長が違う候補を同時比較しない。
-- future-fitは空き正方形数のproxyで、未来要求の個別 `P,V` や配置成功料金を直接rolloutしない。
-- 退去時刻境界とfuture-fitは正規化された未来到着CDFを使う。future-fitは `remaining_groups>0` を発火条件に使うだけで、残り組数の大小をutilityへ反映しない。
+- 通常placementは、境界costでshortlistを作り、実到着・syntheticとも空き正方形数の3 snapshot future-fitで同一料金候補を順位付けする。
+- 異周長polishは同じ空き正方形proxyの旧配置以上guardを維持する。placement proxyをadmissionのhard rejectへ使わない。
+- 退去時刻境界とfuture-fitは正規化された未来到着CDFを使い、`R=0`では停止する。`Rq=1`のhard gateは置かない。
 - placementの境界評価はtheta点推定、admission DLPはtheta事後5分位sampleであり、予測表現が異なる。
 - root未来は48点近似と開始・終了時刻の重複排除でjointな到着列を作る一方、sampled DLPは公式整数丸めCDFを別の256点低食い違い列でsampleし、時刻重複を排除しない。二つの未来生成器は同じ分布表現ではない。
 - repackingは現在到着に結び付くときだけ動き、proactiveな整理をしない。
@@ -920,7 +921,7 @@ trainでfitしてvalidationでfamily・lambdaを選び、train+validationでrefi
 | `apply_plan` | 4574 | 実盤面への唯一の反映点 |
 | `main` | 4616 | 全体の接続 |
 
-Optunaの全調整差分は`main-optuna-v29.cpp`に履歴として残す。現在の通常実装は、DLP倍率、保存p2 placement、限定root重みをケース固定変数として再利用し、Optuna用macroは含まない。調整実験を調べるときは[v29実験記録](memo/experiments/20260805-optuna-final-v29.md)、直前portfolioは[4-expert + anchor index記録](memo/experiments/20260807-static-portfolio-anchor-index.md)、v31は[connected polish + root記録](memo/experiments/20260807-connected-polish-root-v31.md)、v32は[plateau実行記録](memo/experiments/20260807-connected-polish-plateau-v32.md)、現在v33は[static polish gate記録](memo/experiments/20260808-static-polish-gate-v33.md)を参照する。
+Optunaの全調整差分は`main-optuna-v29.cpp`に履歴として残す。現在の通常実装は、DLP倍率、保存p2 placement、限定root重みをケース固定変数として再利用し、Optuna用macroは含まない。調整実験を調べるときは[v29実験記録](memo/experiments/20260805-optuna-final-v29.md)、incumbent v35は[small-group strict descent記録](memo/experiments/20260808-small-group-strict-descent-v35.md)、現在の挙動保存整理は[maintenance記録](memo/experiments/20260808-v35-maintenance-audit.md)、棄却・撤去済みv37は[expected-overlap future-fit記録](memo/experiments/20260808-expected-overlap-future-fit-v37.md)、棄却・撤去済みv38は[spatial-template shadow記録](memo/experiments/20260808-spatial-template-shadow-v38.md)を参照する。
 
 ## 13. 実験するときの比較単位
 
@@ -950,7 +951,7 @@ python3 tools/generate_seed_corpus_v28.py --start-seed 2700 --count 2000 \
 
 ## 14. 最短の要約
 
-この実装は、**時間容量の価値をsampled DLPで見積もり、初期外周率でDLP 1.30 / 1.25 / 1.00の静的expertを選び、高外周率ケースだけplacement探索を広げる。限定地形だけrootを直接利益寄りにし、smooth地形のold Accepted connectedだけをdense変形とstrict swapで短周長化する。polish候補は料金を上げ、既存の3断面scalar future-fitを落とさない。受理可能な最小周長を最優先し、その同一周長内で退去時刻のまとまりと未来の空き形状を残す場所を選ぶ**。
+この実装は、**時間容量の価値をsampled DLPで見積もり、初期外周率でDLP 1.30 / 1.25 / 1.00の静的expertを選び、高外周率ケースだけplacement探索を広げる。限定地形だけrootを直接利益寄りにし、smooth地形のold Accepted connectedだけをdense変形とstrict swapで短周長化する。受理可能な最小周長を最優先し、その同一料金内では退去時刻の境界costと3 snapshotの空き正方形future-fitで将来の配置自由度を残す**。
 
 通常templateとrescue targetでは、行bitsetの`LegalAnchorIndex`が従来と同じ合法anchorを同じ順で列挙し、不合法anchorの個別照会を省く。方策portfolioと意味保存の計算量改善を分けた構成である。
 
