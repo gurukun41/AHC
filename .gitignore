@@ -1,8 +1,7 @@
-# Ignore everything except source code, personal notes, and this file.
+# Ignore everything except C++ source code and this file.
 *
 !*/
 !*.cpp
-!*.md
 !/.gitignore
 
 # Contest tooling and generated reports are not personal source/notes.
