@@ -15,7 +15,8 @@ struct Op {
 static const int MAX_OP = 100000;
 
 // Homogeneous blocks are unchanged by reversal. Replace only disjoint,
-// consecutive pairs whose intermediate cell starts and ends empty.
+// consecutive pairs whose intermediate cell starts and ends empty. Mixed
+// payloads must keep their number of flips, so they are never merged here.
 vector<Op> compressMoves(const vector<string>& grid, int K,
                          const vector<Op>& ops) {
     const int n = (int)grid.size();
@@ -124,9 +125,181 @@ vector<Op> compressMoves(const vector<string>& grid, int K,
     return result;
 }
 
+struct RouteTree {
+    vector<int> parent, depth, direction, straight;
+};
+
+// Grow each color's tree toward its slimes. Crossing another color is cheaper
+// when both routes have a long straight run toward their respective nests.
+vector<RouteTree> buildCrossingTrees(
+    const vector<string>& grid, int K,
+    chrono::steady_clock::time_point refinementDeadline) {
+    const int n = (int)grid.size(), cells = n * n;
+    const int dr[4] = {-1, 1, 0, 0};
+    const int dc[4] = {0, 0, -1, 1};
+    vector<array<int, 4>> neighbor(cells);
+    vector<int> root(K, -1), slimeColor(cells, -1);
+    vector<vector<int>> slimes(K);
+    for (int v = 0; v < cells; ++v) {
+        neighbor[v].fill(-1);
+        char ch = grid[v / n][v % n];
+        if (ch == '#') continue;
+        if ('A' <= ch && ch < 'A' + K) root[ch - 'A'] = v;
+        if ('a' <= ch && ch < 'a' + K) {
+            slimeColor[v] = ch - 'a';
+            slimes[ch - 'a'].push_back(v);
+        }
+        for (int d = 0; d < 4; ++d) {
+            int r = v / n + dr[d], c = v % n + dc[d];
+            if (0 <= r && r < n && 0 <= c && c < n && grid[r][c] != '#')
+                neighbor[v][d] = r * n + c;
+        }
+    }
+
+    // Bound every route by its shortest distance to the nest plus a small
+    // allowance. This prevents shared corridors from causing long detours.
+    vector<vector<int>> shortest(K, vector<int>(cells, -1));
+    for (int color = 0; color < K; ++color) {
+        queue<int> q;
+        shortest[color][root[color]] = 0;
+        q.push(root[color]);
+        while (!q.empty()) {
+            int v = q.front();
+            q.pop();
+            for (int next : neighbor[v]) {
+                if (next < 0 || shortest[color][next] >= 0) continue;
+                shortest[color][next] = shortest[color][v] + 1;
+                q.push(next);
+            }
+        }
+    }
+
+    using Support = vector<array<double, 2>>;
+    const Support emptySupport(cells, array<double, 2>{0.0, 0.0});
+    auto build = [&](int color, const Support& foreign, bool timed) -> optional<RouteTree> {
+        RouteTree tree;
+        tree.parent.assign(cells, -1);
+        tree.depth.assign(cells, -1);
+        tree.direction.assign(cells, -1);
+        tree.straight.assign(cells, 0);
+        tree.depth[root[color]] = 0;
+        int remaining = (int)slimes[color].size();
+
+        // Crossing discounts are fixed during this rebuild. Perpendicular
+        // routes are preferred; sharing a corridor can also provide support.
+        Support crossing(cells);
+        for (int v = 0; v < cells; ++v) {
+            for (int axis = 0; axis < 2; ++axis) {
+                double amount = max(0.0, foreign[v][1 - axis]) +
+                                0.5 * max(0.0, foreign[v][axis]);
+                crossing[v][axis] = 1.0 - exp(-amount);
+            }
+        }
+
+        while (remaining > 0) {
+            if (timed && chrono::steady_clock::now() >= refinementDeadline) return nullopt;
+            vector<double> distance(cells, 1e100);
+            vector<int> previous(cells, -1), routeDepth = tree.depth;
+            vector<int> direction = tree.direction, straight = tree.straight;
+            vector<bool> settled(cells, false);
+            using Entry = pair<double, int>;
+            priority_queue<Entry, vector<Entry>, greater<Entry>> q;
+            for (int v = 0; v < cells; ++v) {
+                if (tree.depth[v] < 0) continue;
+                distance[v] = 0.04 * tree.depth[v];
+                q.push({distance[v], v});
+            }
+
+            int target = -1;
+            // One settled label per cell is a routing heuristic, rather than
+            // an exact direction-state shortest path. Every predecessor is
+            // already settled, so the resulting physical path cannot cycle.
+            while (!q.empty()) {
+                auto [cost, p] = q.top();
+                q.pop();
+                if (settled[p] || cost > distance[p]) continue;
+                settled[p] = true;
+                if (tree.depth[p] < 0 && slimeColor[p] == color) {
+                    target = p;
+                    break;
+                }
+                for (int outward = 0; outward < 4; ++outward) {
+                    int v = neighbor[p][outward];
+                    if (v < 0 || tree.depth[v] >= 0 || settled[v]) continue;
+                    int nextDepth = routeDepth[p] + 1;
+                    int direct = shortest[color][v];
+                    if (nextDepth > direct + max(2, direct / 3)) continue;
+                    int towardNest = outward ^ 1;
+                    int run = direction[p] == towardNest ? min(8, straight[p] + 1) : 1;
+                    double lengthValue = (run - 1) / 7.0;
+                    double reward = 0.70 * crossing[v][towardNest / 2] *
+                                    (0.25 + 0.75 * lengthValue);
+                    bool bends = direction[p] >= 0 && direction[p] != towardNest;
+                    double edgeCost = 1.0 + 0.12 * bends - 0.08 * lengthValue - reward;
+                    // edgeCost >= 0.22 even with maximal crossing support.
+                    double nextCost = cost + edgeCost;
+                    if (nextCost >= distance[v]) continue;
+                    distance[v] = nextCost;
+                    previous[v] = p;
+                    routeDepth[v] = nextDepth;
+                    direction[v] = towardNest;
+                    straight[v] = run;
+                    q.push({nextCost, v});
+                }
+            }
+            if (target < 0) return nullopt;
+
+            // The downstream path, including its outgoing straight length,
+            // is now fixed and becomes a seed for the next slime connection.
+            for (int v = target; tree.depth[v] < 0; v = previous[v]) {
+                tree.parent[v] = previous[v];
+                tree.depth[v] = routeDepth[v];
+                tree.direction[v] = direction[v];
+                tree.straight[v] = straight[v];
+                if (slimeColor[v] == color) --remaining;
+            }
+        }
+        return tree;
+    };
+
+    vector<RouteTree> trees(K);
+    for (int color = 0; color < K; ++color) {
+        auto tree = build(color, emptySupport, false);
+        if (!tree) return {}; // Connected floors make this unreachable.
+        trees[color] = std::move(*tree);
+    }
+    Support total = emptySupport;
+    auto addSupport = [&](Support& support, const RouteTree& tree, double sign) {
+        for (int v = 0; v < cells; ++v) {
+            if (tree.parent[v] < 0) continue; // No departures from a nest.
+            double value = 0.25 + 0.75 * (tree.straight[v] - 1) / 7.0;
+            support[v][tree.direction[v] / 2] += sign * value;
+        }
+    };
+    for (const auto& tree : trees) addSupport(total, tree, 1.0);
+
+    // Revisiting colors lets earlier routes see later colors as well. This is
+    // fixed geometric rerouting, with no schedule annealing or score trials.
+    for (int pass = 0; pass < 3; ++pass) {
+        for (int i = 0; i < K; ++i) {
+            if (chrono::steady_clock::now() >= refinementDeadline) return trees;
+            int color = pass % 2 == 0 ? i : K - 1 - i;
+            Support foreign = total;
+            addSupport(foreign, trees[color], -1.0);
+            auto tree = build(color, foreign, true);
+            if (!tree) return trees;
+            addSupport(total, trees[color], -1.0);
+            trees[color] = std::move(*tree);
+            addSupport(total, trees[color], 1.0);
+        }
+    }
+    return trees;
+}
+
 // Interleave all colors so that a temporarily parked block can serve as a
-// springboard for a different color. Every moved slime stays on its own tree
-// and strictly approaches its root; an unfinished candidate is never returned.
+// springboard for a different color. Mixed two-move actions may temporarily
+// leave a color's tree, but must return all survivors to their own trees without
+// increasing any payload's depth. Only completed candidates are returned.
 optional<vector<Op>> cooperativeSolve(
     const vector<string>& grid, int K,
     const vector<vector<int>>& parent,
@@ -187,6 +360,7 @@ optional<vector<Op>> cooperativeSolve(
     static constexpr double readinessWeights[8] =
         {7.0, 7.0, 7.0, 7.0, 10.0, 10.0, 10.0, 10.0};
     const int variant = ((mode % 8) + 8) % 8;
+    const bool useMixed = mode >= 8;
     const double supportWeight = supportWeights[variant];
     const double readinessWeight = readinessWeights[variant];
 
@@ -287,6 +461,7 @@ optional<vector<Op>> cooperativeSolve(
         struct Candidate {
             int source = -1, target = -1, count = 0, length = 0;
             double score = -1e100;
+            int secondTarget = -1, secondCount = 0, secondLength = 0;
         } best;
         for (int source = 0; source < cells; ++source) {
             int color = topColor[source];
@@ -349,24 +524,263 @@ optional<vector<Op>> cooperativeSolve(
                 }
             }
         }
+
+        if (useMixed) {
+            // A one- or two-move action touches at most three cells. Keep the
+            // exact stack order here: after one flip the payload's bottom is
+            // exposed; after two whole-payload flips its original top returns.
+            struct LocalState {
+                array<int, 3> cell{-1, -1, -1};
+                array<Stack, 3> stack;
+                int size = 0, homed = 0, splits = 0;
+                double merged = 0.0, skipped = 0.0;
+            };
+            auto readStack = [&](const LocalState& state, int v) -> const Stack& {
+                for (int i = 0; i < state.size; ++i)
+                    if (state.cell[i] == v) return state.stack[i];
+                return board[v];
+            };
+            auto editStack = [&](LocalState& state, int v) -> Stack& {
+                for (int i = 0; i < state.size; ++i)
+                    if (state.cell[i] == v) return state.stack[i];
+                assert(state.size < 3);
+                int i = state.size++;
+                state.cell[i] = v;
+                state.stack[i] = board[v];
+                return state.stack[i];
+            };
+            auto topRun = [](const Stack& stack) {
+                if (stack.size == 0) return 0;
+                int count = 1;
+                while (count < stack.size &&
+                       stack.color[stack.size - 1 - count] == stack.color[stack.size - 1])
+                    ++count;
+                return count;
+            };
+            auto simulate = [&](LocalState& state, int source, int target, int count, int len) {
+                if (source == target || target < 0 || target >= cells || len < 1 || len > 8)
+                    return false;
+                int dr = (target / n - source / n) / len;
+                int dc = (target % n - source % n) / len;
+                if (abs(dr) + abs(dc) != 1 || source / n + dr * len != target / n ||
+                    source % n + dc * len != target % n) return false;
+                for (int step = 1; step <= len; ++step) {
+                    int r = source / n + dr * step, c = source % n + dc * step;
+                    if (r < 0 || r >= n || c < 0 || c >= n || grid[r][c] == '#') return false;
+                }
+                Stack& from = editStack(state, source);
+                Stack& to = editStack(state, target);
+                int kept = from.size - count;
+                if (count <= 0 || kept < 0 || len > kept + 1 || to.size + count > 8) return false;
+
+                array<int, 26> moving{}, skipped{};
+                for (int j = kept; j < from.size; ++j) ++moving[from.color[j]];
+                for (int step = 1; step < len; ++step) {
+                    int v = (source / n + dr * step) * n + source % n + dc * step;
+                    const Stack& middle = readStack(state, v);
+                    for (int j = 0; j < middle.size; ++j) ++skipped[middle.color[j]];
+                }
+                for (int color = 0; color < K; ++color)
+                    state.skipped += min(moving[color], skipped[color]);
+                if (to.size > 0 && to.color[to.size - 1] == from.color[from.size - 1])
+                    state.merged += min({count, topRun(from), topRun(to)});
+                if (kept > 0 && from.color[kept - 1] == from.color[kept]) ++state.splits;
+                for (int j = from.size - 1; j >= kept; --j) to.color[to.size++] = from.color[j];
+                from.size = kept;
+                auto localHome = [&](int v, Stack& stack) {
+                    while (stack.size > 0 && stack.color[stack.size - 1] == nest[v]) {
+                        --stack.size;
+                        ++state.homed;
+                    }
+                };
+                localHome(source, from);
+                localHome(target, to);
+                return true;
+            };
+            auto exposure = [&](const LocalState& state, int v, const Stack& stack) {
+                if (stack.size == 0) return 0.0;
+                int color = stack.color[stack.size - 1], count = topRun(stack);
+                int maximum = min(run[color][v], stack.size - count + 1);
+                for (int len = maximum; len >= 1; --len) {
+                    int target = jump[color][v][len - 1];
+                    if (readStack(state, target).size + count <= 8)
+                        return 0.5 * count + len - 1;
+                }
+                return 0.0;
+            };
+            auto evaluate = [&](const LocalState& state, const Candidate& action) {
+                int steps = action.secondTarget < 0 ? 1 : 2;
+                if ((int)answer.size() + steps >= operationLimit) return;
+                const Stack& original = board[action.source];
+                int kept = original.size - action.count;
+                array<int, 26> moved{}, gain{}, firstIndex;
+                firstIndex.fill(8);
+                unsigned movingMask = 0;
+                for (int j = 0; j < original.size; ++j)
+                    firstIndex[original.color[j]] = min(firstIndex[original.color[j]], j);
+                for (int j = kept; j < original.size; ++j) {
+                    ++moved[original.color[j]];
+                    movingMask |= 1u << original.color[j];
+                }
+                double supportChange = 0.0, exposureChange = 0.0;
+                LocalState before;
+                for (int i = 0; i < state.size; ++i) {
+                    int v = state.cell[i];
+                    const Stack& old = board[v];
+                    const Stack& now = state.stack[i];
+                    for (int j = 0; j < old.size; ++j) {
+                        int color = old.color[j];
+                        if (depth[color][v] < 0) return;
+                        gain[color] += depth[color][v];
+                    }
+                    for (int j = 0; j < now.size; ++j) {
+                        int color = now.color[j];
+                        if (depth[color][v] < 0) return;
+                        gain[color] -= depth[color][v];
+                    }
+                    double change = support[v][now.size] - support[v][old.size];
+                    for (int color = 0; color < K; ++color) {
+                        if (movingMask & (1u << color))
+                            change -= colorSupport(color, v, now.size) - colorSupport(color, v, old.size);
+                    }
+                    supportChange += change;
+                    exposureChange += exposure(state, v, now) - exposure(before, v, old);
+                }
+                double score = 0.0;
+                int totalGain = 0;
+                for (int color = 0; color < K; ++color) {
+                    if (gain[color] < 0) return;
+                    totalGain += gain[color];
+                    if (moved[color] == 0 || gain[color] == 0) continue;
+                    int desired = min(8 - firstIndex[color], pending[color][action.source]);
+                    double ready = min(1.0, (double)moved[color] / max(1, desired));
+                    double distance = (double)gain[color] / moved[color];
+                    score += 1.0 + 0.55 * moved[color] + 1.65 * (distance - 1.0);
+                    score -= readinessWeight * (1.0 - ready);
+                }
+                if (totalGain <= 0) return;
+                score += 1.25 * state.merged - 0.85 * state.splits - 0.8 * state.skipped;
+                score += 0.20 * state.homed + supportWeight * supportChange;
+                score += 0.30 * exposureChange;
+                score /= steps; // Compare one- and two-move actions per operation.
+                if (score > best.score) {
+                    best = action;
+                    best.score = score;
+                }
+            };
+
+            for (int source = 0; source < cells; ++source) {
+                if (chrono::steady_clock::now() >= deadline) return nullopt;
+                const Stack& stack = board[source];
+                int top = topColor[source], block = topCount[source];
+                if (top < 0 || block == stack.size || run[top][source] == 0) continue;
+                for (int count = block + 1; count <= stack.size; ++count) {
+                    int kept = stack.size - count;
+                    int bottomColor = stack.color[kept], bottomCount = 1;
+                    while (bottomCount < count && stack.color[kept + bottomCount] == bottomColor)
+                        ++bottomCount;
+                    int maximum = min(run[top][source], kept + 1);
+                    for (int len = 1; len <= maximum; ++len) {
+                        int target = jump[top][source][len - 1];
+                        if (board[target].size + count > 8) continue;
+                        auto advances = [&](int color) {
+                            return depth[color][target] >= 0 &&
+                                   depth[color][target] < depth[color][source];
+                        };
+                        // Only the lowest homogeneous block may temporarily
+                        // leave its tree: reversal exposes it for the next move.
+                        bool upperAdvances = true;
+                        for (int j = kept + bottomCount; j < stack.size; ++j)
+                            if (!advances(stack.color[j])) upperAdvances = false;
+                        if (!upperAdvances) continue;
+
+                        Candidate action{source, target, count, len, -1e100};
+                        LocalState first;
+                        if (!simulate(first, source, target, count, len)) continue;
+                        bool allAdvance = advances(bottomColor);
+                        if (allAdvance) evaluate(first, action);
+                        if ((int)answer.size() + 2 >= operationLimit) continue;
+                        const Stack& landing = readStack(first, target);
+                        int payload = max(0, landing.size - board[target].size);
+                        if (payload == 0) continue;
+
+                        if (allAdvance) {
+                            // Odd: release the newly exposed bottom-color block.
+                            // Even: carry the entire surviving payload once more,
+                            // restoring its original orientation at the next stop.
+                            int exposed = min(payload, topRun(landing));
+                            array<int, 2> choices{exposed, payload};
+                            int color = landing.color[landing.size - 1];
+                            for (int choice = 0; choice < 2; ++choice) {
+                                if (choice == 1 && payload == exposed) continue;
+                                int nextCount = choices[choice];
+                                int maxNext = min(run[color][target], landing.size - nextCount + 1);
+                                for (int nextLen = 1; nextLen <= maxNext; ++nextLen) {
+                                    int end = jump[color][target][nextLen - 1];
+                                    bool returnsToTrees = true;
+                                    for (int j = landing.size - nextCount; j < landing.size; ++j) {
+                                        int c = landing.color[j];
+                                        if (depth[c][end] < 0 || depth[c][end] > depth[c][source])
+                                            returnsToTrees = false;
+                                    }
+                                    if (!returnsToTrees) continue;
+                                    LocalState second = first;
+                                    if (!simulate(second, target, end, nextCount, nextLen)) continue;
+                                    Candidate pair = action;
+                                    pair.secondTarget = end;
+                                    pair.secondCount = nextCount;
+                                    pair.secondLength = nextLen;
+                                    evaluate(second, pair);
+                                }
+                            }
+                        } else {
+                            // Carry the upper colors forward, flip the hidden
+                            // bottom block to the top, then use those upper
+                            // colors as a springboard to jump back past source.
+                            int dr = (target / n - source / n) / len;
+                            int dc = (target % n - source % n) / len;
+                            int maxNext = landing.size - bottomCount + 1;
+                            for (int nextLen = len; nextLen <= maxNext; ++nextLen) {
+                                int back = nextLen - len;
+                                int end = source;
+                                if (back > 0) {
+                                    end = jump[bottomColor][source][back - 1];
+                                    if (end < 0 || end / n != source / n - dr * back ||
+                                        end % n != source % n - dc * back) continue;
+                                }
+                                LocalState second = first;
+                                if (!simulate(second, target, end, bottomCount, nextLen)) continue;
+                                Candidate pair = action;
+                                pair.secondTarget = end;
+                                pair.secondCount = bottomCount;
+                                pair.secondLength = nextLen;
+                                evaluate(second, pair);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if (best.source < 0) return nullopt;
 
-        Stack& from = board[best.source];
-        Stack& to = board[best.target];
-        int kept = from.size - best.count;
-        char direction;
-        if (best.target / n < best.source / n) direction = 'U';
-        else if (best.target / n > best.source / n) direction = 'D';
-        else if (best.target % n < best.source % n) direction = 'L';
-        else direction = 'R';
-        answer.push_back({best.source / n, best.source % n, kept, direction, best.length});
-        // The payload is monochrome, but reverse it explicitly to mirror the
-        // problem rule and keep board simulation locally complete.
-        for (int j = from.size - 1; j >= kept; --j)
-            to.color[to.size++] = from.color[j];
-        from.size = kept;
-        home(best.source);
-        home(best.target);
+        auto execute = [&](int source, int target, int count, int length) {
+            Stack& from = board[source];
+            Stack& to = board[target];
+            int kept = from.size - count;
+            char direction;
+            if (target / n < source / n) direction = 'U';
+            else if (target / n > source / n) direction = 'D';
+            else if (target % n < source % n) direction = 'L';
+            else direction = 'R';
+            answer.push_back({source / n, source % n, kept, direction, length});
+            for (int j = from.size - 1; j >= kept; --j) to.color[to.size++] = from.color[j];
+            from.size = kept;
+            home(source);
+            home(target);
+        };
+        execute(best.source, best.target, best.count, best.length);
+        if (best.secondTarget >= 0)
+            execute(best.target, best.secondTarget, best.secondCount, best.secondLength);
     }
     if ((int)answer.size() >= operationLimit ||
         chrono::steady_clock::now() >= deadline) return nullopt;
@@ -388,22 +802,11 @@ int main() {
     const int dc[4] = {0, 0, -1, 1};
     const char DIR[4] = {'U', 'D', 'L', 'R'};
 
-    auto inside = [&](int r, int c) {
-        return 0 <= r && r < N && 0 <= c && c < N;
-    };
-
-    auto floorCell = [&](int r, int c) {
-        return inside(r, c) && C[r][c] != '#';
-    };
-
     // nest[color]
     vector<Pos> nest(K);
 
     // nestColor[r][c] = 巣の色。巣でなければ -1
     vector<vector<int>> nestColor(N, vector<int>(N, -1));
-
-    // 初期スライム位置
-    vector<vector<Pos>> initialSlimes(K);
 
     // tower[r][c] : 下 -> 上
     vector<vector<vector<int>>> tower(
@@ -423,7 +826,6 @@ int main() {
             if ('a' <= ch && ch < 'a' + K) {
                 int color = ch - 'a';
                 tower[r][c].push_back(color);
-                initialSlimes[color].push_back({r, c});
             }
         }
     }
@@ -534,166 +936,27 @@ int main() {
     // 色ごとに処理
     // ============================================================
 
-    // 色をまたぐ運搬でも、同色を合流させる既存の木を共有する。
-    vector<vector<int>> parentTrees(K, vector<int>(N * N, -1));
-    vector<vector<int>> treeDepths(K, vector<int>(N * N, -1));
+    // 全色の経路を先に作り、交差点とそこから巣方向への直線を優遇する。
+    const auto routingDeadline = searchStart + chrono::milliseconds(350);
+    auto routes = buildCrossingTrees(C, K, routingDeadline);
+    if ((int)routes.size() != K) return 0;
+    vector<vector<int>> parentTrees(K), treeDepths(K);
+    for (int color = 0; color < K; ++color) {
+        parentTrees[color] = routes[color].parent;
+        treeDepths[color] = routes[color].depth;
+    }
     for (int color = 0; color < K; ++color) {
         if (stopped) break;
-
-        /*
-         * この色専用の経路木を作る。
-         *
-         * root = 巣。
-         *
-         * 現在の木に最も近い未接続スライムを BFS で探し、
-         * そのスライムから既存木まで最短路で接続する。
-         *
-         * これによって複数スライムの経路がなるべく
-         * 同じ幹を共有するようになる。
-         */
-
-        vector<vector<bool>> inTree(
-            N, vector<bool>(N, false)
-        );
-
-        vector<vector<Pos>> parent(
-            N, vector<Pos>(N, {-1, -1})
-        );
-
-        vector<vector<int>> depth(
-            N, vector<int>(N, -1)
-        );
-
-        int rr = nest[color].r;
-        int rc = nest[color].c;
-
-        inTree[rr][rc] = true;
-        depth[rr][rc] = 0;
-
-        auto allConnected = [&]() {
-            for (const auto &p : initialSlimes[color]) {
-                if (!inTree[p.r][p.c]) {
-                    return false;
-                }
-            }
-            return true;
-        };
-
-        while (!allConnected()) {
-            vector<vector<bool>> vis(
-                N, vector<bool>(N, false)
-            );
-
-            // prev[x] は BFS で1段木に近いマス
-            vector<vector<Pos>> prev(
-                N, vector<Pos>(N, {-1, -1})
-            );
-
-            queue<Pos> q;
-
-            // 木全体を multi-source BFS の始点にする
-            for (int r = 0; r < N; ++r) {
-                for (int c = 0; c < N; ++c) {
-                    if (inTree[r][c]) {
-                        vis[r][c] = true;
-                        q.push({r, c});
-                    }
-                }
-            }
-
-            Pos target{-1, -1};
-
-            while (!q.empty()) {
-                Pos cur = q.front();
-                q.pop();
-
-                // 未接続の同色スライムなら採用
-                bool isTarget = false;
-
-                for (const auto &p : initialSlimes[color]) {
-                    if (p.r == cur.r &&
-                        p.c == cur.c &&
-                        !inTree[cur.r][cur.c]) {
-                        isTarget = true;
-                        break;
-                    }
-                }
-
-                if (isTarget) {
-                    target = cur;
-                    break;
-                }
-
-                for (int d = 0; d < 4; ++d) {
-                    int nr = cur.r + dr[d];
-                    int nc = cur.c + dc[d];
-
-                    if (!floorCell(nr, nc)) continue;
-                    if (vis[nr][nc]) continue;
-
-                    vis[nr][nc] = true;
-
-                    // cur のほうが木に近い
-                    prev[nr][nc] = cur;
-
-                    q.push({nr, nc});
-                }
-            }
-
-            // 床が連結なので通常起きない
-            if (target.r == -1) {
-                stopped = true;
-                break;
-            }
-
-            // target -> 既存木までたどる
-            vector<Pos> newPath;
-
-            Pos cur = target;
-
-            while (!inTree[cur.r][cur.c]) {
-                newPath.push_back(cur);
-
-                Pos nxt = prev[cur.r][cur.c];
-
-                if (nxt.r == -1) {
-                    stopped = true;
-                    break;
-                }
-
-                parent[cur.r][cur.c] = nxt;
-                cur = nxt;
-            }
-
-            if (stopped) break;
-
-            /*
-             * 木側から順に depth を付ける。
-             *
-             * newPath は
-             * target -> ... -> 木の直前
-             * なので reverse する。
-             */
-            reverse(newPath.begin(), newPath.end());
-
-            for (const Pos &p : newPath) {
-                Pos par = parent[p.r][p.c];
-
-                depth[p.r][p.c] =
-                    depth[par.r][par.c] + 1;
-
-                inTree[p.r][p.c] = true;
-            }
-        }
-
-        if (stopped) break;
-
-        for (int r = 0; r < N; ++r) {
-            for (int c = 0; c < N; ++c) {
-                treeDepths[color][r * N + c] = depth[r][c];
-                const Pos par = parent[r][c];
-                if (par.r >= 0) parentTrees[color][r * N + c] = par.r * N + par.c;
-            }
+        vector<vector<bool>> inTree(N, vector<bool>(N, false));
+        vector<vector<Pos>> parent(N, vector<Pos>(N, {-1, -1}));
+        vector<vector<int>> depth(N, vector<int>(N, -1));
+        int rr = nest[color].r, rc = nest[color].c;
+        for (int v = 0; v < N * N; ++v) {
+            int r = v / N, c = v % N;
+            depth[r][c] = treeDepths[color][v];
+            inTree[r][c] = depth[r][c] >= 0;
+            int p = parentTrees[color][v];
+            if (p >= 0) parent[r][c] = {p / N, p % N};
         }
 
         // --------------------------------------------------------
@@ -883,16 +1146,18 @@ int main() {
     // 生成した操作列の盤面遷移を保ったまま、連続する2移動を圧縮する。
     answer = compressMoves(C, K, answer);
 
-    // 集約待ちと足場保持の重みを変え、全色を交互に進める候補を作る。
+    // 前半は既存の単色移動、後半は反転の偶奇を考慮した混色移動も使う。
     // 完走して操作数が減った候補だけ採用し、途中停止した候補は捨てる。
-    const auto searchDeadline = searchStart + chrono::milliseconds(1200);
+    const auto monochromeDeadline = searchStart + chrono::milliseconds(800);
+    const auto searchDeadline = searchStart + chrono::milliseconds(1650);
     int cooperativeMode = -1;
     if (!stopped) {
-        for (int mode = 0; mode < 8; ++mode) {
-            if (chrono::steady_clock::now() >= searchDeadline) break;
+        for (int mode = 0; mode < 16; ++mode) {
+            const auto deadline = mode < 8 ? monochromeDeadline : searchDeadline;
+            if (chrono::steady_clock::now() >= deadline) continue;
             const int limit = min(MAX_OP, 2 * (int)answer.size() + 1);
             auto candidate = cooperativeSolve(C, K, parentTrees, treeDepths,
-                                               limit, mode, searchDeadline);
+                                               limit, mode, deadline);
             if (!candidate) continue;
             auto compressed = compressMoves(C, K, *candidate);
             if (compressed.size() < answer.size()) {
