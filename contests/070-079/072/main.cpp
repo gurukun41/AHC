@@ -9,6 +9,16 @@ struct Op {
 };
 
 static const int MAX_OP = 100000;
+static constexpr int MAX_COLOR = 12;
+// Tower sizes bound readiness/fit denominators by eight. An incoming batch
+// below twice that denominator needs a numerator of at most fifteen.
+static constexpr auto SMALL_RATIO = [] {
+    array<array<double, 9>, 17> result{};
+    for (int numerator = 0; numerator <= 16; ++numerator)
+        for (int denominator = 0; denominator <= 8; ++denominator)
+            result[numerator][denominator] = (double)numerator / max(1, denominator);
+    return result;
+}();
 
 // Only live colors participate in equality; unused slots retain old values.
 struct SlimeStack {
@@ -143,6 +153,12 @@ vector<Op> compressMoves(
     chrono::steady_clock::time_point deadline = chrono::steady_clock::time_point::max()) {
     SlimeBoard sim(grid, K);
     auto board = sim.initial;
+    // Scratch stacks are initialized only when an endpoint is first touched.
+    vector<SlimeStack> original(board.size()), replacement(board.size());
+    vector<unsigned> touchedAt(board.size(), 0);
+    unsigned generation = 0;
+    vector<int> touched;
+    touched.reserve(48);
     vector<Op> result;
     result.reserve(ops.size());
     for (size_t i = 0; i < ops.size();) {
@@ -153,10 +169,31 @@ vector<Op> compressMoves(
         const Op& first = ops[i];
         int from, current;
         if (!sim.endpoints(first, from, current)) return ops;
-        auto original = board;
+        const int firstTarget = current;
         int payload = board[from].size - first.k;
         int base = board[current].size;
-        if (!sim.apply(original, first)) return ops;
+        SlimeStack firstFrom = board[from], firstTo = board[current];
+        if (transferSlimes(firstFrom, firstTo, first.k, first.len,
+                           sim.nest[from], sim.nest[current]) < 0) return ops;
+        if (first.len >= first.k + 1 || firstTo.size != base + payload) {
+            board[from] = firstFrom;
+            board[current] = firstTo;
+            result.push_back(first);
+            ++i;
+            continue;
+        }
+        ++generation;
+        touched.clear();
+        auto touch = [&](int v) {
+            if (touchedAt[v] == generation) return;
+            touchedAt[v] = generation;
+            touched.push_back(v);
+            original[v] = board[v];
+        };
+        touch(from);
+        touch(current);
+        original[from] = firstFrom;
+        original[current] = firstTo;
         bool palindrome = true;
         for (int a = first.k, b = board[from].size - 1; a < b; ++a, --b) {
             if (board[from].color[a] != board[from].color[b]) palindrome = false;
@@ -164,7 +201,6 @@ vector<Op> compressMoves(
 
         vector<int> chainCells{from, current}, skippedCells;
         vector<Op> skipped, bestReplacement;
-        vector<SlimeStack> bestBoard;
         size_t bestEnd = i;
         int distance = first.len, links = 1;
         if (distance < first.k + 1 && original[current].size == base + payload) {
@@ -178,6 +214,8 @@ vector<Op> compressMoves(
                 if (!continues) {
                     if (find(chainCells.begin(), chainCells.end(), a) != chainCells.end() ||
                         find(chainCells.begin(), chainCells.end(), b) != chainCells.end()) break;
+                    touch(a);
+                    touch(b);
                     if (!sim.apply(original, next)) return ops;
                     skipped.push_back(next);
                     skippedCells.push_back(a);
@@ -185,6 +223,7 @@ vector<Op> compressMoves(
                     continue;
                 }
                 if (find(skippedCells.begin(), skippedCells.end(), b) != skippedCells.end()) break;
+                touch(b);
                 int nextBase = original[b].size;
                 if (!sim.apply(original, next)) return ops;
                 distance += next.len;
@@ -198,7 +237,7 @@ vector<Op> compressMoves(
                 if ((links & 1) || palindrome) {
                     Op combined = first;
                     combined.len = distance;
-                    auto replacement = board;
+                    for (int v : touched) replacement[v] = board[v];
                     bool valid = sim.apply(replacement, combined);
                     for (const Op& middle : skipped) {
                         if (!valid || !sim.apply(replacement, middle)) {
@@ -206,10 +245,18 @@ vector<Op> compressMoves(
                             break;
                         }
                     }
-                    if (valid && replacement == original) {
+                    // Both sequences leave every other cell unchanged.
+                    if (valid) {
+                        for (int v : touched) {
+                            if (!(replacement[v] == original[v])) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (valid) {
                         bestReplacement = {combined};
                         bestReplacement.insert(bestReplacement.end(), skipped.begin(), skipped.end());
-                        bestBoard = original;
                         bestEnd = j + 1;
                     }
                 }
@@ -217,11 +264,13 @@ vector<Op> compressMoves(
             }
         }
         if (bestEnd > i) {
+            for (const Op& op : bestReplacement)
+                if (!sim.apply(board, op)) return ops;
             result.insert(result.end(), bestReplacement.begin(), bestReplacement.end());
-            board = std::move(bestBoard);
             i = bestEnd;
         } else {
-            if (!sim.apply(board, first)) return ops;
+            board[from] = firstFrom;
+            board[firstTarget] = firstTo;
             result.push_back(first);
             ++i;
         }
@@ -240,6 +289,7 @@ vector<Op> optimizeMoveWindows(
     struct Edge { int from, to; Op op; };
     struct Node { State state; int parent; Op op; int score; };
     auto board = sim.initial;
+    vector<Cell> original(board.size()), verified(board.size());
     vector<Op> result;
     result.reserve(ops.size());
     int searched = 0;
@@ -249,7 +299,7 @@ vector<Op> optimizeMoveWindows(
             break;
         }
         vector<int> cells;
-        auto original = board;
+        cells.reserve(6);
         size_t end = i;
         for (; end < ops.size() && end < i + 4; ++end) {
             int from, to;
@@ -259,6 +309,8 @@ vector<Op> optimizeMoveWindows(
                 if (find(nextCells.begin(), nextCells.end(), v) == nextCells.end()) nextCells.push_back(v);
             }
             if (nextCells.size() > 6) break;
+            for (size_t c = cells.size(); c < nextCells.size(); ++c)
+                original[nextCells[c]] = board[nextCells[c]];
             if (!sim.apply(original, ops[end])) return ops;
             cells = std::move(nextCells);
         }
@@ -268,7 +320,7 @@ vector<Op> optimizeMoveWindows(
             ++searched;
             const int count = (int)cells.size();
             State start{}, target{};
-            array<int, 26> targetCounts{};
+            array<int, MAX_COLOR> targetCounts{};
             for (int c = 0; c < count; ++c) {
                 start[c] = board[cells[c]];
                 target[c] = original[cells[c]];
@@ -291,7 +343,7 @@ vector<Op> optimizeMoveWindows(
             }
             auto scoreState = [&](const State& state) {
                 int score = 0;
-                array<int, 26> counts{};
+                array<int, MAX_COLOR> counts{};
                 for (int c = 0; c < count; ++c) {
                     score += 3 * abs(state[c].size - target[c].size);
                     int prefix = 0;
@@ -302,7 +354,7 @@ vector<Op> optimizeMoveWindows(
                 }
                 // Homed pieces never return, so losing a required color is
                 // irreparable while the search is confined to these cells.
-                for (int c = 0; c < 26; ++c) {
+                for (int c = 0; c < K; ++c) {
                     if (counts[c] < targetCounts[c]) return INT_MAX;
                     score += counts[c] - targetCounts[c];
                 }
@@ -379,8 +431,9 @@ vector<Op> optimizeMoveWindows(
             if (finish >= 0) {
                 for (int id = finish; nodes[id].parent >= 0; id = nodes[id].parent) replacement.push_back(nodes[id].op);
                 reverse(replacement.begin(), replacement.end());
-                // Revalidate on the entire board, not just the searched cells.
-                auto verified = board;
+                // Replay exact transitions on all touched cells; every other
+                // cell is unchanged by both the window and its replacement.
+                for (int v : cells) verified[v] = board[v];
                 bool valid = replacement.size() < end - i;
                 for (const Op& op : replacement) {
                     if (!valid || !sim.apply(verified, op)) {
@@ -388,12 +441,20 @@ vector<Op> optimizeMoveWindows(
                         break;
                     }
                 }
-                if (valid && verified == original) found = true;
+                if (valid) {
+                    for (int v : cells) {
+                        if (!(verified[v] == original[v])) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if (valid) found = true;
             }
         }
         if (found) {
             result.insert(result.end(), replacement.begin(), replacement.end());
-            board = std::move(original);
+            for (int v : cells) board[v] = original[v];
             i = end;
         } else {
             if (!sim.apply(board, ops[i])) return ops;
@@ -689,6 +750,11 @@ struct CooperativeScheduler {
     struct State {
         vector<Stack> board;
         int remaining = 0;
+        // Copies retain their identity. Each atomic action receives a unique
+        // revision and records the cells changed from its predecessor.
+        uint64_t revision = 0, previousRevision = UINT64_MAX;
+        array<int, 3> changedCells{};
+        int changedCount = 0;
     };
     struct Candidate {
         int source = -1, target = -1, count = 0, length = 0;
@@ -708,6 +774,8 @@ struct CooperativeScheduler {
     vector<vector<int>> parent, depth, order, run, sharedPath;
     vector<vector<array<int, 8>>> jump, reachableGain;
     vector<array<array<int, 8>, 4>> ray;
+    vector<signed char> moveInfo;
+    vector<int> cellRow, cellColumn;
     vector<vector<vector<Forward>>> treeForward, shortcutForward;
     vector<int> nest;
     State initial, state;
@@ -717,6 +785,19 @@ struct CooperativeScheduler {
     vector<vector<int>> local, pending, nearest, arrivalDistance, arrivalSize, nearestSize;
     vector<vector<double>> traffic;
     vector<array<double, 9>> support;
+    vector<vector<array<double, 9>>> supportByColor;
+    vector<double> originalExposure;
+    vector<Stack> cachedBoard;
+    vector<int> batchPrefix;
+    vector<unsigned char> originalOnTree;
+    vector<unsigned> supportAt, exposureAt;
+    vector<int> activeCells, dirtySupportCells;
+    array<uint64_t, 7> occupied{};
+    vector<vector<int>> activeSupport;
+    bool boardCacheReady = false, cachedShortcuts = false;
+    uint64_t cachedRevision = UINT64_MAX;
+    mutable uint64_t nextRevision = 0;
+    unsigned decisionGeneration = 0;
 
     CooperativeScheduler(const vector<string>& grid_, int K_, const vector<RouteTree>& routes)
         : grid(grid_), n((int)grid.size()), K(K_), cells(n * n),
@@ -724,19 +805,27 @@ struct CooperativeScheduler {
           sharedPath(K * K, vector<int>(cells)),
           jump(K, vector<array<int, 8>>(cells)),
           reachableGain(K, vector<array<int, 8>>(cells)), ray(cells),
+          moveInfo(cells * cells, -1), cellRow(cells), cellColumn(cells),
           treeForward(K, vector<vector<Forward>>(cells)),
           shortcutForward(K, vector<vector<Forward>>(cells)),
-          topColor(cells), topCount(cells), batchCount(cells), waitTarget(cells), waitState(cells),
+          topColor(cells, -1), topCount(cells), batchCount(cells), waitTarget(cells), waitState(cells),
           wholeCanMove(cells), waiting(cells), sharedPotential(cells),
           local(K, vector<int>(cells)), pending(local), nearest(local),
           arrivalDistance(local), arrivalSize(local), nearestSize(local),
-          traffic(K, vector<double>(cells)), support(cells) {
+          traffic(K, vector<double>(cells)), support(cells),
+          supportByColor(K, vector<array<double, 9>>(cells)), originalExposure(cells),
+          cachedBoard(cells), batchPrefix(cells), originalOnTree(cells),
+          supportAt(cells), exposureAt(cells), activeSupport(K) {
+        activeCells.reserve(cells);
+        dirtySupportCells.reserve(cells);
         SlimeBoard board(grid, K);
         initial.board = std::move(board.initial);
         nest = std::move(board.nest);
         for (const auto& stack : initial.board) initial.remaining += stack.size;
         constexpr int dr[4] = {-1, 1, 0, 0}, dc[4] = {0, 0, -1, 1};
         for (int v = 0; v < cells; ++v) {
+            cellRow[v] = v / n;
+            cellColumn[v] = v % n;
             for (int d = 0; d < 4; ++d) {
                 ray[v][d].fill(-1);
                 if (grid[v / n][v % n] == '#') continue;
@@ -744,6 +833,7 @@ struct CooperativeScheduler {
                     int r = v / n + dr[d] * len, c = v % n + dc[d] * len;
                     if (r < 0 || r >= n || c < 0 || c >= n || grid[r][c] == '#') break;
                     ray[v][d][len - 1] = r * n + c;
+                    moveInfo[v * cells + r * n + c] = d * 8 + len - 1;
                 }
             }
         }
@@ -782,6 +872,7 @@ struct CooperativeScheduler {
             }
             sort(order[color].begin(), order[color].end(),
                  [&](int a, int b) { return depth[color][a] > depth[color][b]; });
+            activeSupport[color].reserve(order[color].size());
         }
         for (int a = 0; a < K; ++a) {
             for (int b = a + 1; b < K; ++b) {
@@ -811,11 +902,16 @@ struct CooperativeScheduler {
                               Clock::time_point deadline, int alternativeLimit = 0,
                               const Candidate* focus = nullptr) {
         auto& board = state.board;
+        if (Clock::now() >= deadline) return nullopt;
+        if (++decisionGeneration == 0) {
+            fill(supportAt.begin(), supportAt.end(), 0);
+            fill(exposureAt.begin(), exposureAt.end(), 0);
+            ++decisionGeneration;
+        }
         // These are scheduling preferences, not legality constraints. Relax
         // them at the edited action only; suffix repair keeps the full policy.
         const bool explore = alternativeLimit > 0;
         const auto& forward = allowShortcuts ? shortcutForward : treeForward;
-        auto readBoard = [&](int v) -> const Stack& { return board[v]; };
         unsigned candidateChecks = 0;
         auto deadlineReached = [&]() {
             return (++candidateChecks & 63u) == 0 && Clock::now() >= deadline;
@@ -889,43 +985,92 @@ struct CooperativeScheduler {
             return true;
         };
 
-        fill(topColor.begin(), topColor.end(), -1);
-        fill(topCount.begin(), topCount.end(), 0);
-        for (int color = 0; color < K; ++color) {
-            fill(local[color].begin(), local[color].end(), 0);
-            fill(nearest[color].begin(), nearest[color].end(), cells + 1);
-            fill(nearestSize[color].begin(), nearestSize[color].end(), 1);
-            fill(arrivalDistance[color].begin(), arrivalDistance[color].end(), cells + 1);
-            fill(arrivalSize[color].begin(), arrivalSize[color].end(), 1);
-            fill(traffic[color].begin(), traffic[color].end(), 0.0);
-        }
-        for (int v = 0; v < cells; ++v) {
+        // Consecutive repair steps expose their two or three changed cells.
+        // Restored histories fall back to comparing the full cached board.
+        const bool refreshSupport = !boardCacheReady || cachedShortcuts != allowShortcuts;
+        unsigned dirtyColors = boardCacheReady ? 0u : (1u << K) - 1;
+        auto updateCell = [&](int v) {
             const Stack& stack = board[v];
+            if (boardCacheReady && stack == cachedBoard[v]) return;
+            const Stack& old = cachedBoard[v];
+            array<int, MAX_COLOR> difference{};
+            unsigned presentColors = 0;
+            for (int j = 0; j < old.size; ++j) {
+                int color = old.color[j];
+                --local[color][v];
+                --difference[color];
+                presentColors |= 1u << color;
+            }
+            originalOnTree[v] = true;
+            for (int j = 0; j < stack.size; ++j) {
+                int color = stack.color[j];
+                ++local[color][v];
+                ++difference[color];
+                presentColors |= 1u << color;
+                if (depth[color][v] < 0) originalOnTree[v] = false;
+            }
+            for (unsigned mask = presentColors; mask; mask &= mask - 1) {
+                int color = __builtin_ctz(mask);
+                if (difference[color] != 0) dirtyColors |= 1u << color;
+            }
             sharedPotential[v] = sharedValue(v, stack);
-            for (int j = 0; j < stack.size; ++j) ++local[stack.color[j]][v];
-            if (stack.size == 0) continue;
-            int color = stack.color[stack.size - 1];
-            topColor[v] = color;
+            int color = stack.size > 0 ? stack.color[stack.size - 1] : -1;
             int count = stack.topCount();
+            if (topColor[v] != color || topCount[v] != count) {
+                if (topColor[v] >= 0) dirtyColors |= 1u << topColor[v];
+                if (color >= 0) dirtyColors |= 1u << color;
+            }
+            topColor[v] = color;
             topCount[v] = count;
-            nearest[color][v] = 0;
-            nearestSize[color][v] = count;
+            uint64_t bit = uint64_t(1) << (v & 63);
+            if (stack.size > 0) occupied[v >> 6] |= bit;
+            else occupied[v >> 6] &= ~bit;
+            batchCount[v] = batchSize(v, stack);
+            batchPrefix[v] = batchCount[v] > 0 ? sharedPrefix(v, stack, batchCount[v]) : 0;
+            cachedBoard[v] = stack;
+        };
+        if (!boardCacheReady || (state.revision != cachedRevision &&
+                                state.previousRevision != cachedRevision)) {
+            for (int v = 0; v < cells; ++v) updateCell(v);
+        } else if (state.revision != cachedRevision) {
+            for (int i = 0; i < state.changedCount; ++i) updateCell(state.changedCells[i]);
+        }
+        boardCacheReady = true;
+        cachedShortcuts = allowShortcuts;
+        cachedRevision = state.revision;
+        // Ascending cell order preserves candidate serials and cycle choices.
+        activeCells.clear();
+        for (int word = 0; word < (int)occupied.size(); ++word) {
+            for (uint64_t mask = occupied[word]; mask; mask &= mask - 1)
+                activeCells.push_back(word * 64 + __builtin_ctzll(mask));
         }
 
         // The leading batch waits for an exposed follower that can reach it
         // through empty cells, fit on its tower, and then share an outgoing edge.
         // Stop at the first occupied cell so blocked/hidden arrivals cannot
         // reserve a distant batch indefinitely.
-        fill(waitTarget.begin(), waitTarget.end(), -1);
-        fill(waitState.begin(), waitState.end(), 0);
-        fill(waiting.begin(), waiting.end(), false);
-        for (int source = 0; source < cells; ++source) {
+        // Every wait edge connects two occupied cells. Empty cells cannot
+        // participate in this graph or become candidate sources.
+        for (int v : activeCells) {
+            waitTarget[v] = -1;
+            waitState[v] = 0;
+            waiting[v] = false;
+        }
+        for (int source : activeCells) {
             const Stack& stack = board[source];
-            int count = batchCount[source] = batchSize(source, stack);
-            wholeCanMove[source] = batchCanMove(source, stack, count, readBoard);
+            int count = batchCount[source];
+            wholeCanMove[source] = false;
             if (count == 0) continue;
             int color = topColor[source], v = source;
-            int length = sharedPrefix(source, stack, count);
+            int length = batchPrefix[source];
+            int maximum = min({run[color][source], length, stack.size - count + 1});
+            for (int len = 1; len <= maximum; ++len) {
+                int target = jump[color][source][len - 1];
+                if (board[target].size + count <= 8) {
+                    wholeCanMove[source] = true;
+                    break;
+                }
+            }
             for (int step = 0; step < length; ++step) {
                 v = parent[color][v];
                 if (board[v].size == 0) continue;
@@ -944,61 +1089,102 @@ struct CooperativeScheduler {
             }
             waitState[v] = 2;
         };
-        for (int v = 0; v < cells; ++v)
+        for (int v : activeCells)
             if (waitState[v] == 0) breakWaitCycles(breakWaitCycles, v);
-        for (int v = 0; v < cells; ++v)
+        for (int v : activeCells)
             if (waitTarget[v] >= 0) waiting[waitTarget[v]] = true;
 
         // Pending mass includes hidden blocks. Arrival distance uses exposed
         // blocks only, so a blocked distant color does not reserve a tower.
+        dirtySupportCells.clear();
+        auto markSupportDirty = [&](int v) {
+            if (supportAt[v] == decisionGeneration) return;
+            supportAt[v] = decisionGeneration;
+            dirtySupportCells.push_back(v);
+        };
+        if (refreshSupport)
+            for (int v = 0; v < cells; ++v) markSupportDirty(v);
         for (int color = 0; color < K; ++color) {
-            pending[color] = local[color];
-            for (int v : order[color]) {
-                int p = parent[color][v];
-                if (p < 0) continue;
-                pending[color][p] += pending[color][v];
-                int distance = nearest[color][v] + 1;
-                if (distance < arrivalDistance[color][p]) {
-                    arrivalDistance[color][p] = distance;
-                    arrivalSize[color][p] = nearestSize[color][v];
+            bool dirty = (dirtyColors & (1u << color)) != 0;
+            if (!dirty && !refreshSupport) continue;
+            if (dirty) {
+                fill(nearest[color].begin(), nearest[color].end(), cells + 1);
+                fill(nearestSize[color].begin(), nearestSize[color].end(), 1);
+                fill(arrivalDistance[color].begin(), arrivalDistance[color].end(), cells + 1);
+                fill(arrivalSize[color].begin(), arrivalSize[color].end(), 1);
+                for (int v : activeCells) {
+                    if (topColor[v] != color) continue;
+                    nearest[color][v] = 0;
+                    nearestSize[color][v] = topCount[v];
                 }
-                if (distance < nearest[color][p]) {
-                    nearest[color][p] = distance;
-                    nearestSize[color][p] = nearestSize[color][v];
+                pending[color] = local[color];
+                for (int v : order[color]) {
+                    int p = parent[color][v];
+                    if (p < 0) continue;
+                    pending[color][p] += pending[color][v];
+                    int distance = nearest[color][v] + 1;
+                    if (distance < arrivalDistance[color][p]) {
+                        arrivalDistance[color][p] = distance;
+                        arrivalSize[color][p] = nearestSize[color][v];
+                    }
+                    if (distance < nearest[color][p]) {
+                        nearest[color][p] = distance;
+                        nearestSize[color][p] = nearestSize[color][v];
+                    }
                 }
             }
+            for (int v : activeSupport[color]) {
+                traffic[color][v] = 0.0;
+                markSupportDirty(v);
+            }
+            activeSupport[color].clear();
             for (int v : order[color]) {
                 int incoming = pending[color][v] - local[color][v];
                 int distance = arrivalDistance[color][v];
                 bool useful = allowShortcuts ?
                     reachableGain[color][v][7] > reachableGain[color][v][0] : run[color][v] >= 2;
                 if (incoming == 0 || distance > cells || !useful) continue;
-                double batches = min(2.0, (double)incoming / max(1, arrivalSize[color][v]));
+                int arrival = arrivalSize[color][v];
+                double batches = incoming >= 2 * arrival ? 2.0 : SMALL_RATIO[incoming][arrival];
                 traffic[color][v] = batches / (1.0 + 0.5 * distance);
+                activeSupport[color].push_back(v);
+                markSupportDirty(v);
+                auto& values = supportByColor[color][v];
+                values[0] = values[8] = 0.0;
+                for (int height = 1; height < 8; ++height) {
+                    int saved = allowShortcuts ?
+                        reachableGain[color][v][height] - reachableGain[color][v][0] :
+                        min(height, run[color][v] - 1);
+                    double fit = min(1.0, SMALL_RATIO[8 - height][arrival]);
+                    values[height] = traffic[color][v] * saved * fit;
+                }
             }
         }
 
-        auto colorSupport = [&](int color, int v, int height) {
-            if (height <= 0 || height >= 8 || traffic[color][v] == 0.0) return 0.0;
-            int saved = allowShortcuts ?
-                reachableGain[color][v][height] - reachableGain[color][v][0] :
-                min(height, run[color][v] - 1);
-            double fit = min(1.0, (double)(8 - height) / arrivalSize[color][v]);
-            return traffic[color][v] * saved * fit;
-        };
-        for (int v = 0; v < cells; ++v) {
+        // Re-sum affected cells in color order instead of subtracting old
+        // contributions, preserving the original floating-point accumulation.
+        for (int v : dirtySupportCells) {
             support[v].fill(0.0);
             for (int color = 0; color < K; ++color) {
                 if (traffic[color][v] == 0.0) continue;
+                const auto& values = supportByColor[color][v];
                 for (int height = 1; height < 8; ++height)
-                    support[v][height] += colorSupport(color, v, height);
+                    support[v][height] += values[height];
             }
         }
+        auto colorSupport = [&](int color, int v, int height) {
+            return traffic[color][v] == 0.0 ? 0.0 : supportByColor[color][v][height];
+        };
         auto foreignSupport = [&](int color, int v, int height) {
             return support[v][height] - colorSupport(color, v, height);
         };
 
         Decision decision;
+        if (explore) {
+            decision.alternatives.reserve(alternativeLimit + 1);
+            decision.related.reserve(alternativeLimit + 1);
+            decision.sameSource.reserve(9);
+        }
         int serial = 0;
         auto collect = [&](vector<Candidate>& choices, const Candidate& tagged,
                            int limit, int perSource) {
@@ -1036,7 +1222,12 @@ struct CooperativeScheduler {
                     if (a >= 0 && a == b) interacts = true;
             if (interacts) collect(decision.related, tagged, alternativeLimit, 3);
         };
-        for (int source = 0; source < cells; ++source) {
+        auto canJoinMonochrome = [&](int v, int color, int count) {
+            if (topColor[v] < 0 || board[v].size + count > 8) return false;
+            int next = parent[topColor[v]][v];
+            return next >= 0 && parent[color][v] == next;
+        };
+        for (int source : activeCells) {
             int color = topColor[source];
             if (color < 0 || forward[color][source].empty() || (!explore && waiting[source])) continue;
             int height = board[source].size;
@@ -1045,6 +1236,9 @@ struct CooperativeScheduler {
             int subtree = pending[color][source];
             int desired = min(8 - bottom, subtree);
             double originalSupport = foreignSupport(color, source, height);
+            unsigned tie = (unsigned)(source + 1) * 2654435761u;
+            tie ^= (unsigned)(color + 1 + variant * 17) * 2246822519u;
+            const double tieScore = 0.00001 * (tie % 1024);
             array<array<int, 9>, 4> skippedPrefix{};
             for (int d = 0; allowShortcuts && d < 4; ++d) {
                 for (int distance = 1; distance <= 8; ++distance) {
@@ -1057,6 +1251,27 @@ struct CooperativeScheduler {
             for (int count = 1; count <= block; ++count) {
                 if (!explore && count < batchCount[source] && wholeCanMove[source]) continue;
                 int kept = height - count;
+                Stack remaining = board[source];
+                remaining.size = kept;
+                remaining.home(nest[source]);
+                const double sourceSupportChange =
+                    foreignSupport(color, source, remaining.size) - originalSupport;
+                const double sourceSharedChange =
+                    sharedValue(source, remaining) - sharedPotential[source];
+                array<int, 4> firstJoin;
+                firstJoin.fill(9);
+                if (allowShortcuts && !explore) {
+                    for (int d = 0; d < 4; ++d) {
+                        for (int distance = 1; distance <= kept; ++distance) {
+                            int v = ray[source][d][distance - 1];
+                            if (v < 0) break;
+                            if (canJoinMonochrome(v, color, count)) {
+                                firstJoin[d] = distance;
+                                break;
+                            }
+                        }
+                    }
+                }
                 int skippedSameColor = 0;
                 for (const Forward& step : forward[color][source]) {
                     if (deadlineReached()) return nullopt;
@@ -1071,25 +1286,17 @@ struct CooperativeScheduler {
                         // baseline path, including its first merge stop.
                         if (len > 1) {
                             int skipped = jump[color][source][len - 2];
-                            if (!explore && canJoin(skipped, board[source], count, board[skipped])) break;
+                            if (!explore && canJoinMonochrome(skipped, color, count)) break;
                             skippedSameColor += local[color][skipped];
                         }
                     } else {
-                        bool skipsJoin = false;
-                        for (int distance = 1; distance < len; ++distance) {
-                            int middle = ray[source][step.direction][distance - 1];
-                            if (canJoin(middle, board[source], count, board[middle])) {
-                                skipsJoin = true;
-                                break;
-                            }
-                        }
-                        if (!explore && skipsJoin) continue;
+                        if (!explore && firstJoin[step.direction] < len) continue;
                         skippedSameColor = skippedPrefix[step.direction][len - 1];
                     }
                     if (destinationHeight + count > 8) continue;
 
                     int sameAtTarget = topColor[target] == color ? topCount[target] : 0;
-                    double ready = min(1.0, (double)count / max(1, desired));
+                    double ready = min(1.0, SMALL_RATIO[count][desired]);
                     // Once a block is full, waiting for more descendants cannot
                     // save an additional batch on this departure.
                     double score = 1.0 + 0.55 * count + 1.65 * (step.gain - 1);
@@ -1101,24 +1308,26 @@ struct CooperativeScheduler {
                     if (nest[target] == color) score += 0.20 * count;
                     if (count == block && bottom > 0) score += 0.15 * bottom;
 
-                    Stack from = board[source], to = board[target];
-                    if (transferSlimes(from, to, kept, len, nest[source], nest[target]) < 0) continue;
-                    double supportChange = foreignSupport(color, source, from.size) - originalSupport;
+                    // This suffix is monochrome, so reversal changes no colors.
+                    // Geometry, kept height and destination capacity were
+                    // already checked; the source result is cached above.
+                    Stack to = board[target];
+                    for (int j = 0; j < count; ++j) to.color[to.size++] = color;
+                    to.home(nest[target]);
+                    double supportChange = sourceSupportChange;
                     supportChange += foreignSupport(color, target, to.size) -
                                      foreignSupport(color, target, destinationHeight);
                     score += supportWeight * supportChange;
 
                     // A monochrome arrival may form a useful mixed stack.
                     // Conversely, discourage peeling apart a shared route.
-                    double change = sharedValue(source, from) - sharedPotential[source] +
+                    double change = sourceSharedChange +
                                     sharedValue(target, to) - sharedPotential[target];
                     score += sharedWeight * change;
 
                     // A stable, mode-dependent tie break explores different
                     // interleavings without random generators or runtime tuning.
-                    unsigned tie = (unsigned)(source + 1) * 2654435761u;
-                    tie ^= (unsigned)(color + 1 + variant * 17) * 2246822519u;
-                    score += 0.00001 * (tie % 1024);
+                    score += tieScore;
                     offer({source, target, count, len, score});
                 }
             }
@@ -1130,6 +1339,7 @@ struct CooperativeScheduler {
         struct LocalState {
             array<int, 3> cell{-1, -1, -1};
             array<Stack, 3> stack;
+            array<int, MAX_COLOR> gain{};
             int size = 0, homed = 0, splits = 0;
             double merged = 0.0, skipped = 0.0;
         };
@@ -1148,9 +1358,8 @@ struct CooperativeScheduler {
             return state.stack[i];
         };
         auto simulate = [&](LocalState& state, int source, int target, int count, int len) {
-            if (moveDirection(source, target, len) < 0) return false;
-            int dr = (target / n - source / n) / len;
-            int dc = (target % n - source % n) / len;
+            int direction = moveDirection(source, target, len);
+            if (direction < 0) return false;
             Stack& from = editStack(state, source);
             Stack& to = editStack(state, target);
             int kept = from.size - count;
@@ -1161,16 +1370,27 @@ struct CooperativeScheduler {
             if (!explore && count < together && batchCanMove(source, from, together, readCurrent))
                 return false;
 
-            array<int, 26> moving{}, skipped{};
-            for (int j = kept; j < from.size; ++j) ++moving[from.color[j]];
+            array<int, MAX_COLOR> moving{}, skipped{};
+            unsigned movingColors = 0;
+            for (int j = kept; j < from.size; ++j) {
+                ++moving[from.color[j]];
+                movingColors |= 1u << from.color[j];
+            }
             for (int step = 1; step < len; ++step) {
-                int v = (source / n + dr * step) * n + source % n + dc * step;
+                int v = ray[source][direction][step - 1];
                 const Stack& middle = readStack(state, v);
                 if (!explore && canJoin(v, from, count, middle)) return false;
                 for (int j = 0; j < middle.size; ++j) ++skipped[middle.color[j]];
             }
-            for (int color = 0; color < K; ++color)
+            for (unsigned mask = movingColors; mask; mask &= mask - 1) {
+                int color = __builtin_ctz(mask);
                 state.skipped += min(moving[color], skipped[color]);
+                // Transfers change only the moving pieces' depths. Homed
+                // pieces are removed at their own nest, whose depth is zero.
+                // A temporary off-tree depth cancels across the second move.
+                state.gain[color] += moving[color] *
+                    (depth[color][source] - depth[color][target]);
+            }
             if (to.size > 0 && to.color[to.size - 1] == from.color[from.size - 1])
                 state.merged += min({count, from.topCount(), to.topCount()});
             if (kept > 0 && from.color[kept - 1] == from.color[kept]) ++state.splits;
@@ -1197,42 +1417,35 @@ struct CooperativeScheduler {
                     gain = max(gain, step.gain);
             return gain > 0 ? 0.5 * count + gain - 1 : 0.0;
         };
-        auto evaluate = [&](const LocalState& state, const Candidate& action) {
+        const LocalState before;
+        auto evaluate = [&](const LocalState& state, const Candidate& action,
+                            const array<int, MAX_COLOR>& moved, unsigned movingMask,
+                            const array<int, MAX_COLOR>& firstIndex) {
             int steps = action.secondTarget < 0 ? 1 : 2;
             const Stack& original = board[action.source];
             int kept = original.size - action.count;
-            array<int, 26> moved{}, gain{}, firstIndex;
-            firstIndex.fill(8);
-            unsigned movingMask = 0;
-            for (int j = 0; j < original.size; ++j)
-                firstIndex[original.color[j]] = min(firstIndex[original.color[j]], j);
-            for (int j = kept; j < original.size; ++j) {
-                ++moved[original.color[j]];
-                movingMask |= 1u << original.color[j];
-            }
+            const auto& gain = state.gain;
             double supportChange = 0.0, exposureChange = 0.0, sharedChange = 0.0;
-            LocalState before;
             for (int i = 0; i < state.size; ++i) {
                 int v = state.cell[i];
                 const Stack& old = board[v];
                 const Stack& now = state.stack[i];
-                for (int j = 0; j < old.size; ++j) {
-                    int color = old.color[j];
-                    if (depth[color][v] < 0) return;
-                    gain[color] += depth[color][v];
-                }
+                if (!originalOnTree[v]) return;
                 for (int j = 0; j < now.size; ++j) {
                     int color = now.color[j];
                     if (depth[color][v] < 0) return;
-                    gain[color] -= depth[color][v];
                 }
                 double change = support[v][now.size] - support[v][old.size];
-                for (int color = 0; color < K; ++color) {
-                    if (movingMask & (1u << color))
-                        change -= colorSupport(color, v, now.size) - colorSupport(color, v, old.size);
+                for (unsigned mask = movingMask; mask; mask &= mask - 1) {
+                    int color = __builtin_ctz(mask);
+                    change -= colorSupport(color, v, now.size) - colorSupport(color, v, old.size);
                 }
                 supportChange += change;
-                exposureChange += exposure(state, v, now) - exposure(before, v, old);
+                if (exposureAt[v] != decisionGeneration) {
+                    exposureAt[v] = decisionGeneration;
+                    originalExposure[v] = exposure(before, v, old);
+                }
+                exposureChange += exposure(state, v, now) - originalExposure[v];
                 sharedChange += sharedValue(v, now) - sharedPotential[v];
             }
             double score = 0.0;
@@ -1242,7 +1455,7 @@ struct CooperativeScheduler {
                 totalGain += gain[color];
                 if (moved[color] == 0 || gain[color] == 0) continue;
                 int desired = min(8 - firstIndex[color], pending[color][action.source]);
-                double ready = min(1.0, (double)moved[color] / max(1, desired));
+                double ready = min(1.0, SMALL_RATIO[moved[color]][desired]);
                 double distance = (double)gain[color] / moved[color];
                 score += 1.0 + 0.55 * moved[color] + 1.65 * (distance - 1.0);
                 score -= readinessWeight * (1.0 - ready);
@@ -1261,7 +1474,7 @@ struct CooperativeScheduler {
                     ++colors;
                 }
                 int desired = min(8 - kept, incoming);
-                double ready = min(1.0, (double)action.count / max(1, desired));
+                double ready = min(1.0, SMALL_RATIO[action.count][desired]);
                 double distance = (double)totalGain / action.count;
                 score = 1.0 + 0.55 * action.count + 1.65 * (distance - 1.0) +
                         0.85 * (colors - 1) - readinessWeight * (1.0 - ready);
@@ -1276,15 +1489,24 @@ struct CooperativeScheduler {
             offer(scored);
         };
 
-        for (int source = 0; source < cells; ++source) {
-            if (chrono::steady_clock::now() >= deadline) return nullopt;
+        for (int source : activeCells) {
             const Stack& stack = board[source];
             int top = topColor[source], block = topCount[source];
             if (top < 0 || block == stack.size || forward[top][source].empty() ||
                 (!explore && waiting[source])) continue;
+            if (Clock::now() >= deadline) return nullopt;
+            array<int, MAX_COLOR> firstIndex;
+            firstIndex.fill(8);
+            for (int j = 0; j < stack.size; ++j)
+                firstIndex[stack.color[j]] = min(firstIndex[stack.color[j]], j);
+            array<int, MAX_COLOR> moved{};
+            moved[top] = block;
+            unsigned movingMask = 1u << top;
             for (int count = block + 1; count <= stack.size; ++count) {
-                if (!explore && count < batchCount[source] && wholeCanMove[source]) continue;
                 int kept = stack.size - count;
+                ++moved[stack.color[kept]];
+                movingMask |= 1u << stack.color[kept];
+                if (!explore && count < batchCount[source] && wholeCanMove[source]) continue;
                 int bottomColor = stack.color[kept], bottomCount = 1;
                 while (bottomCount < count && stack.color[kept + bottomCount] == bottomColor)
                     ++bottomCount;
@@ -1308,7 +1530,7 @@ struct CooperativeScheduler {
                     LocalState first;
                     if (!simulate(first, source, target, count, len)) continue;
                     bool allAdvance = advances(bottomColor);
-                    if (allAdvance) evaluate(first, action);
+                    if (allAdvance) evaluate(first, action, moved, movingMask, firstIndex);
                     const Stack& landing = readStack(first, target);
                     int payload = max(0, landing.size - board[target].size);
                     if (payload == 0) continue;
@@ -1343,7 +1565,7 @@ struct CooperativeScheduler {
                                     pair.secondTarget = end;
                                     pair.secondCount = nextCount;
                                     pair.secondLength = nextLen;
-                                    evaluate(second, pair);
+                                    evaluate(second, pair, moved, movingMask, firstIndex);
                                 }
                             }
                         }
@@ -1374,32 +1596,27 @@ struct CooperativeScheduler {
                                 pair.secondTarget = end;
                                 pair.secondCount = nextCount;
                                 pair.secondLength = nextLen;
-                                evaluate(second, pair);
+                                evaluate(second, pair, moved, movingMask, firstIndex);
                             }
                         }
                     } else {
                         // Carry the upper colors forward, flip the hidden
                         // bottom block to the top, then use those upper
                         // colors as a springboard to jump back past source.
-                        int dr = (target / n - source / n) / len;
-                        int dc = (target % n - source % n) / len;
                         int maxNext = landing.size - bottomCount + 1;
                         for (int nextLen = len; nextLen <= maxNext; ++nextLen) {
                             if (deadlineReached()) return nullopt;
                             int back = nextLen - len;
-                            int end = source;
-                            if (back > 0) {
-                                end = jump[bottomColor][source][back - 1];
-                                if (end < 0 || end / n != source / n - dr * back ||
-                                    end % n != source % n - dc * back) continue;
-                            }
+                            int end = ray[target][step.direction ^ 1][nextLen - 1];
+                            if (end < 0 || (back > 0 &&
+                                jump[bottomColor][source][back - 1] != end)) continue;
                             LocalState second = first;
                             if (!simulate(second, target, end, bottomCount, nextLen)) continue;
                             Candidate pair = action;
                             pair.secondTarget = end;
                             pair.secondCount = bottomCount;
                             pair.secondLength = nextLen;
-                            evaluate(second, pair);
+                            evaluate(second, pair, moved, movingMask, firstIndex);
                         }
                     }
                 }
@@ -1413,12 +1630,13 @@ struct CooperativeScheduler {
     int moveDirection(int source, int target, int length) const {
         if (source < 0 || source >= cells || target < 0 || target >= cells ||
             length < 1 || length > 8) return -1;
-        int d = target / n < source / n ? 0 : target / n > source / n ? 1 :
-                target % n < source % n ? 2 : 3;
-        return ray[source][d][length - 1] == target ? d : -1;
+        int info = moveInfo[source * cells + target];
+        return info >= 0 && (info & 7) == length - 1 ? info >> 3 : -1;
     }
 
     bool apply(State& value, const Candidate& action, vector<Op>* output = nullptr) const {
+        const uint64_t previousRevision = value.revision;
+        bool changed = false;
         auto move = [&](int source, int target, int count, int length) {
             int d = moveDirection(source, target, length);
             if (d < 0) return false;
@@ -1426,8 +1644,23 @@ struct CooperativeScheduler {
             int homed = transferSlimes(value.board[source], value.board[target], kept, length,
                                        nest[source], nest[target]);
             if (homed < 0) return false;
+            if (!changed) {
+                changed = true;
+                value.previousRevision = previousRevision;
+                value.revision = ++nextRevision;
+                value.changedCount = 0;
+            }
+            for (int v : {source, target}) {
+                bool seen = false;
+                for (int i = 0; i < value.changedCount; ++i)
+                    if (value.changedCells[i] == v) seen = true;
+                if (!seen) {
+                    assert(value.changedCount < 3);
+                    value.changedCells[value.changedCount++] = v;
+                }
+            }
             value.remaining -= homed;
-            if (output) output->push_back({source / n, source % n, kept, "UDLR"[d], length});
+            if (output) output->push_back({cellRow[source], cellColumn[source], kept, "UDLR"[d], length});
             return true;
         };
         if (!move(action.source, action.target, action.count, action.length)) return false;
@@ -1504,6 +1737,8 @@ optional<vector<Op>> rewriteCooperativeHistory(
         vector<State> checkpoints;
         unordered_multimap<uint64_t, int> boundary;
         vector<Site> sites;
+        vector<int> weightTree;
+        int totalWeight = 0;
     };
     auto mix = [](uint64_t x) {
         x ^= x >> 30;
@@ -1584,7 +1819,34 @@ optional<vector<Op>> rewriteCooperativeHistory(
             if (cost > MAX_OP || !applyTracked(state, action, hash)) return nullopt;
         }
         if (state.remaining != 0) return nullopt;
+        // Fenwick tree keeps weighted pivot selection logarithmic. A site is
+        // removed once its cached alternatives have all been tried.
+        history.weightTree.assign(count + 1, 0);
+        for (int i = 1; i <= count; ++i) {
+            history.totalWeight += history.weight[i - 1];
+            history.weightTree[i] += history.weight[i - 1];
+            int next = i + (i & -i);
+            if (next <= count) history.weightTree[next] += history.weightTree[i];
+        }
         return history;
+    };
+    auto removeSite = [](History& history, int at) {
+        int weight = history.weight[at];
+        history.totalWeight -= weight;
+        for (int i = at + 1; i < (int)history.weightTree.size(); i += i & -i)
+            history.weightTree[i] -= weight;
+    };
+    auto selectSite = [](const History& history, int draw) {
+        int at = 0, count = (int)history.actions.size(), step = 1;
+        while (step <= count / 2) step <<= 1;
+        for (; step > 0; step >>= 1) {
+            int next = at + step;
+            if (next <= count && history.weightTree[next] <= draw) {
+                draw -= history.weightTree[next];
+                at = next;
+            }
+        }
+        return at;
     };
     auto restore = [&](const History& history, int at, State& out) {
         int base = at / CHECKPOINT * CHECKPOINT;
@@ -1615,16 +1877,8 @@ optional<vector<Op>> rewriteCooperativeHistory(
     const double startTemperature = clamp(bestRaw * 0.01, 1.5, 5.0);
 
     while (Clock::now() < deadline) {
-        int totalWeight = 0;
-        for (int i = 0; i < (int)current.actions.size(); ++i)
-            if (current.sites[i].available()) totalWeight += current.weight[i];
-        if (totalWeight == 0) break;
-        int draw = (int)(rng() % totalWeight), cut = -1;
-        for (int i = 0; i < (int)current.actions.size(); ++i) {
-            if (!current.sites[i].available()) continue;
-            draw -= current.weight[i];
-            if (draw < 0) { cut = i; break; }
-        }
+        if (current.totalWeight == 0) break;
+        int cut = selectSite(current, (int)(rng() % current.totalWeight));
         if (!restore(current, cut, sim.state)) { ++stats.invalid; break; }
         Site& site = current.sites[cut];
         if (!site.ready) {
@@ -1633,7 +1887,10 @@ optional<vector<Op>> rewriteCooperativeHistory(
                                        deadline, 12, &current.actions[cut]);
             if (Clock::now() >= deadline) { ++stats.timedOut; break; }
             site.ready = true;
-            if (!decision) continue;
+            if (!decision) {
+                removeSite(current, cut);
+                continue;
+            }
             auto addChoices = [&](const vector<Candidate>& choices, double weight) {
                 for (int rank = 0; rank < (int)choices.size(); ++rank) {
                     const Candidate& action = choices[rank];
@@ -1650,7 +1907,10 @@ optional<vector<Op>> rewriteCooperativeHistory(
             addChoices(decision->alternatives, 1.0);
             addChoices(decision->related, 3.0);
             addChoices(decision->sameSource, 2.0);
-            if (site.choices.empty()) continue;
+            if (site.choices.empty()) {
+                removeSite(current, cut);
+                continue;
+            }
         } else ++stats.cachedPivots;
 
         double choiceWeight = 0.0;
@@ -1666,6 +1926,7 @@ optional<vector<Op>> rewriteCooperativeHistory(
         }
         if (selected < 0) break;
         site.tried |= uint64_t(1) << selected;
+        if (!site.available()) removeSite(current, cut);
         Candidate next = site.choices[selected].action;
         ++stats.attempts;
         ++stats.cutThirds[min(2, 3 * cut / (int)current.actions.size())];
@@ -1753,6 +2014,8 @@ optional<vector<Op>> rewriteCooperativeHistory(
                 changed->sites[tailStart + i - join] = std::move(current.sites[i]);
                 changed->sites[tailStart + i - join].tried = 0;
             }
+        for (int i = 0; i < (int)changed->sites.size(); ++i)
+            if (!changed->sites[i].available()) removeSite(*changed, i);
         current = std::move(*changed);
         ++stats.accepted;
         if (delta == 0) ++stats.neutralAccepted;
