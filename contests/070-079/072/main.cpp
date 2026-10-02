@@ -1,3 +1,27 @@
+#if defined(__GNUC__) && !defined(__clang__)
+// Keep standard floating-point semantics for candidate scores and cache checks.
+#pragma GCC optimize("O3", "unroll-loops")
+#endif
+
+// AtCoder defines ONLINE_JUDGE. Local builds retain diagnostics by default;
+// -DENABLE_DEBUG=0 also selects submission-style diagnostics locally.
+#ifndef ENABLE_DEBUG
+#ifdef ONLINE_JUDGE
+#define ENABLE_DEBUG 0
+#else
+#define ENABLE_DEBUG 1
+#endif
+#endif
+
+#ifndef ENABLE_PROFILING
+#define ENABLE_PROFILING ENABLE_DEBUG
+#endif
+
+// Define this before standard headers so runtime assertions are compiled out.
+#if !ENABLE_DEBUG && !defined(NDEBUG)
+#define NDEBUG
+#endif
+
 #include <bits/stdc++.h>
 using namespace std;
 
@@ -10,6 +34,112 @@ struct Op {
 
 static const int MAX_OP = 100000;
 static constexpr int MAX_COLOR = 12;
+
+// -DENABLE_PROFILING=0 disables timers while retaining local search statistics.
+// Sampling uses call counters, never the solver's random-number sequence.
+template<size_t Parts>
+struct TimingBucket {
+    uint64_t calls = 0, samples = 0, sampleNs = 0;
+    array<uint64_t, Parts> partNs{};
+
+    uint64_t estimate(uint64_t measured) const {
+        return samples == 0 ? 0 : (uint64_t)((long double)measured * calls / samples);
+    }
+    void print(ostream& out, const char* name, const array<const char*, Parts>& labels) const {
+        out << ' ' << name << "_calls=" << calls
+            << ' ' << name << "_samples=" << samples
+            << ' ' << name << "_sample_ns=" << sampleNs
+            << ' ' << name << "_est_ns=" << estimate(sampleNs);
+        if constexpr (Parts > 1)
+            for (size_t i = 0; i < Parts; ++i)
+                out << ' ' << name << '_' << labels[i] << "_sample_ns=" << partNs[i]
+                    << ' ' << name << '_' << labels[i] << "_est_ns=" << estimate(partNs[i]);
+    }
+};
+
+template<size_t Parts>
+struct SampledTiming {
+    using Clock = chrono::steady_clock;
+    TimingBucket<Parts>& bucket;
+    Clock::time_point started{}, previous{};
+    size_t part = 0;
+    bool active = false;
+
+    SampledTiming(TimingBucket<Parts>& bucket_, uint64_t period,
+                  Clock::time_point origin = {}) : bucket(bucket_) {
+        if constexpr (ENABLE_PROFILING) {
+            active = (bucket.calls++ % period) == 0;
+            if (active) {
+                ++bucket.samples;
+                started = previous = origin == Clock::time_point{} ? Clock::now() : origin;
+            }
+        }
+    }
+    SampledTiming(const SampledTiming&) = delete;
+    SampledTiming& operator=(const SampledTiming&) = delete;
+    void next(size_t nextPart) {
+        if constexpr (ENABLE_PROFILING) {
+            if (!active) return;
+            auto now = Clock::now();
+            bucket.partNs[part] += chrono::duration_cast<chrono::nanoseconds>(now - previous).count();
+            previous = now;
+            part = nextPart;
+        }
+    }
+    void finish() {
+        if constexpr (ENABLE_PROFILING) {
+            if (!active) return;
+            auto now = Clock::now();
+            bucket.partNs[part] += chrono::duration_cast<chrono::nanoseconds>(now - previous).count();
+            bucket.sampleNs += chrono::duration_cast<chrono::nanoseconds>(now - started).count();
+            active = false;
+        }
+    }
+    ~SampledTiming() { finish(); }
+};
+
+struct PerformanceProfile {
+    static constexpr uint64_t DECISION_PERIOD = 64, HISTORY_PERIOD = 16, PROBE_PERIOD = 128;
+    bool inSearch = false;
+    TimingBucket<8> main;
+    TimingBucket<4> attempt;
+    TimingBucket<7> seedDecide, pivotDecide, repairDecide;
+    TimingBucket<2> restore;
+    TimingBucket<1> repairApply;
+    TimingBucket<3> join, update;
+    TimingBucket<5> build;
+
+    void print(ostream& out) const {
+        if constexpr (ENABLE_PROFILING) {
+            out << " prof_version=1 prof_decide_period=" << DECISION_PERIOD
+                << " prof_history_period=" << HISTORY_PERIOD
+                << " prof_probe_period=" << PROBE_PERIOD;
+            const array<const char*, 8> stages{
+                "input", "routes", "fallback", "scheduler", "baseline", "search", "search_compress", "postprocess"};
+            out << " prof_main_ns=" << main.sampleNs;
+            for (size_t i = 0; i < stages.size(); ++i)
+                out << " prof_" << stages[i] << "_ns=" << main.partNs[i];
+            // Main stages are exact wall times, excluding log/output I/O.
+            // Below: est_ns = sample_ns * calls / samples, including early
+            // returns. Parts partition their parent; parent/child timers overlap.
+            // attempt -> pivot/repair/accept/update; decide/restore/join/apply
+            // refine the first two. build refines update (plus initial setup).
+            attempt.print(out, "prof_attempt", {"pivot", "repair", "accept", "update"});
+            const array<const char*, 7> decisionParts{
+                "setup", "cache", "wait", "support", "mono", "mixed", "finish"};
+            seedDecide.print(out, "prof_seed_decide", decisionParts);
+            pivotDecide.print(out, "prof_pivot_decide", decisionParts);
+            repairDecide.print(out, "prof_repair_decide", decisionParts);
+            restore.print(out, "prof_restore", {"copy", "replay"});
+            repairApply.print(out, "prof_repair_apply", {"work"});
+            join.print(out, "prof_join", {"lookup", "restore", "compare"});
+            update.print(out, "prof_update", {"actions", "build", "cache_commit"});
+            build.print(out, "prof_build", {"setup", "index", "snapshots", "replay", "weights"});
+        }
+    }
+};
+static PerformanceProfile performance;
+
 // Tower sizes bound readiness/fit denominators by eight. An incoming batch
 // below twice that denominator needs a numerator of at most fifteen.
 static constexpr auto SMALL_RATIO = [] {
@@ -23,7 +153,7 @@ static constexpr auto SMALL_RATIO = [] {
 // Only live colors participate in equality; unused slots retain old values.
 struct SlimeStack {
     array<unsigned char, 8> color{};
-    int size = 0;
+    uint8_t size = 0; // 0..8; arithmetic is promoted to int.
 
     bool operator==(const SlimeStack& other) const {
         return size == other.size &&
@@ -41,6 +171,7 @@ struct SlimeStack {
         return before - size;
     }
 };
+static_assert(sizeof(SlimeStack) == 9);
 
 // Geometry is checked by the caller. Capacity must be checked before homing.
 bool canTransfer(const SlimeStack& from, const SlimeStack& to, int kept, int length) {
@@ -767,25 +898,61 @@ struct CooperativeScheduler {
         Candidate greedy;
         vector<Candidate> alternatives, related, sameSource;
     };
-    struct Forward { int target, length, direction, gain; };
+    struct Forward {
+        int target;
+        uint8_t length, direction; // Length 1..8, direction 0..3.
+        int gain; // Cell IDs and tree-depth gains can exceed 255.
+    };
+    static_assert(sizeof(Forward) == 12);
+    struct ProgressMask { uint16_t strict = 0, nonworsening = 0; };
+    struct TreeChildren { array<int, 4> cell{}; int size = 0; };
+    struct SupportInput { int incoming = -1, distance = -1, arrival = -1; };
+
+    // Rows are appended in order during construction, then accessed as spans.
+    // Both the elements and row boundaries occupy single contiguous vectors.
+    template<class T>
+    struct FlatLists {
+        vector<T> values;
+        vector<int> offsets;
+
+        explicit FlatLists(int rows) : offsets(rows + 1) {}
+        span<T> operator[](int row) {
+            return span<T>(values).subspan(offsets[row], offsets[row + 1] - offsets[row]);
+        }
+        span<const T> operator[](int row) const {
+            return span<const T>(values).subspan(offsets[row], offsets[row + 1] - offsets[row]);
+        }
+    };
 
     const vector<string>& grid;
     int n, K, cells;
-    vector<vector<int>> parent, depth, order, run, sharedPath;
-    vector<vector<array<int, 8>>> jump, reachableGain;
+    // Fixed tables use color-major rows: color * cells + cell.
+    vector<int> parent, depth;
+    vector<uint8_t> run; // Straight-run lengths: 0..8.
+    vector<int> sharedPath, orderIndex;
+    FlatLists<int> order;
+    vector<TreeChildren> children;
+    vector<ProgressMask> progressMask;
+    vector<array<int, 8>> jump, reachableGain;
     vector<array<array<int, 8>, 4>> ray;
     vector<signed char> moveInfo;
     vector<int> cellRow, cellColumn;
-    vector<vector<vector<Forward>>> treeForward, shortcutForward;
+    FlatLists<Forward> treeForward, shortcutForward;
     vector<int> nest;
     State initial, state;
-    vector<int> topColor, topCount, batchCount, waitTarget, waitState;
-    vector<bool> wholeCanMove, waiting;
+    vector<int8_t> topColor; // -1 for empty, otherwise 0..K-1.
+    vector<uint8_t> topCount, batchCount; // 0..8.
+    vector<int> waitTarget;
+    vector<uint8_t> waitState; // DFS states: 0..2.
+    vector<uint8_t> wholeCanMove, waiting; // Byte flags avoid bit read-modify-write.
     vector<double> sharedPotential;
-    vector<vector<int>> local, pending, nearest, arrivalDistance, arrivalSize, nearestSize;
-    vector<vector<double>> traffic;
+    vector<uint8_t> local; // Per-cell color counts: 0..8.
+    vector<int> pending, nearest, arrivalDistance;
+    vector<uint8_t> arrivalSize, nearestSize; // Exposed batch sizes: 1..8.
+    vector<double> traffic;
     vector<array<double, 9>> support;
-    vector<vector<array<double, 9>>> supportByColor;
+    vector<array<double, 9>> supportByColor;
+    vector<SupportInput> supportInput;
     vector<double> originalExposure;
     vector<Stack> cachedBoard;
     vector<int> batchPrefix;
@@ -793,29 +960,28 @@ struct CooperativeScheduler {
     vector<unsigned> supportAt, exposureAt;
     vector<int> activeCells, dirtySupportCells;
     array<uint64_t, 7> occupied{};
-    vector<vector<int>> activeSupport;
     bool boardCacheReady = false, cachedShortcuts = false;
     uint64_t cachedRevision = UINT64_MAX;
     mutable uint64_t nextRevision = 0;
     unsigned decisionGeneration = 0;
 
+    int cellIndex(int color, int v) const { return color * cells + v; }
+
     CooperativeScheduler(const vector<string>& grid_, int K_, const vector<RouteTree>& routes)
         : grid(grid_), n((int)grid.size()), K(K_), cells(n * n),
-          parent(K), depth(K), order(K), run(K, vector<int>(cells)),
-          sharedPath(K * K, vector<int>(cells)),
-          jump(K, vector<array<int, 8>>(cells)),
-          reachableGain(K, vector<array<int, 8>>(cells)), ray(cells),
+          parent(K * cells), depth(K * cells), run(K * cells), sharedPath(K * K * cells),
+          orderIndex(K * cells, -1), order(K), children(K * cells),
+          progressMask(cells * cells), jump(K * cells), reachableGain(K * cells), ray(cells),
           moveInfo(cells * cells, -1), cellRow(cells), cellColumn(cells),
-          treeForward(K, vector<vector<Forward>>(cells)),
-          shortcutForward(K, vector<vector<Forward>>(cells)),
+          treeForward(K * cells), shortcutForward(K * cells),
           topColor(cells, -1), topCount(cells), batchCount(cells), waitTarget(cells), waitState(cells),
           wholeCanMove(cells), waiting(cells), sharedPotential(cells),
-          local(K, vector<int>(cells)), pending(local), nearest(local),
-          arrivalDistance(local), arrivalSize(local), nearestSize(local),
-          traffic(K, vector<double>(cells)), support(cells),
-          supportByColor(K, vector<array<double, 9>>(cells)), originalExposure(cells),
+          local(K * cells), pending(K * cells), nearest(K * cells, cells + 1),
+          arrivalDistance(nearest), arrivalSize(K * cells, 1), nearestSize(arrivalSize),
+          traffic(K * cells), support(cells), supportByColor(K * cells),
+          supportInput(K * cells), originalExposure(cells),
           cachedBoard(cells), batchPrefix(cells), originalOnTree(cells),
-          supportAt(cells), exposureAt(cells), activeSupport(K) {
+          supportAt(cells), exposureAt(cells) {
         activeCells.reserve(cells);
         dirtySupportCells.reserve(cells);
         SlimeBoard board(grid, K);
@@ -838,23 +1004,28 @@ struct CooperativeScheduler {
             }
         }
         for (int color = 0; color < K; ++color) {
-            parent[color] = routes[color].parent;
-            depth[color] = routes[color].depth;
+            copy(routes[color].parent.begin(), routes[color].parent.end(), parent.begin() + color * cells);
+            copy(routes[color].depth.begin(), routes[color].depth.end(), depth.begin() + color * cells);
             for (int v = 0; v < cells; ++v) {
-                jump[color][v].fill(-1);
-                if (depth[color][v] < 0) continue;
-                order[color].push_back(v);
-                int p = parent[color][v];
+                int index = cellIndex(color, v);
+                // Record empty rows as well, including walls and off-tree cells.
+                treeForward.offsets[index] = (int)treeForward.values.size();
+                shortcutForward.offsets[index] = (int)shortcutForward.values.size();
+                jump[cellIndex(color, v)].fill(-1);
+                if (depth[cellIndex(color, v)] < 0) continue;
+                order.values.push_back(v);
+                int p = parent[cellIndex(color, v)];
                 if (p >= 0) {
                     int d = p / n < v / n ? 0 : p / n > v / n ? 1 : p % n < v % n ? 2 : 3;
                     int at = v;
                     for (int len = 1; len <= 8; ++len) {
-                        int next = parent[color][at];
+                        int next = parent[cellIndex(color, at)];
                         if (next < 0 || next / n - at / n != dr[d] ||
                             next % n - at % n != dc[d]) break;
-                        jump[color][v][len - 1] = next;
-                        run[color][v] = len;
-                        treeForward[color][v].push_back({next, len, d, len});
+                        jump[cellIndex(color, v)][len - 1] = next;
+                        run[cellIndex(color, v)] = len;
+                        treeForward.values.push_back({next, static_cast<uint8_t>(len),
+                                                      static_cast<uint8_t>(d), len});
                         at = next;
                     }
                 }
@@ -862,25 +1033,49 @@ struct CooperativeScheduler {
                     for (int len = 1; len <= 8; ++len) {
                         int target = ray[v][d][len - 1];
                         if (target < 0) break;
-                        if (depth[color][target] < 0 || depth[color][target] >= depth[color][v]) continue;
-                        int gain = depth[color][v] - depth[color][target];
-                        shortcutForward[color][v].push_back({target, len, d, gain});
+                        if (depth[cellIndex(color, target)] < 0 || depth[cellIndex(color, target)] >= depth[cellIndex(color, v)]) continue;
+                        int gain = depth[cellIndex(color, v)] - depth[cellIndex(color, target)];
+                        shortcutForward.values.push_back({target, static_cast<uint8_t>(len),
+                                                          static_cast<uint8_t>(d), gain});
                         for (int kept = len - 1; kept < 8; ++kept)
-                            reachableGain[color][v][kept] = max(reachableGain[color][v][kept], gain);
+                            reachableGain[cellIndex(color, v)][kept] = max(reachableGain[cellIndex(color, v)][kept], gain);
                     }
                 }
             }
+            order.offsets[color + 1] = (int)order.values.size();
             sort(order[color].begin(), order[color].end(),
-                 [&](int a, int b) { return depth[color][a] > depth[color][b]; });
-            activeSupport[color].reserve(order[color].size());
+                 [&](int a, int b) { return depth[cellIndex(color, a)] > depth[cellIndex(color, b)]; });
+            // Strict '<' arrival ties originally followed this order. Retain
+            // it when recomputing a parent directly from its children.
+            for (int i = 0; i < (int)order[color].size(); ++i) {
+                int v = order[color][i], p = parent[cellIndex(color, v)];
+                orderIndex[cellIndex(color, v)] = i;
+                if (p >= 0) {
+                    auto& child = children[cellIndex(color, p)];
+                    assert(child.size < (int)child.cell.size());
+                    child.cell[child.size++] = v;
+                }
+            }
+            for (int source = 0; source < cells; ++source) {
+                for (int target = 0; target < cells; ++target) {
+                    if (depth[cellIndex(color, target)] < 0) continue;
+                    auto& mask = progressMask[source * cells + target];
+                    if (depth[cellIndex(color, target)] <= depth[cellIndex(color, source)])
+                        mask.nonworsening |= 1u << color;
+                    if (depth[cellIndex(color, target)] < depth[cellIndex(color, source)])
+                        mask.strict |= 1u << color;
+                }
+            }
         }
+        treeForward.offsets.back() = (int)treeForward.values.size();
+        shortcutForward.offsets.back() = (int)shortcutForward.values.size();
         for (int a = 0; a < K; ++a) {
             for (int b = a + 1; b < K; ++b) {
-                auto& length = sharedPath[a * K + b];
-                auto& reverseLength = sharedPath[b * K + a];
+                auto length = span<int>(sharedPath).subspan((a * K + b) * cells, cells);
+                auto reverseLength = span<int>(sharedPath).subspan((b * K + a) * cells, cells);
                 for (auto it = order[a].rbegin(); it != order[a].rend(); ++it) {
-                    int v = *it, p = parent[a][v];
-                    if (p >= 0 && parent[b][v] == p)
+                    int v = *it, p = parent[cellIndex(a, v)];
+                    if (p >= 0 && parent[cellIndex(b, v)] == p)
                         length[v] = reverseLength[v] = 1 + length[p];
                 }
             }
@@ -901,6 +1096,9 @@ struct CooperativeScheduler {
     optional<Decision> decide(int mode, bool allowShortcuts, bool allowTransfers,
                               Clock::time_point deadline, int alternativeLimit = 0,
                               const Candidate* focus = nullptr) {
+        auto& timing = alternativeLimit > 0 ? performance.pivotDecide :
+                       performance.inSearch ? performance.repairDecide : performance.seedDecide;
+        SampledTiming<7> profile(timing, PerformanceProfile::DECISION_PERIOD);
         auto& board = state.board;
         if (Clock::now() >= deadline) return nullopt;
         if (++decisionGeneration == 0) {
@@ -930,23 +1128,23 @@ struct CooperativeScheduler {
 
         auto sharedPrefix = [&](int v, const Stack& stack, int count) {
             int reference = stack.color[stack.size - 1];
-            int length = depth[reference][v];
+            int length = depth[cellIndex(reference, v)];
             for (int j = stack.size - count; j < stack.size && length > 0; ++j) {
                 int color = stack.color[j];
                 if (color != reference)
-                    length = min(length, sharedPath[reference * K + color][v]);
+                    length = min(length, sharedPath[cellIndex(reference * K + color, v)]);
             }
             return max(0, length);
         };
         auto sharedValue = [&](int v, const Stack& stack) {
             if (stack.size < 2) return 0.0;
             int reference = stack.color[stack.size - 1];
-            int length = depth[reference][v], blocks = 0, previous = -1;
+            int length = depth[cellIndex(reference, v)], blocks = 0, previous = -1;
             double best = 0.0;
             for (int j = stack.size - 1; j >= 0 && length > 0; --j) {
                 int color = stack.color[j];
                 if (color != reference)
-                    length = min(length, sharedPath[reference * K + color][v]);
+                    length = min(length, sharedPath[cellIndex(reference * K + color, v)]);
                 if (color != previous) ++blocks;
                 previous = color;
                 // Estimate future departures saved by keeping a mixed top suffix
@@ -957,38 +1155,61 @@ struct CooperativeScheduler {
         };
         auto batchSize = [&](int v, const Stack& stack) {
             if (stack.size == 0) return 0;
-            int next = parent[stack.color[stack.size - 1]][v];
+            int next = parent[cellIndex(stack.color[stack.size - 1], v)];
             if (next < 0) return 0;
             int count = 0;
             while (count < stack.size &&
-                   parent[stack.color[stack.size - 1 - count]][v] == next)
+                   parent[cellIndex(stack.color[stack.size - 1 - count], v)] == next)
                 ++count;
             return count;
         };
         auto batchCanMove = [&](int v, const Stack& stack, int count, const auto& read) {
             if (count == 0) return false;
             int color = stack.color[stack.size - 1];
-            int maximum = min({run[color][v], sharedPrefix(v, stack, count),
-                               stack.size - count + 1});
+            int maximum = min<int>({run[cellIndex(color, v)], sharedPrefix(v, stack, count),
+                                    stack.size - count + 1});
             for (int len = 1; len <= maximum; ++len) {
-                int target = jump[color][v][len - 1];
+                int target = jump[cellIndex(color, v)][len - 1];
                 if (read(target).size + count <= 8) return true;
             }
             return false;
         };
         auto canJoin = [&](int v, const Stack& moving, int count, const Stack& resident) {
             if (resident.size == 0 || resident.size + count > 8) return false;
-            int next = parent[resident.color[resident.size - 1]][v];
+            int next = parent[cellIndex(resident.color[resident.size - 1], v)];
             if (next < 0) return false;
             for (int j = moving.size - count; j < moving.size; ++j)
-                if (parent[moving.color[j]][v] != next) return false;
+                if (parent[cellIndex(moving.color[j], v)] != next) return false;
             return true;
         };
 
         // Consecutive repair steps expose their two or three changed cells.
         // Restored histories fall back to comparing the full cached board.
+        profile.next(1); // Board cache and occupied-cell list.
         const bool refreshSupport = !boardCacheReady || cachedShortcuts != allowShortcuts;
         unsigned dirtyColors = boardCacheReady ? 0u : (1u << K) - 1;
+        array<array<uint64_t, 7>, MAX_COLOR> dirtyArrivals{};
+        array<int, MAX_COLOR> dirtyArrivalCount{};
+        auto markArrivalDirty = [&](int color, int v) {
+            int index = orderIndex[cellIndex(color, v)];
+            if (index < 0) {
+                // Off-tree cells have no children or outgoing tree edge.
+                // Keep their local values consistent after history restores.
+                const Stack& stack = board[v];
+                bool exposed = stack.size > 0 && stack.color[stack.size - 1] == color;
+                pending[cellIndex(color, v)] = local[cellIndex(color, v)];
+                nearest[cellIndex(color, v)] = exposed ? 0 : cells + 1;
+                nearestSize[cellIndex(color, v)] = exposed ? stack.topCount() : 1;
+                return;
+            }
+            dirtyColors |= 1u << color;
+            uint64_t bit = uint64_t(1) << (index & 63);
+            auto& word = dirtyArrivals[color][index >> 6];
+            if (!(word & bit)) {
+                word |= bit;
+                ++dirtyArrivalCount[color];
+            }
+        };
         auto updateCell = [&](int v) {
             const Stack& stack = board[v];
             if (boardCacheReady && stack == cachedBoard[v]) return;
@@ -997,28 +1218,28 @@ struct CooperativeScheduler {
             unsigned presentColors = 0;
             for (int j = 0; j < old.size; ++j) {
                 int color = old.color[j];
-                --local[color][v];
+                --local[cellIndex(color, v)];
                 --difference[color];
                 presentColors |= 1u << color;
             }
             originalOnTree[v] = true;
             for (int j = 0; j < stack.size; ++j) {
                 int color = stack.color[j];
-                ++local[color][v];
+                ++local[cellIndex(color, v)];
                 ++difference[color];
                 presentColors |= 1u << color;
-                if (depth[color][v] < 0) originalOnTree[v] = false;
+                if (depth[cellIndex(color, v)] < 0) originalOnTree[v] = false;
             }
             for (unsigned mask = presentColors; mask; mask &= mask - 1) {
                 int color = __builtin_ctz(mask);
-                if (difference[color] != 0) dirtyColors |= 1u << color;
+                if (difference[color] != 0) markArrivalDirty(color, v);
             }
             sharedPotential[v] = sharedValue(v, stack);
             int color = stack.size > 0 ? stack.color[stack.size - 1] : -1;
             int count = stack.topCount();
             if (topColor[v] != color || topCount[v] != count) {
-                if (topColor[v] >= 0) dirtyColors |= 1u << topColor[v];
-                if (color >= 0) dirtyColors |= 1u << color;
+                if (topColor[v] >= 0) markArrivalDirty(topColor[v], v);
+                if (color >= 0) markArrivalDirty(color, v);
             }
             topColor[v] = color;
             topCount[v] = count;
@@ -1051,6 +1272,7 @@ struct CooperativeScheduler {
         // reserve a distant batch indefinitely.
         // Every wait edge connects two occupied cells. Empty cells cannot
         // participate in this graph or become candidate sources.
+        profile.next(2); // Wait graph and cycle removal.
         for (int v : activeCells) {
             waitTarget[v] = -1;
             waitState[v] = 0;
@@ -1063,16 +1285,16 @@ struct CooperativeScheduler {
             if (count == 0) continue;
             int color = topColor[source], v = source;
             int length = batchPrefix[source];
-            int maximum = min({run[color][source], length, stack.size - count + 1});
+            int maximum = min<int>({run[cellIndex(color, source)], length, stack.size - count + 1});
             for (int len = 1; len <= maximum; ++len) {
-                int target = jump[color][source][len - 1];
+                int target = jump[cellIndex(color, source)][len - 1];
                 if (board[target].size + count <= 8) {
                     wholeCanMove[source] = true;
                     break;
                 }
             }
             for (int step = 0; step < length; ++step) {
-                v = parent[color][v];
+                v = parent[cellIndex(color, v)];
                 if (board[v].size == 0) continue;
                 if (canJoin(v, stack, count, board[v])) waitTarget[source] = v;
                 break;
@@ -1096,6 +1318,7 @@ struct CooperativeScheduler {
 
         // Pending mass includes hidden blocks. Arrival distance uses exposed
         // blocks only, so a blocked distant color does not reserve a tower.
+        profile.next(3); // Per-color arrivals and springboard values.
         dirtySupportCells.clear();
         auto markSupportDirty = [&](int v) {
             if (supportAt[v] == decisionGeneration) return;
@@ -1104,59 +1327,112 @@ struct CooperativeScheduler {
         };
         if (refreshSupport)
             for (int v = 0; v < cells; ++v) markSupportDirty(v);
+        auto updateSupport = [&](int color, int v) {
+            int incoming = pending[cellIndex(color, v)] - local[cellIndex(color, v)];
+            int distance = arrivalDistance[cellIndex(color, v)], arrival = arrivalSize[cellIndex(color, v)];
+            auto& previous = supportInput[cellIndex(color, v)];
+            bool sameArrival = previous.arrival == arrival;
+            if (!refreshSupport && previous.incoming == incoming &&
+                previous.distance == distance && sameArrival) return;
+            previous = {incoming, distance, arrival};
+            bool useful = allowShortcuts ?
+                reachableGain[cellIndex(color, v)][7] > reachableGain[cellIndex(color, v)][0] : run[cellIndex(color, v)] >= 2;
+            if (incoming == 0 || distance > cells || !useful) {
+                if (traffic[cellIndex(color, v)] != 0.0) {
+                    traffic[cellIndex(color, v)] = 0.0;
+                    markSupportDirty(v);
+                }
+                return;
+            }
+            double batches = incoming >= 2 * arrival ? 2.0 : SMALL_RATIO[incoming][arrival];
+            double nextTraffic = batches / (1.0 + 0.5 * distance);
+            // For a fixed route mode, every height depends only on traffic
+            // and arrival size. Saturation can preserve both despite changed
+            // inputs. Compare exactly; keep the updated raw inputs above.
+            if (!refreshSupport && sameArrival && nextTraffic == traffic[cellIndex(color, v)]) return;
+            traffic[cellIndex(color, v)] = nextTraffic;
+            markSupportDirty(v);
+            auto& values = supportByColor[cellIndex(color, v)];
+            values[0] = values[8] = 0.0;
+            for (int height = 1; height < 8; ++height) {
+                int saved = allowShortcuts ?
+                    reachableGain[cellIndex(color, v)][height] - reachableGain[cellIndex(color, v)][0] :
+                    min(height, run[cellIndex(color, v)] - 1);
+                double fit = min(1.0, SMALL_RATIO[8 - height][arrival]);
+                values[height] = traffic[cellIndex(color, v)] * saved * fit;
+            }
+        };
         for (int color = 0; color < K; ++color) {
             bool dirty = (dirtyColors & (1u << color)) != 0;
             if (!dirty && !refreshSupport) continue;
-            if (dirty) {
-                fill(nearest[color].begin(), nearest[color].end(), cells + 1);
-                fill(nearestSize[color].begin(), nearestSize[color].end(), 1);
-                fill(arrivalDistance[color].begin(), arrivalDistance[color].end(), cells + 1);
-                fill(arrivalSize[color].begin(), arrivalSize[color].end(), 1);
+            // Broad history restores are cheaper with a linear tree pass.
+            // Normal repair steps update only changed nodes and ancestors.
+            bool rebuild = refreshSupport ||
+                dirtyArrivalCount[color] >= max(8, (int)order[color].size() / 4);
+            if (rebuild) {
+                fill_n(nearest.begin() + color * cells, cells, cells + 1);
+                fill_n(nearestSize.begin() + color * cells, cells, 1);
+                fill_n(arrivalDistance.begin() + color * cells, cells, cells + 1);
+                fill_n(arrivalSize.begin() + color * cells, cells, 1);
                 for (int v : activeCells) {
                     if (topColor[v] != color) continue;
-                    nearest[color][v] = 0;
-                    nearestSize[color][v] = topCount[v];
+                    nearest[cellIndex(color, v)] = 0;
+                    nearestSize[cellIndex(color, v)] = topCount[v];
                 }
-                pending[color] = local[color];
+                copy_n(local.begin() + color * cells, cells, pending.begin() + color * cells);
                 for (int v : order[color]) {
-                    int p = parent[color][v];
+                    int p = parent[cellIndex(color, v)];
                     if (p < 0) continue;
-                    pending[color][p] += pending[color][v];
-                    int distance = nearest[color][v] + 1;
-                    if (distance < arrivalDistance[color][p]) {
-                        arrivalDistance[color][p] = distance;
-                        arrivalSize[color][p] = nearestSize[color][v];
+                    pending[cellIndex(color, p)] += pending[cellIndex(color, v)];
+                    int distance = nearest[cellIndex(color, v)] + 1;
+                    if (distance < arrivalDistance[cellIndex(color, p)]) {
+                        arrivalDistance[cellIndex(color, p)] = distance;
+                        arrivalSize[cellIndex(color, p)] = nearestSize[cellIndex(color, v)];
                     }
-                    if (distance < nearest[color][p]) {
-                        nearest[color][p] = distance;
-                        nearestSize[color][p] = nearestSize[color][v];
+                    if (distance < nearest[cellIndex(color, p)]) {
+                        nearest[cellIndex(color, p)] = distance;
+                        nearestSize[cellIndex(color, p)] = nearestSize[cellIndex(color, v)];
                     }
                 }
+                for (int v : order[color]) updateSupport(color, v);
+                continue;
             }
-            for (int v : activeSupport[color]) {
-                traffic[color][v] = 0.0;
-                markSupportDirty(v);
-            }
-            activeSupport[color].clear();
-            for (int v : order[color]) {
-                int incoming = pending[color][v] - local[color][v];
-                int distance = arrivalDistance[color][v];
-                bool useful = allowShortcuts ?
-                    reachableGain[color][v][7] > reachableGain[color][v][0] : run[color][v] >= 2;
-                if (incoming == 0 || distance > cells || !useful) continue;
-                int arrival = arrivalSize[color][v];
-                double batches = incoming >= 2 * arrival ? 2.0 : SMALL_RATIO[incoming][arrival];
-                traffic[color][v] = batches / (1.0 + 0.5 * distance);
-                activeSupport[color].push_back(v);
-                markSupportDirty(v);
-                auto& values = supportByColor[color][v];
-                values[0] = values[8] = 0.0;
-                for (int height = 1; height < 8; ++height) {
-                    int saved = allowShortcuts ?
-                        reachableGain[color][v][height] - reachableGain[color][v][0] :
-                        min(height, run[color][v] - 1);
-                    double fit = min(1.0, SMALL_RATIO[8 - height][arrival]);
-                    values[height] = traffic[color][v] * saved * fit;
+            auto& queued = dirtyArrivals[color];
+            int words = ((int)order[color].size() + 63) / 64;
+            for (int word = 0; word < words; ++word) {
+                while (queued[word]) {
+                    int index = word * 64 + __builtin_ctzll(queued[word]);
+                    queued[word] &= queued[word] - 1;
+                    int v = order[color][index];
+                    int mass = local[cellIndex(color, v)], distance = cells + 1, arrival = 1;
+                    const auto& child = children[cellIndex(color, v)];
+                    for (int i = 0; i < child.size; ++i) {
+                        int u = child.cell[i];
+                        mass += pending[cellIndex(color, u)];
+                        int nextDistance = nearest[cellIndex(color, u)] + 1;
+                        if (nextDistance < distance) {
+                            distance = nextDistance;
+                            arrival = nearestSize[cellIndex(color, u)];
+                        }
+                    }
+                    bool exposed = topColor[v] == color;
+                    int nextNearest = exposed ? 0 : distance;
+                    int nextSize = exposed ? topCount[v] : arrival;
+                    bool changed = mass != pending[cellIndex(color, v)] ||
+                        nextNearest != nearest[cellIndex(color, v)] || nextSize != nearestSize[cellIndex(color, v)];
+                    pending[cellIndex(color, v)] = mass;
+                    nearest[cellIndex(color, v)] = nextNearest;
+                    nearestSize[cellIndex(color, v)] = nextSize;
+                    arrivalDistance[cellIndex(color, v)] = distance;
+                    arrivalSize[cellIndex(color, v)] = arrival;
+                    updateSupport(color, v);
+                    int p = parent[cellIndex(color, v)];
+                    if (changed && p >= 0) {
+                        // Parents occur later than every child, including
+                        // when another changed branch already queued them.
+                        int parentIndex = orderIndex[cellIndex(color, p)];
+                        queued[parentIndex >> 6] |= uint64_t(1) << (parentIndex & 63);
+                    }
                 }
             }
         }
@@ -1166,19 +1442,20 @@ struct CooperativeScheduler {
         for (int v : dirtySupportCells) {
             support[v].fill(0.0);
             for (int color = 0; color < K; ++color) {
-                if (traffic[color][v] == 0.0) continue;
-                const auto& values = supportByColor[color][v];
+                if (traffic[cellIndex(color, v)] == 0.0) continue;
+                const auto& values = supportByColor[cellIndex(color, v)];
                 for (int height = 1; height < 8; ++height)
                     support[v][height] += values[height];
             }
         }
         auto colorSupport = [&](int color, int v, int height) {
-            return traffic[color][v] == 0.0 ? 0.0 : supportByColor[color][v][height];
+            return traffic[cellIndex(color, v)] == 0.0 ? 0.0 : supportByColor[cellIndex(color, v)][height];
         };
         auto foreignSupport = [&](int color, int v, int height) {
             return support[v][height] - colorSupport(color, v, height);
         };
 
+        profile.next(4); // Monochrome candidates, including candidate collection.
         Decision decision;
         if (explore) {
             decision.alternatives.reserve(alternativeLimit + 1);
@@ -1224,16 +1501,16 @@ struct CooperativeScheduler {
         };
         auto canJoinMonochrome = [&](int v, int color, int count) {
             if (topColor[v] < 0 || board[v].size + count > 8) return false;
-            int next = parent[topColor[v]][v];
-            return next >= 0 && parent[color][v] == next;
+            int next = parent[cellIndex(topColor[v], v)];
+            return next >= 0 && parent[cellIndex(color, v)] == next;
         };
         for (int source : activeCells) {
             int color = topColor[source];
-            if (color < 0 || forward[color][source].empty() || (!explore && waiting[source])) continue;
+            if (color < 0 || forward[cellIndex(color, source)].empty() || (!explore && waiting[source])) continue;
             int height = board[source].size;
             int block = topCount[source];
             int bottom = height - block;
-            int subtree = pending[color][source];
+            int subtree = pending[cellIndex(color, source)];
             int desired = min(8 - bottom, subtree);
             double originalSupport = foreignSupport(color, source, height);
             unsigned tie = (unsigned)(source + 1) * 2654435761u;
@@ -1244,7 +1521,7 @@ struct CooperativeScheduler {
                 for (int distance = 1; distance <= 8; ++distance) {
                     int v = ray[source][d][distance - 1];
                     if (v < 0) break;
-                    skippedPrefix[d][distance] = skippedPrefix[d][distance - 1] + local[color][v];
+                    skippedPrefix[d][distance] = skippedPrefix[d][distance - 1] + local[cellIndex(color, v)];
                 }
             }
 
@@ -1273,7 +1550,7 @@ struct CooperativeScheduler {
                     }
                 }
                 int skippedSameColor = 0;
-                for (const Forward& step : forward[color][source]) {
+                for (const Forward& step : forward[cellIndex(color, source)]) {
                     if (deadlineReached()) return nullopt;
                     int len = step.length, target = step.target;
                     if (len > kept + 1) {
@@ -1285,9 +1562,9 @@ struct CooperativeScheduler {
                         // Keep the submitted single-pass ancestor scan on the
                         // baseline path, including its first merge stop.
                         if (len > 1) {
-                            int skipped = jump[color][source][len - 2];
+                            int skipped = jump[cellIndex(color, source)][len - 2];
                             if (!explore && canJoinMonochrome(skipped, color, count)) break;
-                            skippedSameColor += local[color][skipped];
+                            skippedSameColor += local[cellIndex(color, skipped)];
                         }
                     } else {
                         if (!explore && firstJoin[step.direction] < len) continue;
@@ -1336,6 +1613,7 @@ struct CooperativeScheduler {
         // A one- or two-move action touches at most three cells. Keep the
         // exact stack order here: after one flip the payload's bottom is
         // exposed; after two whole-payload flips its original top returns.
+        profile.next(5); // Mixed candidates and two-move transfers.
         struct LocalState {
             array<int, 3> cell{-1, -1, -1};
             array<Stack, 3> stack;
@@ -1357,7 +1635,27 @@ struct CooperativeScheduler {
             state.stack[i] = board[v];
             return state.stack[i];
         };
-        auto simulate = [&](LocalState& state, int source, int target, int count, int len) {
+        struct Packet {
+            array<uint8_t, MAX_COLOR> counts{}; // Each payload contains at most eight slimes.
+            unsigned colors = 0;
+            uint8_t exposed = 0;
+            bool split = false;
+        };
+        auto makePacket = [&](const Stack& stack, int count, int exposed) {
+            Packet packet;
+            int kept = stack.size - count;
+            for (int j = kept; j < stack.size; ++j) {
+                ++packet.counts[stack.color[j]];
+                packet.colors |= 1u << stack.color[j];
+            }
+            packet.exposed = min(count, exposed);
+            packet.split = kept > 0 && stack.color[kept - 1] == stack.color[kept];
+            return packet;
+        };
+        // Batch policy and payload metadata are fixed before enumerating
+        // destinations. Only capacity and intermediate cells vary here.
+        auto simulate = [&](LocalState& state, int source, int target, int count, int len,
+                            const Packet& packet) {
             int direction = moveDirection(source, target, len);
             if (direction < 0) return false;
             Stack& from = editStack(state, source);
@@ -1365,35 +1663,25 @@ struct CooperativeScheduler {
             int kept = from.size - count;
             if (!canTransfer(from, to, kept, len)) return false;
 
-            auto readCurrent = [&](int v) -> const Stack& { return readStack(state, v); };
-            int together = batchSize(source, from);
-            if (!explore && count < together && batchCanMove(source, from, together, readCurrent))
-                return false;
-
-            array<int, MAX_COLOR> moving{}, skipped{};
-            unsigned movingColors = 0;
-            for (int j = kept; j < from.size; ++j) {
-                ++moving[from.color[j]];
-                movingColors |= 1u << from.color[j];
-            }
+            array<int, MAX_COLOR> skipped{};
             for (int step = 1; step < len; ++step) {
                 int v = ray[source][direction][step - 1];
                 const Stack& middle = readStack(state, v);
                 if (!explore && canJoin(v, from, count, middle)) return false;
                 for (int j = 0; j < middle.size; ++j) ++skipped[middle.color[j]];
             }
-            for (unsigned mask = movingColors; mask; mask &= mask - 1) {
+            for (unsigned mask = packet.colors; mask; mask &= mask - 1) {
                 int color = __builtin_ctz(mask);
-                state.skipped += min(moving[color], skipped[color]);
+                state.skipped += min<int>(packet.counts[color], skipped[color]);
                 // Transfers change only the moving pieces' depths. Homed
                 // pieces are removed at their own nest, whose depth is zero.
                 // A temporary off-tree depth cancels across the second move.
-                state.gain[color] += moving[color] *
-                    (depth[color][source] - depth[color][target]);
+                state.gain[color] += packet.counts[color] *
+                    (depth[cellIndex(color, source)] - depth[cellIndex(color, target)]);
             }
             if (to.size > 0 && to.color[to.size - 1] == from.color[from.size - 1])
-                state.merged += min({count, from.topCount(), to.topCount()});
-            if (kept > 0 && from.color[kept - 1] == from.color[kept]) ++state.splits;
+                state.merged += min<int>(packet.exposed, to.topCount());
+            state.splits += packet.split;
             int homed = transferSlimes(from, to, kept, len, nest[source], nest[target]);
             if (homed < 0) return false;
             state.homed += homed;
@@ -1403,24 +1691,24 @@ struct CooperativeScheduler {
             if (stack.size == 0) return 0.0;
             int color = stack.color[stack.size - 1], count = stack.topCount();
             if (!allowShortcuts) {
-                int maximum = min(run[color][v], stack.size - count + 1);
+                int maximum = min<int>(run[cellIndex(color, v)], stack.size - count + 1);
                 for (int len = maximum; len >= 1; --len) {
-                    int target = jump[color][v][len - 1];
+                    int target = jump[cellIndex(color, v)][len - 1];
                     if (readStack(state, target).size + count <= 8)
                         return 0.5 * count + len - 1;
                 }
                 return 0.0;
             }
             int maximum = stack.size - count + 1, gain = 0;
-            for (const Forward& step : forward[color][v])
+            for (const Forward& step : forward[cellIndex(color, v)])
                 if (step.length <= maximum && readStack(state, step.target).size + count <= 8)
                     gain = max(gain, step.gain);
             return gain > 0 ? 0.5 * count + gain - 1 : 0.0;
         };
         const LocalState before;
         auto evaluate = [&](const LocalState& state, const Candidate& action,
-                            const array<int, MAX_COLOR>& moved, unsigned movingMask,
-                            const array<int, MAX_COLOR>& firstIndex) {
+                            const array<uint8_t, MAX_COLOR>& moved, unsigned movingMask,
+                            const array<int, MAX_COLOR>& firstIndex, int sourcePrefix) {
             int steps = action.secondTarget < 0 ? 1 : 2;
             const Stack& original = board[action.source];
             int kept = original.size - action.count;
@@ -1433,7 +1721,7 @@ struct CooperativeScheduler {
                 if (!originalOnTree[v]) return;
                 for (int j = 0; j < now.size; ++j) {
                     int color = now.color[j];
-                    if (depth[color][v] < 0) return;
+                    if (depth[cellIndex(color, v)] < 0) return;
                 }
                 double change = support[v][now.size] - support[v][old.size];
                 for (unsigned mask = movingMask; mask; mask &= mask - 1) {
@@ -1454,7 +1742,7 @@ struct CooperativeScheduler {
                 if (gain[color] < 0) return;
                 totalGain += gain[color];
                 if (moved[color] == 0 || gain[color] == 0) continue;
-                int desired = min(8 - firstIndex[color], pending[color][action.source]);
+                int desired = min(8 - firstIndex[color], pending[cellIndex(color, action.source)]);
                 double ready = min(1.0, SMALL_RATIO[moved[color]][desired]);
                 double distance = (double)gain[color] / moved[color];
                 score += 1.0 + 0.55 * moved[color] + 1.65 * (distance - 1.0);
@@ -1462,15 +1750,15 @@ struct CooperativeScheduler {
             }
             if (totalGain <= 0) return;
             if (steps == 1 &&
-                jump[original.color[original.size - 1]][action.source][action.length - 1] == action.target &&
-                sharedPrefix(action.source, original, action.count) >= action.length) {
+                jump[cellIndex(original.color[original.size - 1], action.source)][action.length - 1] == action.target &&
+                sourcePrefix >= action.length) {
                 // On a common route the colors depart as one batch. Apply
                 // the readiness penalty once to the combined load, instead
                 // of making every color wait independently for its subtree.
                 int incoming = 0, colors = 0;
                 for (int color = 0; color < K; ++color) {
                     if (moved[color] == 0) continue;
-                    incoming += pending[color][action.source];
+                    incoming += pending[cellIndex(color, action.source)];
                     ++colors;
                 }
                 int desired = min(8 - kept, incoming);
@@ -1492,80 +1780,92 @@ struct CooperativeScheduler {
         for (int source : activeCells) {
             const Stack& stack = board[source];
             int top = topColor[source], block = topCount[source];
-            if (top < 0 || block == stack.size || forward[top][source].empty() ||
+            if (top < 0 || block == stack.size || forward[cellIndex(top, source)].empty() ||
                 (!explore && waiting[source])) continue;
             if (Clock::now() >= deadline) return nullopt;
             array<int, MAX_COLOR> firstIndex;
             firstIndex.fill(8);
             for (int j = 0; j < stack.size; ++j)
                 firstIndex[stack.color[j]] = min(firstIndex[stack.color[j]], j);
-            array<int, MAX_COLOR> moved{};
-            moved[top] = block;
-            unsigned movingMask = 1u << top;
+            array<unsigned, 9> suffixColors{};
+            for (int j = stack.size - 1; j >= 0; --j)
+                suffixColors[j] = suffixColors[j + 1] | (1u << stack.color[j]);
+            Packet packet;
+            packet.counts[top] = packet.exposed = block;
+            packet.colors = 1u << top;
+            const ProgressMask* progress = progressMask.data() + source * cells;
             for (int count = block + 1; count <= stack.size; ++count) {
                 int kept = stack.size - count;
-                ++moved[stack.color[kept]];
-                movingMask |= 1u << stack.color[kept];
+                ++packet.counts[stack.color[kept]];
+                packet.colors |= 1u << stack.color[kept];
                 if (!explore && count < batchCount[source] && wholeCanMove[source]) continue;
+                packet.split = kept > 0 && stack.color[kept - 1] == stack.color[kept];
+                int sourcePrefix = sharedPrefix(source, stack, count);
                 int bottomColor = stack.color[kept], bottomCount = 1;
                 while (bottomCount < count && stack.color[kept + bottomCount] == bottomColor)
                     ++bottomCount;
-                for (const Forward& step : forward[top][source]) {
+                // The same color can occur both in the bottom block and
+                // above it, so use the actual upper suffix's color mask.
+                unsigned upperColors = suffixColors[kept + bottomCount];
+                for (const Forward& step : forward[cellIndex(top, source)]) {
                     if (deadlineReached()) return nullopt;
                     int len = step.length, target = step.target;
                     if (len > kept + 1) continue;
                     if (board[target].size + count > 8) continue;
-                    auto advances = [&](int color) {
-                        return depth[color][target] >= 0 &&
-                               depth[color][target] < depth[color][source];
-                    };
                     // Only the lowest homogeneous block may temporarily
                     // leave its tree: reversal exposes it for the next move.
-                    bool upperAdvances = true;
-                    for (int j = kept + bottomCount; j < stack.size; ++j)
-                        if (!advances(stack.color[j])) upperAdvances = false;
-                    if (!upperAdvances) continue;
+                    unsigned advances = progress[target].strict;
+                    if (upperColors & ~advances) continue;
 
                     Candidate action{source, target, count, len, -1e100};
                     LocalState first;
-                    if (!simulate(first, source, target, count, len)) continue;
-                    bool allAdvance = advances(bottomColor);
-                    if (allAdvance) evaluate(first, action, moved, movingMask, firstIndex);
+                    if (!simulate(first, source, target, count, len, packet)) continue;
+                    bool allAdvance = (advances & (1u << bottomColor)) != 0;
+                    if (allAdvance)
+                        evaluate(first, action, packet.counts, packet.colors, firstIndex, sourcePrefix);
                     const Stack& landing = readStack(first, target);
                     int payload = max(0, landing.size - board[target].size);
                     if (payload == 0) continue;
+                    int landingTopCount = landing.topCount();
+                    int together = explore ? 0 : batchSize(target, landing);
+                    bool checkedBatch = false, canMoveBatch = false;
+                    auto allowSecondCount = [&](int nextCount) {
+                        if (nextCount <= 0 || nextCount > landing.size) return false;
+                        if (nextCount >= together) return true;
+                        if (!checkedBatch) {
+                            checkedBatch = true;
+                            auto read = [&](int v) -> const Stack& { return readStack(first, v); };
+                            canMoveBatch = batchCanMove(target, landing, together, read);
+                        }
+                        return !canMoveBatch;
+                    };
 
                     if (allowTransfers) {
                         // Release the newly exposed block or carry the
                         // entire surviving payload. Search every physical
                         // direction, including right-angle transfers and
                         // recovery from a temporary off-tree landing.
-                        int exposed = min(payload, landing.topCount());
+                        int exposed = min(payload, landingTopCount);
                         array<int, 2> choices{exposed, payload};
                         for (int choice = 0; choice < 2; ++choice) {
                             if (choice == 1 && exposed == payload) continue;
                             int nextCount = choices[choice];
+                            if (!allowSecondCount(nextCount)) continue;
+                            Packet nextPacket = makePacket(landing, nextCount, landingTopCount);
                             int maxNext = min(8, landing.size - nextCount + 1);
                             for (int d = 0; d < 4; ++d) {
                                 for (int nextLen = 1; nextLen <= maxNext; ++nextLen) {
                                     if (deadlineReached()) return nullopt;
                                     int end = ray[target][d][nextLen - 1];
                                     if (end < 0) break;
-                                    bool returnsToTrees = true;
-                                    for (int j = landing.size - nextCount; j < landing.size; ++j) {
-                                        int color = landing.color[j];
-                                        if (depth[color][end] < 0 ||
-                                            depth[color][end] > depth[color][source])
-                                            returnsToTrees = false;
-                                    }
-                                    if (!returnsToTrees) continue;
+                                    if (nextPacket.colors & ~progress[end].nonworsening) continue;
                                     LocalState second = first;
-                                    if (!simulate(second, target, end, nextCount, nextLen)) continue;
+                                    if (!simulate(second, target, end, nextCount, nextLen, nextPacket)) continue;
                                     Candidate pair = action;
                                     pair.secondTarget = end;
                                     pair.secondCount = nextCount;
                                     pair.secondLength = nextLen;
-                                    evaluate(second, pair, moved, movingMask, firstIndex);
+                                    evaluate(second, pair, packet.counts, packet.colors, firstIndex, sourcePrefix);
                                 }
                             }
                         }
@@ -1573,56 +1873,55 @@ struct CooperativeScheduler {
                         // Odd: release the newly exposed bottom-color block.
                         // Even: carry the entire surviving payload once more,
                         // restoring its original orientation at the next stop.
-                        int exposed = min(payload, landing.topCount());
+                        int exposed = min(payload, landingTopCount);
                         array<int, 2> choices{exposed, payload};
                         int color = landing.color[landing.size - 1];
                         for (int choice = 0; choice < 2; ++choice) {
                             if (choice == 1 && payload == exposed) continue;
                             int nextCount = choices[choice];
-                            int maxNext = min(run[color][target], landing.size - nextCount + 1);
+                            if (!allowSecondCount(nextCount)) continue;
+                            Packet nextPacket = makePacket(landing, nextCount, landingTopCount);
+                            int maxNext = min<int>(run[cellIndex(color, target)], landing.size - nextCount + 1);
                             for (int nextLen = 1; nextLen <= maxNext; ++nextLen) {
                                 if (deadlineReached()) return nullopt;
-                                int end = jump[color][target][nextLen - 1];
-                                bool returnsToTrees = true;
-                                for (int j = landing.size - nextCount; j < landing.size; ++j) {
-                                    int c = landing.color[j];
-                                    if (depth[c][end] < 0 || depth[c][end] > depth[c][source])
-                                        returnsToTrees = false;
-                                }
-                                if (!returnsToTrees) continue;
+                                int end = jump[cellIndex(color, target)][nextLen - 1];
+                                if (nextPacket.colors & ~progress[end].nonworsening) continue;
                                 LocalState second = first;
-                                if (!simulate(second, target, end, nextCount, nextLen)) continue;
+                                if (!simulate(second, target, end, nextCount, nextLen, nextPacket)) continue;
                                 Candidate pair = action;
                                 pair.secondTarget = end;
                                 pair.secondCount = nextCount;
                                 pair.secondLength = nextLen;
-                                evaluate(second, pair, moved, movingMask, firstIndex);
+                                evaluate(second, pair, packet.counts, packet.colors, firstIndex, sourcePrefix);
                             }
                         }
                     } else {
                         // Carry the upper colors forward, flip the hidden
                         // bottom block to the top, then use those upper
                         // colors as a springboard to jump back past source.
+                        if (!allowSecondCount(bottomCount)) continue;
+                        Packet nextPacket = makePacket(landing, bottomCount, landingTopCount);
                         int maxNext = landing.size - bottomCount + 1;
                         for (int nextLen = len; nextLen <= maxNext; ++nextLen) {
                             if (deadlineReached()) return nullopt;
                             int back = nextLen - len;
                             int end = ray[target][step.direction ^ 1][nextLen - 1];
                             if (end < 0 || (back > 0 &&
-                                jump[bottomColor][source][back - 1] != end)) continue;
+                                jump[cellIndex(bottomColor, source)][back - 1] != end)) continue;
                             LocalState second = first;
-                            if (!simulate(second, target, end, bottomCount, nextLen)) continue;
+                            if (!simulate(second, target, end, bottomCount, nextLen, nextPacket)) continue;
                             Candidate pair = action;
                             pair.secondTarget = end;
                             pair.secondCount = bottomCount;
                             pair.secondLength = nextLen;
-                            evaluate(second, pair, moved, movingMask, firstIndex);
+                            evaluate(second, pair, packet.counts, packet.colors, firstIndex, sourcePrefix);
                         }
                     }
                 }
             }
         }
 
+        profile.next(6);
         if (decision.greedy.source < 0) return nullopt;
         return decision;
     }
@@ -1784,6 +2083,7 @@ optional<vector<Op>> rewriteCooperativeHistory(
         return a.remaining == b.remaining && a.board == b.board;
     };
     auto buildHistory = [&](vector<Candidate> actions) -> optional<History> {
+        SampledTiming<5> profile(performance.build, PerformanceProfile::HISTORY_PERIOD);
         History history;
         history.actions = std::move(actions);
         int count = (int)history.actions.size();
@@ -1799,11 +2099,16 @@ optional<vector<Op>> rewriteCooperativeHistory(
         uint64_t hash = stateHash(state);
         int cost = 0;
         for (int i = 0; i <= count; ++i) {
+            profile.next(1); // Boundary costs, hashes and hash-table nodes.
             history.cost.push_back(cost);
             history.hash.push_back(hash);
             history.boundary.emplace(hash, i);
-            if (i % CHECKPOINT == 0) history.checkpoints.push_back(state);
+            if (i % CHECKPOINT == 0) {
+                profile.next(2); // Snapshot allocation and full board copy.
+                history.checkpoints.push_back(state);
+            }
             if (i == count) break;
+            profile.next(3); // Event detection, move replay and incremental hash.
             const Candidate& action = history.actions[i];
             if (action.source < 0 || action.source >= sim.cells ||
                 action.target < 0 || action.target >= sim.cells) return nullopt;
@@ -1819,6 +2124,7 @@ optional<vector<Op>> rewriteCooperativeHistory(
             if (cost > MAX_OP || !applyTracked(state, action, hash)) return nullopt;
         }
         if (state.remaining != 0) return nullopt;
+        profile.next(4);
         // Fenwick tree keeps weighted pivot selection logarithmic. A site is
         // removed once its cached alternatives have all been tried.
         history.weightTree.assign(count + 1, 0);
@@ -1849,20 +2155,24 @@ optional<vector<Op>> rewriteCooperativeHistory(
         return at;
     };
     auto restore = [&](const History& history, int at, State& out) {
+        SampledTiming<2> profile(performance.restore, PerformanceProfile::DECISION_PERIOD);
         int base = at / CHECKPOINT * CHECKPOINT;
         out = history.checkpoints[at / CHECKPOINT];
+        profile.next(1);
         for (int i = base; i < at; ++i) {
-            ++stats.restoredActions;
+            if constexpr (ENABLE_DEBUG) ++stats.restoredActions;
             if (!sim.apply(out, history.actions[i])) return false;
         }
         return true;
     };
 
-    stats.initialRawOps = stats.bestRawOps = stats.currentRawOps = (int)seed.operations.size();
+    const int initialRawOps = (int)seed.operations.size();
+    if constexpr (ENABLE_DEBUG)
+        stats.initialRawOps = stats.bestRawOps = stats.currentRawOps = initialRawOps;
     if (seed.actions.empty() || Clock::now() >= deadline) return nullopt;
     auto initial = buildHistory(seed.actions);
-    if (!initial || initial->cost.back() != stats.initialRawOps) {
-        ++stats.invalid;
+    if (!initial || initial->cost.back() != initialRawOps) {
+        if constexpr (ENABLE_DEBUG) ++stats.invalid;
         return nullopt;
     }
     History current = std::move(*initial);
@@ -1878,14 +2188,21 @@ optional<vector<Op>> rewriteCooperativeHistory(
 
     while (Clock::now() < deadline) {
         if (current.totalWeight == 0) break;
+        SampledTiming<4> attemptProfile(performance.attempt, PerformanceProfile::DECISION_PERIOD);
         int cut = selectSite(current, (int)(rng() % current.totalWeight));
-        if (!restore(current, cut, sim.state)) { ++stats.invalid; break; }
+        if (!restore(current, cut, sim.state)) {
+            if constexpr (ENABLE_DEBUG) ++stats.invalid;
+            break;
+        }
         Site& site = current.sites[cut];
         if (!site.ready) {
-            ++stats.pivotDecisions;
+            if constexpr (ENABLE_DEBUG) ++stats.pivotDecisions;
             auto decision = sim.decide(seed.mode, seed.shortcuts, seed.transfers,
                                        deadline, 12, &current.actions[cut]);
-            if (Clock::now() >= deadline) { ++stats.timedOut; break; }
+            if (Clock::now() >= deadline) {
+                if constexpr (ENABLE_DEBUG) ++stats.timedOut;
+                break;
+            }
             site.ready = true;
             if (!decision) {
                 removeSite(current, cut);
@@ -1911,7 +2228,9 @@ optional<vector<Op>> rewriteCooperativeHistory(
                 removeSite(current, cut);
                 continue;
             }
-        } else ++stats.cachedPivots;
+        } else {
+            if constexpr (ENABLE_DEBUG) ++stats.cachedPivots;
+        }
 
         double choiceWeight = 0.0;
         for (int i = 0; i < (int)site.choices.size(); ++i)
@@ -1928,11 +2247,13 @@ optional<vector<Op>> rewriteCooperativeHistory(
         site.tried |= uint64_t(1) << selected;
         if (!site.available()) removeSite(current, cut);
         Candidate next = site.choices[selected].action;
-        ++stats.attempts;
-        ++stats.cutThirds[min(2, 3 * cut / (int)current.actions.size())];
-        if (next.source == current.actions[cut].source) ++stats.sameSource;
-        else ++stats.differentSource;
-        stats.prefixOps += current.cost[cut];
+        if constexpr (ENABLE_DEBUG) {
+            ++stats.attempts;
+            ++stats.cutThirds[min(2, 3 * cut / (int)current.actions.size())];
+            if (next.source == current.actions[cut].source) ++stats.sameSource;
+            else ++stats.differentSource;
+            stats.prefixOps += current.cost[cut];
+        }
 
         double progress = clamp(chrono::duration<double>(Clock::now() - searchStart).count() /
                                     duration, 0.0, 1.0);
@@ -1946,63 +2267,96 @@ optional<vector<Op>> rewriteCooperativeHistory(
         uint64_t hash = current.hash[cut];
         vector<Candidate> rebuilt;
         bool completed = false;
+        attemptProfile.next(1);
         while (true) {
-            if (Clock::now() >= deadline) { ++stats.timedOut; break; }
-            if (cost + next.steps() > limit) { ++stats.pruned; break; }
-            if (!applyTracked(sim.state, next, hash)) { ++stats.invalid; break; }
-            rebuilt.push_back(next);
-            cost += next.steps();
+            if (Clock::now() >= deadline) {
+                if constexpr (ENABLE_DEBUG) ++stats.timedOut;
+                break;
+            }
+            if (cost + next.steps() > limit) {
+                if constexpr (ENABLE_DEBUG) ++stats.pruned;
+                break;
+            }
+            {
+                SampledTiming<1> applyProfile(performance.repairApply, PerformanceProfile::PROBE_PERIOD);
+                if (!applyTracked(sim.state, next, hash)) {
+                    if constexpr (ENABLE_DEBUG) ++stats.invalid;
+                    break;
+                }
+                rebuilt.push_back(next);
+                cost += next.steps();
+            }
             if (sim.state.remaining == 0) { completed = true; break; }
             // At most 16 slimes can disappear from the two endpoints in one
             // operation. This intentionally loose lower bound is always safe.
             if (cost + (sim.state.remaining + 15) / 16 > limit) {
-                ++stats.pruned;
+                if constexpr (ENABLE_DEBUG) ++stats.pruned;
                 break;
             }
-            auto range = current.boundary.equal_range(hash);
-            for (auto it = range.first; it != range.second; ++it) {
-                int at = it->second;
-                if (at <= cut || cost + current.cost.back() - current.cost[at] > limit) continue;
-                State exact;
-                if (!restore(current, at, exact)) continue;
-                // The hash is an index only. Compare every ordered color stack
-                // before splicing a suffix, including homing at both endpoints.
-                if (!equalState(sim.state, exact)) continue;
-                join = at;
-                completed = true;
-                cost += current.cost.back() - current.cost[at];
-                ++stats.rejoined;
-                stats.suffixOps += current.cost.back() - current.cost[at];
-                break;
+            {
+                SampledTiming<3> joinProfile(performance.join, PerformanceProfile::PROBE_PERIOD);
+                auto range = current.boundary.equal_range(hash);
+                for (auto it = range.first; it != range.second; ++it) {
+                    joinProfile.next(0);
+                    int at = it->second;
+                    if (at <= cut || cost + current.cost.back() - current.cost[at] > limit) continue;
+                    State exact;
+                    joinProfile.next(1);
+                    if (!restore(current, at, exact)) continue;
+                    // The hash is an index only. Compare every ordered color stack
+                    // before splicing a suffix, including homing at both endpoints.
+                    joinProfile.next(2);
+                    if (!equalState(sim.state, exact)) continue;
+                    join = at;
+                    completed = true;
+                    cost += current.cost.back() - current.cost[at];
+                    if constexpr (ENABLE_DEBUG) {
+                        ++stats.rejoined;
+                        stats.suffixOps += current.cost.back() - current.cost[at];
+                    }
+                    break;
+                }
             }
             if (completed) break;
-            ++stats.freshDecisions;
+            if constexpr (ENABLE_DEBUG) ++stats.freshDecisions;
             auto decision = sim.decide(seed.mode, seed.shortcuts, seed.transfers, deadline);
             if (!decision) {
-                if (Clock::now() >= deadline) ++stats.timedOut;
-                else ++stats.deadEnds;
+                if constexpr (ENABLE_DEBUG) {
+                    if (Clock::now() >= deadline) ++stats.timedOut;
+                    else ++stats.deadEnds;
+                }
                 break;
             }
             next = decision->greedy;
         }
+        attemptProfile.next(2);
         if (!completed) continue;
-        ++stats.completed;
+        if constexpr (ENABLE_DEBUG) ++stats.completed;
         int delta = cost - current.cost.back();
-        if (delta < 0) ++stats.improvedTrials;
-        else if (delta == 0) ++stats.neutralTrials;
-        else ++stats.worseTrials;
+        if constexpr (ENABLE_DEBUG) {
+            if (delta < 0) ++stats.improvedTrials;
+            else if (delta == 0) ++stats.neutralTrials;
+            else ++stats.worseTrials;
+        }
         // Independent swaps often reconverge immediately. Admit some neutral
         // histories for new contexts, without rebuilding the cache for each one.
         bool accept = delta < 0 || (delta == 0 ? uniform() < 0.25 :
                                                uniform() < exp(-delta / temperature));
         if (!accept) continue;
+        attemptProfile.next(3);
+        SampledTiming<3> updateProfile(performance.update, PerformanceProfile::HISTORY_PERIOD);
         vector<Candidate> actions(current.actions.begin(), current.actions.begin() + cut);
         actions.insert(actions.end(), rebuilt.begin(), rebuilt.end());
         int tailStart = (int)actions.size();
         if (join >= 0)
             actions.insert(actions.end(), current.actions.begin() + join, current.actions.end());
+        updateProfile.next(1);
         auto changed = buildHistory(std::move(actions));
-        if (!changed || changed->cost.back() != cost) { ++stats.invalid; continue; }
+        if (!changed || changed->cost.back() != cost) {
+            if constexpr (ENABLE_DEBUG) ++stats.invalid;
+            continue;
+        }
+        updateProfile.next(2);
         // Candidate rankings are reusable at identical prefix/suffix states.
         // Reset trial marks because the complete continuation has now changed.
         for (int i = 0; i < cut; ++i) {
@@ -2017,24 +2371,33 @@ optional<vector<Op>> rewriteCooperativeHistory(
         for (int i = 0; i < (int)changed->sites.size(); ++i)
             if (!changed->sites[i].available()) removeSite(*changed, i);
         current = std::move(*changed);
-        ++stats.accepted;
-        if (delta == 0) ++stats.neutralAccepted;
-        if (delta > 0) ++stats.worseAccepted;
-        stats.currentRawOps = cost;
+        if constexpr (ENABLE_DEBUG) {
+            ++stats.accepted;
+            if (delta == 0) ++stats.neutralAccepted;
+            if (delta > 0) ++stats.worseAccepted;
+            stats.currentRawOps = cost;
+        }
         if (cost < bestRaw) {
-            bestRaw = stats.bestRawOps = cost;
+            bestRaw = cost;
             bestActions = current.actions;
-            ++stats.improvements;
+            if constexpr (ENABLE_DEBUG) {
+                stats.bestRawOps = cost;
+                ++stats.improvements;
+            }
         }
     }
-    if (bestRaw >= stats.initialRawOps) return nullopt;
+    if (bestRaw >= initialRawOps) return nullopt;
     State replay = sim.initial;
     vector<Op> output;
     output.reserve(bestRaw);
-    for (const Candidate& action : bestActions)
-        if (!sim.apply(replay, action, &output)) { ++stats.invalid; return nullopt; }
+    for (const Candidate& action : bestActions) {
+        if (!sim.apply(replay, action, &output)) {
+            if constexpr (ENABLE_DEBUG) ++stats.invalid;
+            return nullopt;
+        }
+    }
     if (replay.remaining != 0 || (int)output.size() != bestRaw) {
-        ++stats.invalid;
+        if constexpr (ENABLE_DEBUG) ++stats.invalid;
         return nullopt;
     }
     return output;
@@ -2044,6 +2407,7 @@ int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
     const auto start = chrono::steady_clock::now();
+    SampledTiming<8> mainProfile(performance.main, 1, start);
     int N, K;
     cin >> N >> K;
     vector<string> grid(N);
@@ -2052,13 +2416,17 @@ int main() {
     const auto baselineDeadline = start + chrono::milliseconds(950);
     const auto searchDeadline = start + chrono::milliseconds(1730);
     const auto postprocessingDeadline = start + chrono::milliseconds(1870);
+    mainProfile.next(1);
     auto routes = buildCrossingTrees(grid, K, routingDeadline);
     if ((int)routes.size() != K) return 0;
+    mainProfile.next(2);
     auto fallback = sequentialSolve(grid, K, routes);
     if (!fallback) return 0;
     vector<Op> answer = std::move(*fallback);
     const size_t fallbackOps = answer.size();
+    mainProfile.next(3);
     CooperativeScheduler scheduler(grid, K, routes);
+    mainProfile.next(4);
     optional<GreedySeed> seed;
     int seedScore = INT_MAX, seedAttempts = 0, seedCompleted = 0;
     const int modes[] = {0, 2, 5, 1, 6, 3, 4, 7};
@@ -2066,10 +2434,10 @@ int main() {
         if (chrono::steady_clock::now() >= baselineDeadline) break;
         int mode = job < 8 ? modes[job] : 0;
         bool shortcuts = job >= 9, transfers = job == 8 || job == 10;
-        ++seedAttempts;
+        if constexpr (ENABLE_DEBUG) ++seedAttempts;
         auto candidate = buildCooperativeSeed(scheduler, mode, shortcuts, transfers, baselineDeadline);
         if (!candidate) continue;
-        ++seedCompleted;
+        if constexpr (ENABLE_DEBUG) ++seedCompleted;
         auto compressed = compressBaselineMoves(grid, K, candidate->operations);
         if (compressed.size() < answer.size()) answer = compressed;
         if (!seed || (int)compressed.size() < seedScore ||
@@ -2083,55 +2451,65 @@ int main() {
     int seedMode = seed ? seed->mode : -1;
     bool seedShortcuts = seed && seed->shortcuts, seedTransfers = seed && seed->transfers;
     HistorySearchStats stats;
+    mainProfile.next(5);
     if (seed) {
+        if constexpr (ENABLE_PROFILING) performance.inSearch = true;
         auto rewritten = rewriteCooperativeHistory(scheduler, *seed, searchDeadline, stats);
+        if constexpr (ENABLE_PROFILING) performance.inSearch = false;
+        mainProfile.next(6);
         if (rewritten) {
             auto compressed = compressBaselineMoves(grid, K, *rewritten);
             compressed = compressMoves(grid, K, compressed, postprocessingDeadline);
             if (compressed.size() < answer.size()) answer = std::move(compressed);
         }
     }
+    mainProfile.next(7);
     const size_t beforePostprocessing = answer.size();
     answer = compressMoves(grid, K, answer, postprocessingDeadline);
     answer = optimizeMoveWindows(grid, K, answer, postprocessingDeadline);
     answer = compressMoves(grid, K, answer, postprocessingDeadline);
-    cerr << "fallback_ops=" << fallbackOps
-         << " baseline_ops=" << baselineOps
-         << " seed_attempts=" << seedAttempts
-         << " seed_completed=" << seedCompleted
-         << " seed_mode=" << seedMode
-         << " seed_shortcuts=" << seedShortcuts
-         << " seed_transfers=" << seedTransfers
-         << " history_initial_raw_ops=" << stats.initialRawOps
-         << " history_best_raw_ops=" << stats.bestRawOps
-         << " history_current_raw_ops=" << stats.currentRawOps
-         << " history_attempts=" << stats.attempts
-         << " history_completed=" << stats.completed
-         << " history_accepted=" << stats.accepted
-         << " history_improvements=" << stats.improvements
-         << " history_improved_trials=" << stats.improvedTrials
-         << " history_neutral_trials=" << stats.neutralTrials
-         << " history_worse_trials=" << stats.worseTrials
-         << " history_neutral_accepted=" << stats.neutralAccepted
-         << " history_worse_accepted=" << stats.worseAccepted
-         << " history_pruned=" << stats.pruned
-         << " history_dead_ends=" << stats.deadEnds
-         << " history_timed_out=" << stats.timedOut
-         << " history_invalid=" << stats.invalid
-         << " history_pivot_decisions=" << stats.pivotDecisions
-         << " history_cached_pivots=" << stats.cachedPivots
-         << " history_fresh_decisions=" << stats.freshDecisions
-         << " history_prefix_ops=" << stats.prefixOps
-         << " history_restored_actions=" << stats.restoredActions
-         << " history_rejoined=" << stats.rejoined
-         << " history_suffix_ops=" << stats.suffixOps
-         << " history_same_source=" << stats.sameSource
-         << " history_different_source=" << stats.differentSource
-         << " history_early_cuts=" << stats.cutThirds[0]
-         << " history_middle_cuts=" << stats.cutThirds[1]
-         << " history_late_cuts=" << stats.cutThirds[2]
-         << " postprocess_saved=" << beforePostprocessing - answer.size()
-         << " final_ops=" << answer.size() << '\n';
+    mainProfile.finish();
+    if constexpr (ENABLE_DEBUG) {
+        cerr << "fallback_ops=" << fallbackOps
+             << " baseline_ops=" << baselineOps
+             << " seed_attempts=" << seedAttempts
+             << " seed_completed=" << seedCompleted
+             << " seed_mode=" << seedMode
+             << " seed_shortcuts=" << seedShortcuts
+             << " seed_transfers=" << seedTransfers
+             << " history_initial_raw_ops=" << stats.initialRawOps
+             << " history_best_raw_ops=" << stats.bestRawOps
+             << " history_current_raw_ops=" << stats.currentRawOps
+             << " history_attempts=" << stats.attempts
+             << " history_completed=" << stats.completed
+             << " history_accepted=" << stats.accepted
+             << " history_improvements=" << stats.improvements
+             << " history_improved_trials=" << stats.improvedTrials
+             << " history_neutral_trials=" << stats.neutralTrials
+             << " history_worse_trials=" << stats.worseTrials
+             << " history_neutral_accepted=" << stats.neutralAccepted
+             << " history_worse_accepted=" << stats.worseAccepted
+             << " history_pruned=" << stats.pruned
+             << " history_dead_ends=" << stats.deadEnds
+             << " history_timed_out=" << stats.timedOut
+             << " history_invalid=" << stats.invalid
+             << " history_pivot_decisions=" << stats.pivotDecisions
+             << " history_cached_pivots=" << stats.cachedPivots
+             << " history_fresh_decisions=" << stats.freshDecisions
+             << " history_prefix_ops=" << stats.prefixOps
+             << " history_restored_actions=" << stats.restoredActions
+             << " history_rejoined=" << stats.rejoined
+             << " history_suffix_ops=" << stats.suffixOps
+             << " history_same_source=" << stats.sameSource
+             << " history_different_source=" << stats.differentSource
+             << " history_early_cuts=" << stats.cutThirds[0]
+             << " history_middle_cuts=" << stats.cutThirds[1]
+             << " history_late_cuts=" << stats.cutThirds[2]
+             << " postprocess_saved=" << beforePostprocessing - answer.size()
+             << " final_ops=" << answer.size();
+        performance.print(cerr);
+        cerr << '\n';
+    }
     for (const auto& op : answer)
         cout << op.r << ' ' << op.c << ' ' << op.k << ' ' << op.dir << ' ' << op.len << '\n';
     return 0;
