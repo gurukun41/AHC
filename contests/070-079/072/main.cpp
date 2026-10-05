@@ -1860,6 +1860,8 @@ struct CooperativeScheduler {
     };
     struct Decision {
         Candidate greedy;
+        // Focused history edits omit their original action. Beam decisions
+        // include greedy and retain several distinct action families.
         vector<Candidate> alternatives;
     };
     static constexpr int AMOUNT_ALTERNATIVES = 6;
@@ -2247,6 +2249,56 @@ struct CooperativeScheduler {
             return result;
         }
     };
+    struct BeamAlternativeCollector {
+        static constexpr int SOURCE_LIMIT = 8;
+        static constexpr int ROUTE_LIMIT = 8;
+        static constexpr int STEP_LIMIT = 3;
+        static constexpr int SCORE_LIMIT = 12;
+        vector<Candidate> sources, routes, scored;
+        array<vector<Candidate>, 2> bySteps;
+        array<Candidate, 8> byAmount;
+
+        BeamAlternativeCollector() {
+            sources.reserve(SOURCE_LIMIT + 1);
+            routes.reserve(ROUTE_LIMIT + 1);
+            scored.reserve(SCORE_LIMIT + 1);
+            for (auto& pool : bySteps) pool.reserve(STEP_LIMIT + 1);
+        }
+        void add(const Candidate& action) {
+            AlternativeCollector::collect(sources, action, SOURCE_LIMIT,
+                                          AlternativeCollector::sameSource);
+            AlternativeCollector::collect(routes, action, ROUTE_LIMIT,
+                                          AlternativeCollector::sameRoute);
+            AlternativeCollector::collect(bySteps[action.steps() - 1], action, STEP_LIMIT,
+                                          AlternativeCollector::sameSource);
+            Candidate& amount = byAmount[action.count - 1];
+            if (better(action, amount)) amount = action;
+            AlternativeCollector::collect(scored, action, SCORE_LIMIT, sameAction);
+        }
+        vector<Candidate> finish(const Candidate& greedy) const {
+            vector<Candidate> result;
+            result.reserve(MAX_ALTERNATIVES);
+            auto append = [&](const Candidate& action) {
+                if (action.source < 0 || result.size() >= MAX_ALTERNATIVES) return;
+                if (any_of(result.begin(), result.end(), [&](const Candidate& old) {
+                    return sameAction(old, action);
+                })) return;
+                result.push_back(action);
+            };
+            append(greedy);
+            // Interleave the families so a caller taking a prefix still sees
+            // different sources, routes, operation counts and payload sizes.
+            for (int i = 0; i < 8; ++i) {
+                if (i < (int)sources.size()) append(sources[i]);
+                if (i < (int)routes.size()) append(routes[i]);
+                for (const auto& pool : bySteps)
+                    if (i < (int)pool.size()) append(pool[i]);
+                append(byAmount[i]);
+            }
+            for (const Candidate& action : scored) append(action);
+            return result;
+        }
+    };
     int sharedPrefix(int v, const Stack& stack, int count) const {
         int reference = stack.color[stack.size - 1];
         int length = depth[cellIndex(reference, v)];
@@ -2615,7 +2667,8 @@ struct CooperativeScheduler {
     }
 
     optional<Decision> decide(int mode, bool allowShortcuts, bool allowTransfers,
-                              Clock::time_point deadline, const Candidate* focus = nullptr) {
+                              Clock::time_point deadline, const Candidate* focus = nullptr,
+                              bool beamExplore = false) {
         auto& board = state.board;
         if (Clock::now() >= deadline) return nullopt;
         if (++decisionGeneration == 0) {
@@ -2623,9 +2676,10 @@ struct CooperativeScheduler {
             fill(exposureAt.begin(), exposureAt.end(), 0);
             ++decisionGeneration;
         }
-        // These are scheduling preferences, not legality constraints. Relax
-        // them at the edited action only; suffix repair keeps the full policy.
-        const bool explore = focus != nullptr;
+        // These are scheduling preferences, not legality constraints. History
+        // edits and beam expansion both need the alternatives they suppress.
+        assert(focus == nullptr || !beamExplore);
+        const bool explore = focus != nullptr || beamExplore;
         const auto& forward = allowShortcuts ? shortcutForward : treeForward;
         unsigned candidateChecks = 0;
         auto deadlineReached = [&]() {
@@ -2643,13 +2697,16 @@ struct CooperativeScheduler {
 
         Decision decision;
         optional<AlternativeCollector> alternatives;
-        if (explore) alternatives.emplace(board, *focus);
+        optional<BeamAlternativeCollector> beamAlternatives;
+        if (focus) alternatives.emplace(board, *focus);
+        if (beamExplore) beamAlternatives.emplace();
         int serial = 0;
         auto offer = [&](const Candidate& action) {
             Candidate tagged = action;
             tagged.serial = serial++;
             if (better(tagged, decision.greedy)) decision.greedy = tagged;
-            if (explore) alternatives->add(tagged);
+            if (focus) alternatives->add(tagged);
+            if (beamExplore) beamAlternatives->add(tagged);
         };
 
         for (int source : activeCells) {
@@ -3084,8 +3141,9 @@ struct CooperativeScheduler {
             // exactly that suffix onward. Only the intermediate landing may
             // go backward or leave the color's tree; the loan must restore
             // its host stack and finish strictly ahead on the original tree.
-            // This SA neighborhood is independent of the seed's options and
-            // is never enumerated during initial construction or greedy repair.
+            // This exploration neighborhood is independent of the option mask.
+            // Beam expansion limits its source/host pairs below; focused
+            // history edits retain the full neighborhood around their pivot.
             auto borrowSpringboard = [&](int source, int host, int firstLength) {
                 const Stack& original = board[source];
                 const Stack& springboard = board[host];
@@ -3141,25 +3199,84 @@ struct CooperativeScheduler {
                 }
                 return true;
             };
-            // Also borrow the focused source as a host: otherwise a pivot
-            // that removes a springboard cannot discover how to use it first.
-            int at = focus->source;
-            if (at >= 0 && at < cells && board[at].size > 0) {
-                for (int d = 0; d < 4; ++d) {
-                    for (int len = 1; len <= 8; ++len) {
-                        if (deadlineReached()) return nullopt;
-                        int other = ray[at][d][len - 1];
-                        if (other < 0) break;
-                        if (board[other].size == 0) continue;
-                        if (!borrowSpringboard(at, other, len) ||
-                            !borrowSpringboard(other, at, len)) return nullopt;
+            if (focus) {
+                // Also borrow the focused source as a host: otherwise a pivot
+                // that removes a springboard cannot discover how to use it first.
+                int at = focus->source;
+                if (at >= 0 && at < cells && board[at].size > 0) {
+                    for (int d = 0; d < 4; ++d) {
+                        for (int len = 1; len <= 8; ++len) {
+                            if (deadlineReached()) return nullopt;
+                            int other = ray[at][d][len - 1];
+                            if (other < 0) break;
+                            if (board[other].size == 0) continue;
+                            if (!borrowSpringboard(at, other, len) ||
+                                !borrowSpringboard(other, at, len)) return nullopt;
+                        }
+                    }
+                }
+            } else if (beamExplore) {
+                constexpr int LOAN_SOURCES = 3;
+                array<int, LOAN_SOURCES> sources;
+                sources.fill(-1);
+                int sourceCount = 0;
+                // Snapshot before borrowing: new offers can reorder the
+                // collector while the selected sources are being expanded.
+                for (const Candidate& action : beamAlternatives->sources) {
+                    if (sourceCount == LOAN_SOURCES) break;
+                    if (!originalOnTree[action.source]) continue;
+                    sources[sourceCount++] = action.source;
+                }
+                while (sourceCount < LOAN_SOURCES) {
+                    int best = -1, bestPotential = -1;
+                    for (int source : activeCells) {
+                        if (!originalOnTree[source] ||
+                            find(sources.begin(), sources.end(), source) != sources.end()) continue;
+                        int color = topColor[source];
+                        if (color < 0 || depth[cellIndex(color, source)] <= 0) continue;
+                        int potential = topCount[source] * depth[cellIndex(color, source)];
+                        if (potential > bestPotential) {
+                            best = source;
+                            bestPotential = potential;
+                        }
+                    }
+                    if (best < 0) break;
+                    sources[sourceCount++] = best;
+                }
+                for (int i = 0; i < sourceCount; ++i) {
+                    int source = sources[i];
+                    const Stack& original = board[source];
+                    int color = topColor[source], block = topCount[source];
+                    // One promising occupied host per direction bounds this
+                    // extra work to at most twelve ordered source/host pairs.
+                    for (int d = 0; d < 4; ++d) {
+                        int host = -1, firstLength = 0, bestPotential = -1;
+                        for (int len = 1; len <= 8; ++len) {
+                            if (deadlineReached()) return nullopt;
+                            int other = ray[source][d][len - 1];
+                            if (other < 0) break;
+                            const Stack& tower = board[other];
+                            if (tower.size == 0 || tower.size == 8 ||
+                                !originalOnTree[other] || nest[other] == color) continue;
+                            int amount = min<int>({block, 8 - tower.size,
+                                                   original.size - len + 1});
+                            if (amount <= 0) continue;
+                            int potential = 4 * amount * (tower.size + 1) - len;
+                            if (potential > bestPotential) {
+                                host = other;
+                                firstLength = len;
+                                bestPotential = potential;
+                            }
+                        }
+                        if (host >= 0 && !borrowSpringboard(source, host, firstLength)) return nullopt;
                     }
                 }
             }
         }
 
         if (decision.greedy.source < 0) return nullopt;
-        if (explore) decision.alternatives = alternatives->finish();
+        if (focus) decision.alternatives = alternatives->finish();
+        if (beamExplore) decision.alternatives = beamAlternatives->finish(decision.greedy);
         return decision;
     }
 
@@ -3210,6 +3327,153 @@ struct CooperativeScheduler {
 
 };
 
+// Ranking estimate for the construction beam, not an admissible lower bound.
+// Every dynamic term depends only on one stack and its four adjacent stacks,
+// so siblings can be scored without rebuilding the scheduler's global cache.
+struct BeamStateEvaluator {
+    using State = CooperativeScheduler::State;
+    struct Features {
+        double transport = 0.0;
+        double fragmentation = 0.0;
+        double shared = 0.0;
+        double support = 0.0;
+    };
+
+    const CooperativeScheduler& sim;
+    vector<double> transportUnit, blockWeight;
+
+    explicit BeamStateEvaluator(const CooperativeScheduler& scheduler)
+        : sim(scheduler), transportUnit(sim.K * sim.cells),
+          blockWeight(sim.K * sim.cells) {
+        vector<int> initialMass(sim.K * sim.cells, 0);
+        vector<int> roots(sim.K, -1);
+        for (int v = 0; v < sim.cells; ++v) {
+            if (sim.nest[v] >= 0) roots[sim.nest[v]] = v;
+            const auto& stack = sim.initial.board[v];
+            for (int j = 0; j < stack.size; ++j)
+                ++initialMass[sim.cellIndex(stack.color[j], v)];
+        }
+        for (int color = 0; color < sim.K; ++color) {
+            for (int v : sim.order[color]) {
+                int index = sim.cellIndex(color, v), p = sim.parent[index];
+                if (p >= 0) initialMass[sim.cellIndex(color, p)] += initialMass[index];
+            }
+            for (int v = 0; v < sim.cells; ++v) {
+                int index = sim.cellIndex(color, v);
+                int distance = sim.depth[index];
+                if (distance < 0) {
+                    // Normal completed beam actions stay on every moved color's
+                    // tree. Still give off-tree positions a finite, costly rank.
+                    int root = roots[color];
+                    distance = sim.n + (root < 0 ? sim.n :
+                        abs(v / sim.n - root / sim.n) + abs(v % sim.n - root % sim.n));
+                    transportUnit[index] = distance;
+                }
+                blockWeight[index] = 1.0 + 0.25 * sqrt((double)distance);
+            }
+            for (auto it = sim.order[color].rbegin(); it != sim.order[color].rend(); ++it) {
+                int v = *it, index = sim.cellIndex(color, v), p = sim.parent[index];
+                if (p < 0) {
+                    transportUnit[index] = 0.0;
+                    continue;
+                }
+                // Fixed initial tuning values: expected batching grows with
+                // initial downstream traffic, while long straight runs receive
+                // only a modest discount for possible springboard use.
+                double batch = min(4.0, 1.0 + 0.65 *
+                    sqrt((double)max(0, initialMass[index] - 1)));
+                double stride = 1.0 + 0.20 * min(3, max(0, (int)sim.run[index] - 1));
+                transportUnit[index] = transportUnit[sim.cellIndex(color, p)] +
+                                       1.0 / (batch * stride);
+            }
+        }
+    }
+
+    Features atCell(const State& state, int v) const {
+        Features result;
+        const auto& stack = state.board[v];
+        if (stack.size == 0) return result;
+        int previous = -1;
+        for (int j = 0; j < stack.size; ++j) {
+            int color = stack.color[j], index = sim.cellIndex(color, v);
+            result.transport += transportUnit[index];
+            if (color != previous) result.fragmentation += blockWeight[index];
+            previous = color;
+        }
+        // Cap mixed-stack credit: the same merger already reduces the number
+        // of transported blocks, and a long shared route is only a prospect.
+        result.shared = min(6.0, sim.sharedValue(v, stack));
+        if (stack.size == 8) return result;
+
+        for (int direction = 0; direction < 4; ++direction) {
+            int source = sim.ray[v][direction][0];
+            if (source < 0) continue;
+            const auto& incoming = state.board[source];
+            if (incoming.size == 0) continue;
+            int color = incoming.color[incoming.size - 1];
+            // Require present foreign-color traffic that can arrive along its
+            // tree. A tall stack on its own earns no springboard credit.
+            if (color == stack.color[stack.size - 1] || sim.nest[v] == color ||
+                sim.parent[sim.cellIndex(color, source)] != v) continue;
+            int arrival = incoming.topCount();
+            double fit = (double)min(arrival, 8 - (int)stack.size) / arrival;
+            int index = sim.cellIndex(color, v);
+            int gain = sim.reachableGain[index][stack.size] - sim.reachableGain[index][0];
+            // Several waiting neighbors cannot all reuse the same space at
+            // once. Retain one bounded opportunity instead of summing them.
+            result.support = max(result.support, min(3, max(0, gain)) * fit);
+        }
+        return result;
+    }
+
+    static void accumulate(Features& target, const Features& value, double factor = 1.0) {
+        target.transport += factor * value.transport;
+        target.fragmentation += factor * value.fragmentation;
+        target.shared += factor * value.shared;
+        target.support += factor * value.support;
+    }
+
+    Features evaluate(const State& state) const {
+        Features result;
+        for (int v = 0; v < sim.cells; ++v) accumulate(result, atCell(state, v));
+        return result;
+    }
+
+    Features update(const Features& old, const State& before, const State& after) const {
+        Features result = old;
+        array<int, 15> affected{}; // At most three changed cells, each plus four neighbors.
+        int count = 0;
+        auto include = [&](int v) {
+            if (v < 0 || find(affected.begin(), affected.begin() + count, v) !=
+                         affected.begin() + count) return;
+            assert(count < (int)affected.size());
+            affected[count++] = v;
+        };
+        for (int i = 0; i < after.changedCount; ++i) {
+            int v = after.changedCells[i];
+            include(v);
+            for (int direction = 0; direction < 4; ++direction)
+                include(sim.ray[v][direction][0]);
+        }
+        for (int i = 0; i < count; ++i) {
+            accumulate(result, atCell(before, affected[i]), -1.0);
+            accumulate(result, atCell(after, affected[i]));
+        }
+        return result;
+    }
+
+    double estimate(const Features& value, int occupiedCount, int lane) const {
+        if (occupiedCount == 0) return 0.0;
+        // Untuned initial weights for progress, consolidation, and mixed-color
+        // cooperation lanes. These values rank states; none justify pruning.
+        static constexpr array<double, 3> fragmentationWeight{0.65, 1.50, 0.80};
+        static constexpr array<double, 3> sharedWeight{0.12, 0.18, 0.30};
+        static constexpr array<double, 3> supportWeight{0.08, 0.06, 0.25};
+        return max(0.0, value.transport + fragmentationWeight[lane] * value.fragmentation -
+                        sharedWeight[lane] * value.shared - supportWeight[lane] * value.support);
+    }
+};
+
 struct GreedySeed {
     vector<Op> operations;
     vector<CooperativeScheduler::Candidate> actions;
@@ -3242,6 +3506,281 @@ optional<GreedySeed> buildCooperativeSeed(
         seed.actions.push_back(action);
     }
     return seed;
+}
+
+struct BeamSearchStats {
+    long long expanded = 0, generated = 0, duplicate = 0, dominated = 0;
+    long long rollouts = 0, rolloutCompleted = 0, improvements = 0;
+    long long rolloutNs = 0, elapsedNs = 0;
+    int initialOps = 0, bestOps = 0, layers = 0, lastCost = 0;
+    int minWidth = INT_MAX, maxWidth = 0, peakBucket = 0, seenStates = 0;
+    array<long long, 3> laneExpanded{};
+};
+
+// Construct alternative schedules from the initial board. Layers count physical
+// operations, so two-operation transfers enter g+2 without competing at g+1.
+vector<Op> buildCooperativeBeam(
+    CooperativeScheduler& sim, const vector<Op>& incumbent,
+    chrono::steady_clock::time_point deadline, BeamSearchStats& stats) {
+    using Clock = chrono::steady_clock;
+    using State = CooperativeScheduler::State;
+    using Candidate = CooperativeScheduler::Candidate;
+    using Features = BeamStateEvaluator::Features;
+    const auto started = Clock::now();
+    stats.initialOps = stats.bestOps = (int)incumbent.size();
+    vector<Op> bestOutput = incumbent;
+    int bestCost = (int)incumbent.size();
+    if (started >= deadline || sim.initial.remaining == 0) return bestOutput;
+    BeamStateEvaluator evaluator(sim);
+    const auto totalBudget = deadline - started;
+    const auto finishReserve = min(chrono::duration_cast<Clock::duration>(chrono::milliseconds(80)),
+                                   totalBudget / 10);
+    const auto expansionDeadline = deadline - finishReserve;
+    struct Trace { int parent; Candidate action; };
+    vector<Trace> traces;
+    traces.reserve(8192);
+    struct Node {
+        State state;
+        Features features;
+        uint64_t hash = 0;
+        // Pending actions are materialized only for selected nodes.
+        int parentTrace = -1, lane = 0;
+        Candidate action;
+    };
+    struct Bucket {
+        vector<Node> nodes;
+        unordered_multimap<uint64_t, int> index;
+    };
+    array<Bucket, 3> buckets;
+    struct Seen { vector<SlimeStack> board; int cost; };
+    vector<Seen> seen;
+    unordered_multimap<uint64_t, int> seenIndex;
+    // Bound retained exact boards to roughly 120 MiB at the largest N.
+    constexpr int MAX_SEEN = 32768;
+    seen.reserve(MAX_SEEN);
+    seenIndex.reserve(MAX_SEEN * 2);
+    auto dominated = [&](const State& state, uint64_t hash, int cost) {
+        auto range = seenIndex.equal_range(hash);
+        for (auto it = range.first; it != range.second; ++it) {
+            const auto& old = seen[it->second];
+            if (old.cost <= cost && old.board == state.board) return true;
+        }
+        return false;
+    };
+    auto remember = [&](const Node& node, int cost) {
+        if ((int)seen.size() == MAX_SEEN) return;
+        seenIndex.emplace(node.hash, (int)seen.size());
+        seen.push_back({node.state.board, cost});
+    };
+    auto materialize = [&](Node& node) {
+        if (node.action.source < 0) return;
+        traces.push_back({node.parentTrace, node.action});
+        node.parentTrace = (int)traces.size() - 1;
+        node.action = Candidate{};
+    };
+    auto prefixActions = [&](int trace) {
+        vector<Candidate> actions;
+        while (trace >= 0) {
+            actions.push_back(traces[trace].action);
+            trace = traces[trace].parent;
+        }
+        reverse(actions.begin(), actions.end());
+        return actions;
+    };
+    auto save = [&](int trace, const vector<Candidate>& suffix, int cost) {
+        if (cost >= bestCost) return;
+        auto actions = prefixActions(trace);
+        actions.insert(actions.end(), suffix.begin(), suffix.end());
+        State replay = sim.initial;
+        vector<Op> output;
+        output.reserve(cost);
+        for (const auto& action : actions)
+            if (!sim.apply(replay, action, &output)) return;
+        if (replay.remaining != 0 || (int)output.size() != cost) return;
+        bestCost = cost;
+        bestOutput = std::move(output);
+        stats.bestOps = cost;
+        ++stats.improvements;
+    };
+    auto insert = [&](Node&& node, int cost) {
+        if (dominated(node.state, node.hash, cost)) {
+            ++stats.dominated;
+            return;
+        }
+        auto& bucket = buckets[cost % 3];
+        auto range = bucket.index.equal_range(node.hash);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (bucket.nodes[it->second].state.board == node.state.board) {
+                ++stats.duplicate;
+                return;
+            }
+        }
+        bucket.index.emplace(node.hash, (int)bucket.nodes.size());
+        bucket.nodes.push_back(std::move(node));
+        stats.peakBucket = max(stats.peakBucket, (int)bucket.nodes.size());
+    };
+    Node initial;
+    initial.state = sim.initial;
+    initial.features = evaluator.evaluate(initial.state);
+    for (int v = 0; v < sim.cells; ++v)
+        initial.hash ^= initial.state.board[v].positionHash(v);
+    insert(std::move(initial), 0);
+    // The lanes retain different whole-board evaluations; local action scores
+    // are used only to limit branching, never accumulated as a path score.
+    constexpr array<int, 3> modes{1, 4, 3};
+    auto rollout = [&](const Node& node, int cost, Clock::time_point until) {
+        if (Clock::now() >= until || cost + node.state.occupiedCount >= bestCost) return;
+        const auto rolloutStart = Clock::now();
+        ++stats.rollouts;
+        sim.state = node.state;
+        vector<Candidate> tail;
+        while (sim.state.remaining > 0 && Clock::now() < until) {
+            if (cost + sim.state.occupiedCount >= bestCost) break;
+            auto decision = sim.decide(modes[node.lane], true, true, until);
+            if (!decision || cost + decision->greedy.steps() >= bestCost) break;
+            if (!sim.apply(sim.state, decision->greedy)) break;
+            tail.push_back(decision->greedy);
+            cost += decision->greedy.steps();
+        }
+        if (sim.state.remaining == 0) {
+            ++stats.rolloutCompleted;
+            save(node.parentTrace, tail, cost);
+        }
+        stats.rolloutNs += chrono::duration_cast<chrono::nanoseconds>(Clock::now() - rolloutStart).count();
+    };
+    const int load = sim.initial.remaining * sim.n;
+    const int maximumWidth = load <= 1000 ? 64 : load <= 2800 ? 40 : 24;
+    vector<Node> finishers;
+    int finisherCost = 0, nextRolloutCost = max(8, bestCost / 10), rolloutLane = 0;
+    auto nextRolloutTime = started + chrono::milliseconds(100);
+    for (int cost = 0; cost < bestCost && Clock::now() < expansionDeadline; ++cost) {
+        auto& slot = buckets[cost % 3];
+        vector<Node> current = std::move(slot.nodes);
+        slot.nodes.clear();
+        slot.index.clear();
+        if (current.empty()) {
+            if (buckets[(cost + 1) % 3].nodes.empty() &&
+                buckets[(cost + 2) % 3].nodes.empty()) break;
+            continue;
+        }
+        ++stats.layers;
+        stats.lastCost = cost;
+        int width = maximumWidth;
+        if (stats.expanded >= 8) {
+            const double workNs = max(1.0, (double)chrono::duration_cast<chrono::nanoseconds>(
+                Clock::now() - started).count() - stats.rolloutNs);
+            const double perNode = workNs / stats.expanded;
+            const double leftNs = max(0.0, (double)chrono::duration_cast<chrono::nanoseconds>(
+                expansionDeadline - Clock::now()).count());
+            const double target = 0.80 * leftNs / (perNode * max(8, bestCost - cost));
+            width = max(3, (int)min<double>(maximumWidth, target));
+        } else {
+            width = min(width, 12);
+        }
+        vector<int> eligible;
+        eligible.reserve(current.size());
+        for (int i = 0; i < (int)current.size(); ++i) {
+            const auto& node = current[i];
+            // Only this proven lower bound prunes against the incumbent.
+            if (cost + node.state.occupiedCount >= bestCost) continue;
+            if (dominated(node.state, node.hash, cost)) { ++stats.dominated; continue; }
+            eligible.push_back(i);
+        }
+        array<vector<int>, 3> order;
+        for (int lane = 0; lane < 3; ++lane) {
+            order[lane] = eligible;
+            auto better = [&](int a, int b) {
+                const double x = evaluator.estimate(current[a].features,
+                    current[a].state.occupiedCount, lane);
+                const double y = evaluator.estimate(current[b].features,
+                    current[b].state.occupiedCount, lane);
+                if (x != y) return x < y;
+                if (current[a].hash != current[b].hash) return current[a].hash < current[b].hash;
+                return a < b;
+            };
+            retainBestNodes(order[lane], width, better);
+        }
+        vector<pair<int, int>> selected;
+        vector<uint8_t> used(current.size());
+        array<int, 3> cursor{};
+        while ((int)selected.size() < width) {
+            bool added = false;
+            for (int turn = 0; turn < 3 && (int)selected.size() < width; ++turn) {
+                int lane = (turn + cost) % 3;
+                auto& at = cursor[lane];
+                while (at < (int)order[lane].size() && used[order[lane][at]]) ++at;
+                if (at == (int)order[lane].size()) continue;
+                int id = order[lane][at++];
+                used[id] = 1;
+                selected.push_back({id, lane});
+                added = true;
+            }
+            if (!added) break;
+        }
+        if (selected.empty()) continue;
+        stats.minWidth = min(stats.minWidth, (int)selected.size());
+        stats.maxWidth = max(stats.maxWidth, (int)selected.size());
+        finishers.clear();
+        finisherCost = cost;
+        for (auto [id, lane] : selected) {
+            auto& node = current[id];
+            node.lane = lane;
+            materialize(node);
+            if (finishers.size() < 3) finishers.push_back(node);
+        }
+        if (cost >= nextRolloutCost && Clock::now() >= nextRolloutTime) {
+            const auto until = min(expansionDeadline, Clock::now() + chrono::milliseconds(25));
+            rollout(finishers[rolloutLane++ % finishers.size()], cost, until);
+            nextRolloutCost = cost + max(8, bestCost / 10);
+            nextRolloutTime = Clock::now() + chrono::milliseconds(100);
+        }
+        for (auto [id, lane] : selected) {
+            if (Clock::now() >= expansionDeadline) break;
+            auto& node = current[id];
+            if (cost + node.state.occupiedCount >= bestCost) continue;
+            sim.state = node.state;
+            auto decision = sim.decide(modes[lane], true, true, expansionDeadline, nullptr, true);
+            if (!decision) continue;
+            remember(node, cost);
+            ++stats.expanded;
+            ++stats.laneExpanded[lane];
+            for (const auto& action : decision->alternatives) {
+                if (Clock::now() >= expansionDeadline) break;
+                const int nextCost = cost + action.steps();
+                if (nextCost >= bestCost) continue;
+                Node child;
+                child.state = node.state;
+                if (!sim.apply(child.state, action)) continue;
+                ++stats.generated;
+                if (child.state.remaining == 0) {
+                    save(node.parentTrace, vector<Candidate>{action}, nextCost);
+                    continue;
+                }
+                if (nextCost + child.state.occupiedCount >= bestCost) continue;
+                child.hash = node.hash;
+                for (int j = 0; j < child.state.changedCount; ++j) {
+                    const int v = child.state.changedCells[j];
+                    child.hash ^= node.state.board[v].positionHash(v) ^
+                                  child.state.board[v].positionHash(v);
+                }
+                child.features = evaluator.update(node.features, node.state, child.state);
+                child.parentTrace = node.parentTrace;
+                child.action = action;
+                insert(std::move(child), nextCost);
+            }
+        }
+    }
+    // Even a partially explored beam contributes complete candidates. Reserve
+    // a separate finishing slice instead of relying on reaching a goal layer.
+    for (int i = 0; i < (int)finishers.size() && Clock::now() < deadline; ++i) {
+        auto now = Clock::now();
+        auto until = now + (deadline - now) / ((int)finishers.size() - i);
+        rollout(finishers[i], finisherCost, until);
+    }
+    stats.seenStates = (int)seen.size();
+    if (stats.minWidth == INT_MAX) stats.minWidth = 0;
+    stats.elapsedNs = chrono::duration_cast<chrono::nanoseconds>(Clock::now() - started).count();
+    return bestOutput;
 }
 
 struct HistorySearchStats {
@@ -3846,7 +4385,7 @@ int main() {
     vector<string> grid(N);
     for (auto& row : grid) cin >> row;
     const auto routingDeadline = start + chrono::milliseconds(350);
-    const auto baselineDeadline = start + chrono::milliseconds(950);
+    const auto baselineDeadline = start + chrono::milliseconds(450);
     const auto overallDeadline = start + chrono::milliseconds(1950);
     // Reserve 100 ms for compression. Repeated sparse repairs share their
     // deadlines; retain 10 ms to revisit the output of the region searches.
@@ -3869,40 +4408,19 @@ int main() {
     const auto candidateBuildStart = debugNow();
     const int initialSlimes = scheduler.initial.remaining;
     const int candidateLoad = initialSlimes * N;
-    const auto selectedModels = candidateModelIds(candidateLoad);
-    optional<GreedySeed> seed;
-    int seedScore = INT_MAX, seedAttempts = 0, seedCompleted = 0, seedPruned = 0;
     const char* answerSource = "fallback";
-    constexpr int optionMasks[] = {0, 1, 2, 3};
-    constexpr int optionCount = size(optionMasks);
-    const int candidateCount = (int)selectedModels.size() * optionCount;
-    // Preserve the retained models' order; equal-length candidates keep the first seed.
-    for (int job = 0; job < candidateCount; ++job) {
-        if (chrono::steady_clock::now() >= baselineDeadline) break;
-        int mode = selectedModels[job / optionCount], options = optionMasks[job % optionCount];
-        // Option bits: 1 = transfers, 2 = shortcuts, 3 = both; 0 enables neither.
-        bool shortcuts = (options & 2) != 0, transfers = (options & 1) != 0;
-        if constexpr (ENABLE_DEBUG) ++seedAttempts;
-        bool pruned = false;
-        auto candidate = buildCooperativeSeed(scheduler, mode, shortcuts, transfers,
-                                              baselineDeadline, seedScore, pruned);
-        if constexpr (ENABLE_DEBUG) seedPruned += pruned;
-        if (!candidate) continue;
-        if constexpr (ENABLE_DEBUG) ++seedCompleted;
-        // Select by the complete, uncompressed initial operation count.
-        const int candidateScore = (int)candidate->operations.size();
-        if (candidate->operations.size() < answer.size()) {
-            answer = candidate->operations;
-            answerSource = "seed";
-        }
-        if (!seed || candidateScore < seedScore) {
-            seedScore = candidateScore;
-            seed = std::move(candidate);
-        }
+    bool seedPruned = false;
+    // Obtain one inexpensive incumbent, then spend the construction budget on
+    // alternative intermediate boards instead of independent greedy models.
+    auto seed = buildCooperativeSeed(scheduler, 1, true, true,
+                                     baselineDeadline, (int)answer.size(), seedPruned);
+    if (seed && seed->operations.size() < answer.size()) {
+        answer = seed->operations;
+        answerSource = "seed";
     }
     const auto candidateBuildEnd = debugNow();
     const size_t baselineOps = answer.size();
-    HistorySearchStats stats;
+    BeamSearchStats beamStats;
     long long searchNs = 0, straightNs = 0, smallRegionNs = 0;
     size_t compressionInputOps = answer.size(), straightSaved = 0;
     auto straighten = [&](const vector<Op>& input, auto deadline) {
@@ -3912,23 +4430,13 @@ int main() {
             straightNs += chrono::duration_cast<chrono::nanoseconds>(debugNow() - stageStart).count();
         return output;
     };
-    auto postprocessingStart = debugNow();
-    if (seed) {
-        const auto searchStart = debugNow();
-        auto rewritten = rewriteCooperativeHistory(scheduler, *seed, searchDeadline, stats);
-        if constexpr (ENABLE_DEBUG)
-            searchNs = chrono::duration_cast<chrono::nanoseconds>(debugNow() - searchStart).count();
-        postprocessingStart = debugNow();
-        if (rewritten) {
-            auto compressed = straighten(*rewritten, straightCompressionDeadline);
-            if (compressed.size() < answer.size()) {
-                compressionInputOps = rewritten->size();
-                straightSaved += rewritten->size() - compressed.size();
-                answer = std::move(compressed);
-                answerSource = "history";
-            }
-        }
-    }
+    const auto searchStart = debugNow();
+    answer = buildCooperativeBeam(scheduler, answer, searchDeadline, beamStats);
+    if (answer.size() < baselineOps) answerSource = "beam";
+    if constexpr (ENABLE_DEBUG)
+        searchNs = chrono::duration_cast<chrono::nanoseconds>(debugNow() - searchStart).count();
+    compressionInputOps = answer.size();
+    const auto postprocessingStart = debugNow();
     const size_t beforePostprocessing = answer.size();
     answer = straighten(answer, straightCompressionDeadline);
     straightSaved += beforePostprocessing - answer.size();
@@ -3969,21 +4477,32 @@ int main() {
              << " answer_source=" << answerSource
              << " initial_slimes=" << initialSlimes
              << " candidate_load=" << candidateLoad
-             << " candidate_model_count=" << selectedModels.size()
-             << " candidate_count=" << candidateCount
-             << " seed_attempts=" << seedAttempts
-             << " seed_completed=" << seedCompleted
+             << " search_method=construction_beam"
+             << " candidate_model_count=1 candidate_count=1 seed_attempts=1"
+             << " seed_completed=" << bool(seed)
              << " seed_pruned=" << seedPruned
              << " seed_mode=" << (seed ? seed->mode : -1)
              << " seed_shortcuts=" << (seed && seed->shortcuts)
              << " seed_transfers=" << (seed && seed->transfers)
-             << " history_initial_raw_ops=" << stats.initialRawOps
-             << " history_best_raw_ops=" << stats.bestRawOps
-             << " history_attempts=" << stats.attempts
-             << " history_completed=" << stats.completed
-             << " history_accepted=" << stats.accepted
-             << " history_improvements=" << stats.improvements
-             << " history_invalid=" << stats.invalid
+             << " beam_initial_raw_ops=" << beamStats.initialOps
+             << " beam_best_raw_ops=" << beamStats.bestOps
+             << " beam_expanded=" << beamStats.expanded
+             << " beam_generated=" << beamStats.generated
+             << " beam_duplicates=" << beamStats.duplicate
+             << " beam_dominated=" << beamStats.dominated
+             << " beam_layers=" << beamStats.layers
+             << " beam_last_cost=" << beamStats.lastCost
+             << " beam_min_width=" << beamStats.minWidth
+             << " beam_max_width=" << beamStats.maxWidth
+             << " beam_peak_bucket=" << beamStats.peakBucket
+             << " beam_seen_states=" << beamStats.seenStates
+             << " beam_lane0_expanded=" << beamStats.laneExpanded[0]
+             << " beam_lane1_expanded=" << beamStats.laneExpanded[1]
+             << " beam_lane2_expanded=" << beamStats.laneExpanded[2]
+             << " beam_rollouts=" << beamStats.rollouts
+             << " beam_rollout_completed=" << beamStats.rolloutCompleted
+             << " beam_rollout_ns=" << beamStats.rolloutNs
+             << " beam_improvements=" << beamStats.improvements
              << " compression_input_ops=" << compressionInputOps
              << " compression_saved=" << compressionInputOps - answer.size()
              << " straight_saved_ops=" << straightSaved
@@ -4059,7 +4578,6 @@ int main() {
              << " route_initial_geometry=" << routingStats.initialGeometry
              << " route_best_geometry=" << routingStats.bestGeometry
              << " route_deadline_reached=" << routingStats.deadlineReached;
-        stats.writeProfile(cerr);
         cerr << '\n';
     }
     for (const auto& op : answer)
