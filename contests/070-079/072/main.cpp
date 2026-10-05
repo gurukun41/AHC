@@ -106,14 +106,22 @@ struct SlimeStack {
     array<unsigned char, 8> color{};
     uint8_t size = 0; // 0..8; arithmetic is promoted to int.
 
+    static constexpr array<uint64_t, 9> BYTE_MASK{
+        0, 0xff, 0xffff, 0xffffff, 0xffffffff,
+        0xffffffffff, 0xffffffffffff, 0xffffffffffffff, UINT64_MAX};
+    uint64_t activeColors() const {
+        uint64_t packed;
+        memcpy(&packed, color.data(), sizeof(packed));
+        if constexpr (endian::native == endian::big) packed = __builtin_bswap64(packed);
+        return packed & BYTE_MASK[size];
+    }
     bool operator==(const SlimeStack& other) const {
-        return size == other.size &&
-               equal(color.begin(), color.begin() + size, other.color.begin());
+        return size == other.size && activeColors() == other.activeColors();
     }
     int commonPrefix(const SlimeStack& other) const {
-        int count = 0;
-        while (count < min(size, other.size) && color[count] == other.color[count]) ++count;
-        return count;
+        int length = min(size, other.size);
+        uint64_t different = (activeColors() ^ other.activeColors()) & BYTE_MASK[length];
+        return different ? __builtin_ctzll(different) / 8 : length;
     }
     uint64_t appendToHash(uint64_t hash) const {
         hash = (hash ^ uint64_t(size + 1)) * 1099511628211ULL;
@@ -121,22 +129,30 @@ struct SlimeStack {
             hash = (hash ^ uint64_t(color[i] + 17)) * 1099511628211ULL;
         return hash;
     }
+    uint64_t encoding() const {
+        // Add one per live byte, then compact the eight low nibbles. Colors
+        // are 0..11, so no addition carries between bytes. This is exactly
+        // the original nibble encoding, including the empty-stack hash.
+        uint64_t packed = activeColors() + (0x0101010101010101ULL & BYTE_MASK[size]);
+        packed = (packed | (packed >> 4)) & 0x00ff00ff00ff00ffULL;
+        packed = (packed | (packed >> 8)) & 0x0000ffff0000ffffULL;
+        packed = (packed | (packed >> 16)) & 0x00000000ffffffffULL;
+        return (packed << 4) | size;
+    }
     uint64_t positionHash(int cell) const {
-        uint64_t packed = size;
-        for (int i = 0; i < size; ++i)
-            packed |= uint64_t(color[i] + 1) << (4 + 4 * i);
-        return mixHash(packed ^ (uint64_t(cell + 1) * 0x9e3779b97f4a7c15ULL));
+        return mixHash(encoding() ^ (uint64_t(cell + 1) * 0x9e3779b97f4a7c15ULL));
     }
     int topCount() const {
         if (size == 0) return 0;
-        int count = 1;
-        while (count < size && color[size - 1 - count] == color[size - 1]) ++count;
-        return count;
+        uint64_t different = (activeColors() ^
+            (0x0101010101010101ULL * color[size - 1])) & BYTE_MASK[size];
+        return different ? __builtin_clzll(different) / 8 - (8 - size) : size;
     }
     int home(int nestColor) {
-        int before = size;
-        while (size > 0 && color[size - 1] == nestColor) --size;
-        return before - size;
+        if (size == 0 || color[size - 1] != nestColor) return 0;
+        int count = topCount();
+        size -= count;
+        return count;
     }
 };
 static_assert(sizeof(SlimeStack) == 9);
@@ -151,7 +167,13 @@ bool canTransfer(const SlimeStack& from, const SlimeStack& to, int kept, int len
 int transferSlimes(SlimeStack& from, SlimeStack& to, int kept, int length,
                    int fromNest, int toNest) {
     if (!canTransfer(from, to, kept, length)) return -1;
-    for (int j = from.size - 1; j >= kept; --j) to.color[to.size++] = from.color[j];
+    const int count = from.size - kept;
+    uint64_t reversed = __builtin_bswap64(from.activeColors()) >> (8 * (8 - from.size));
+    uint64_t arrived = to.activeColors() |
+        ((reversed & SlimeStack::BYTE_MASK[count]) << (8 * to.size));
+    if constexpr (endian::native == endian::big) arrived = __builtin_bswap64(arrived);
+    memcpy(to.color.data(), &arrived, sizeof(arrived));
+    to.size += count;
     from.size = kept;
     return from.home(fromNest) + to.home(toNest);
 }
@@ -237,28 +259,46 @@ struct DependencyRegion {
     int end = 0;
 };
 
+struct DependencyRegionScratch {
+    vector<unsigned> selectedAt, pendingAt;
+    unsigned selectionGeneration = 0, pendingGeneration = 0;
+    explicit DependencyRegionScratch(size_t count) : selectedAt(count), pendingAt(count) {}
+};
+
 // Extend through endpoint dependencies, rather than a fixed number of moves.
 // When a new cell enters, absorb all its earlier uses in this interval too;
 // every unselected interior move then commutes with every replacement move.
 DependencyRegion collectDependencyRegion(
     const MoveDependencies& deps, int begin, int maxCells,
-    chrono::steady_clock::time_point deadline) {
+    chrono::steady_clock::time_point deadline, DependencyRegionScratch& scratch) {
     using Clock = chrono::steady_clock;
     DependencyRegion region;
     region.end = begin;
-    vector<unsigned char> selected(deps.from.size(), 0);
-    vector<int> pendingAt(deps.from.size(), 0);
-    int generation = 0, candidate = begin, visited = 0;
+    region.cells.reserve(maxCells + 1);
+    if (++scratch.selectionGeneration == 0) {
+        fill(scratch.selectedAt.begin(), scratch.selectedAt.end(), 0);
+        ++scratch.selectionGeneration;
+    }
+    const unsigned selection = scratch.selectionGeneration;
+    int candidate = begin, visited = 0;
+    vector<int> cells, pending;
+    cells.reserve(maxCells + 1);
+    pending.reserve(32);
     while (candidate < (int)deps.from.size() && Clock::now() < deadline) {
-        ++generation;
-        vector<int> cells = region.cells, pending;
+        if (++scratch.pendingGeneration == 0) {
+            fill(scratch.pendingAt.begin(), scratch.pendingAt.end(), 0);
+            ++scratch.pendingGeneration;
+        }
+        const unsigned generation = scratch.pendingGeneration;
+        cells = region.cells;
+        pending.clear();
         bool oversized = false, timedOut = false;
         auto contains = [&](int cell) {
             return find(cells.begin(), cells.end(), cell) != cells.end();
         };
         auto absorb = [&](int at) {
-            if (selected[at] || pendingAt[at] == generation) return;
-            pendingAt[at] = generation;
+            if (scratch.selectedAt[at] == selection || scratch.pendingAt[at] == generation) return;
+            scratch.pendingAt[at] = generation;
             pending.push_back(at);
             for (int cell : {deps.from[at], deps.to[at]}) {
                 if (contains(cell)) continue;
@@ -284,9 +324,9 @@ DependencyRegion collectDependencyRegion(
             if (timedOut) break;
         }
         if (oversized || timedOut) break;
-        region.cells = std::move(cells);
+        region.cells = cells;
         for (int at : pending) {
-            selected[at] = 1;
+            scratch.selectedAt[at] = selection;
             region.selected.push_back(at);
         }
         region.end = candidate + 1;
@@ -311,6 +351,9 @@ vector<Op> compressMoves(
     vector<SlimeStack> original(board.size()), replacement(board.size());
     vector<Op> result;
     result.reserve(ops.size());
+    vector<int> chainCells, chainOps;
+    chainCells.reserve(9);
+    chainOps.reserve(8);
     for (int i = 0; i < (int)ops.size();) {
         if (Clock::now() >= deadline) {
             result.insert(result.end(), ops.begin() + i, ops.end());
@@ -324,7 +367,8 @@ vector<Op> compressMoves(
         original[current] = board[current];
         if (transferSlimes(original[from], original[current], first.k, first.len,
                            sim.nest[from], sim.nest[current]) < 0) return ops;
-        vector<int> chainCells{from, current}, chainOps{i};
+        chainCells.assign({from, current});
+        chainOps.assign(1, i);
         bool palindrome = true;
         for (int a = first.k, b = board[from].size - 1; a < b; ++a, --b)
             if (board[from].color[a] != board[from].color[b]) palindrome = false;
@@ -452,6 +496,13 @@ vector<Op> compressDependencyGroupsImpl(
             if (!sim.floorCell(ar + dr * step, ac + dc * step)) return INF;
         return len;
     };
+    DependencyRegionScratch regionScratch(ops.size());
+    vector<uint64_t> seen(Large ? 8192 : 2048);
+    vector<Node> nodes;
+    nodes.reserve(MAX_NODES);
+    vector<int> beam, nextBeam;
+    beam.reserve(MAX_NODES);
+    nextBeam.reserve(MAX_NODES);
 
     for (size_t i = 0; i < ops.size();) {
         if (Clock::now() >= deadline || stats.windows >= MAX_WINDOWS) {
@@ -460,7 +511,7 @@ vector<Op> compressDependencyGroupsImpl(
             break;
         }
         const auto groupDeadline = min(deadline, Clock::now() + chrono::microseconds(GROUP_MICROS));
-        DependencyRegion region = collectDependencyRegion(deps, (int)i, MAX_ENDPOINTS, groupDeadline);
+        DependencyRegion region = collectDependencyRegion(deps, (int)i, MAX_ENDPOINTS, groupDeadline, regionScratch);
         vector<int>& cells = region.cells;
         cells.reserve(MAX_CELLS);
         const int selectedCount = (int)region.selected.size();
@@ -644,29 +695,24 @@ vector<Op> compressDependencyGroupsImpl(
                 if constexpr (Large) return hash == 0 ? uint64_t(1) : hash;
                 else return hash;
             };
-            conditional_t<Large, vector<uint64_t>, unordered_set<uint64_t>> seen;
-            if constexpr (Large) seen.assign(8192, 0);
-            else seen.reserve(1024);
+            fill(seen.begin(), seen.end(), 0);
+            bool seenZero = false;
             auto firstVisit = [&](uint64_t hash) {
-                if constexpr (Large) {
-                    size_t slot = hash & (seen.size() - 1);
-                    while (seen[slot] != 0 && seen[slot] != hash) slot = (slot + 1) & (seen.size() - 1);
-                    if (seen[slot] == hash) return false;
-                    seen[slot] = hash;
-                    return true;
-                } else {
-                    return seen.insert(hash).second;
-                }
+                if (hash == 0) return !exchange(seenZero, true);
+                size_t slot = hash & (seen.size() - 1);
+                while (seen[slot] != 0 && seen[slot] != hash) slot = (slot + 1) & (seen.size() - 1);
+                if (seen[slot] == hash) return false;
+                seen[slot] = hash;
+                return true;
             };
-            vector<Node> nodes;
-            nodes.reserve(MAX_NODES);
+            nodes.clear();
             nodes.push_back({start, -1, Op{}, scoreState(start)});
             firstVisit(hashState(start));
-            vector<int> beam{0};
+            beam.assign(1, 0);
             int finishId = start == target ? 0 : -1, attempted = 0, expanded = 0;
             bool stop = Large && nodes[0].score == INT_MAX, windowTimedOut = false;
             for (int depth = 1; depth < selectedCount && finishId < 0 && !stop; ++depth) {
-                vector<int> nextBeam;
+                nextBeam.clear();
                 for (int id : beam) {
                     if constexpr (!Large) {
                         if (++expanded > 48) { stop = true; break; }
@@ -678,6 +724,7 @@ vector<Op> compressDependencyGroupsImpl(
                     }
                     // Child insertion must never invalidate the parent state.
                     State state = nodes[id].state;
+                    State child = state;
                     for (const Edge& edge : edges) {
                         for (int kept = edge.op.len - 1; kept < state[edge.from].size; ++kept) {
                             if constexpr (Large) {
@@ -698,7 +745,8 @@ vector<Op> compressDependencyGroupsImpl(
                                     break;
                                 }
                             }
-                            State child = state;
+                            child[edge.from] = state[edge.from];
+                            child[edge.to] = state[edge.to];
                             if (transferSlimes(child[edge.from], child[edge.to], kept, edge.op.len,
                                     sim.nest[cells[edge.from]], sim.nest[cells[edge.to]]) < 0) continue;
                             int score = scoreState(child);
@@ -713,6 +761,8 @@ vector<Op> compressDependencyGroupsImpl(
                             }
                             nextBeam.push_back(childId);
                         }
+                        child[edge.from] = state[edge.from];
+                        child[edge.to] = state[edge.to];
                         if (stop || finishId >= 0) break;
                     }
                     if (stop || finishId >= 0) break;
@@ -722,7 +772,7 @@ vector<Op> compressDependencyGroupsImpl(
                     return nodes[a].score != nodes[b].score ? nodes[a].score < nodes[b].score : a < b;
                 };
                 retainBestNodes(nextBeam, BEAM_WIDTH, better);
-                beam = std::move(nextBeam);
+                beam.swap(nextBeam);
             }
             stats.transitions += attempted;
             if (windowTimedOut) ++stats.windowTimeouts;
@@ -896,6 +946,22 @@ vector<Op> repairDependentMovesPass(
         }
         return hash;
     };
+    vector<Edit> edits;
+    edits.reserve(MAX_NODES);
+    vector<Node> nodes;
+    nodes.reserve(MAX_NODES);
+    vector<int> beam, nextBeam;
+    beam.reserve(MAX_NODES);
+    nextBeam.reserve(MAX_NODES);
+    struct SeenEntry { uint64_t hash = 0; int omitted = -1; };
+    array<SeenEntry, MAX_NODES * 2> seen;
+    auto seenValue = [&](uint64_t hash) -> int& {
+        size_t slot = hash & (seen.size() - 1);
+        while (seen[slot].omitted >= 0 && seen[slot].hash != hash)
+            slot = (slot + 1) & (seen.size() - 1);
+        seen[slot].hash = hash;
+        return seen[slot].omitted;
+    };
 
     for (int anchor = 0; anchor < (int)ops.size();) {
         if (Clock::now() >= deadline) {
@@ -904,13 +970,10 @@ vector<Op> repairDependentMovesPass(
         }
         ++stats.attempts;
         const auto attemptDeadline = min(deadline, Clock::now() + chrono::microseconds(1000));
-        vector<Edit> edits;
-        edits.reserve(MAX_NODES);
-        vector<Node> nodes;
-        nodes.reserve(MAX_NODES);
-        vector<int> beam;
-        unordered_map<uint64_t, int> seen;
-        seen.reserve(MAX_NODES * 2);
+        edits.clear();
+        nodes.clear();
+        beam.clear();
+        for (auto& entry : seen) entry.omitted = -1;
         int winner = -1;
         int expanded = 0;
         bool timedOut = false, stopped = false;
@@ -929,9 +992,9 @@ vector<Op> repairDependentMovesPass(
             if (first.differences.empty() && first.omitted == 0) return;
             first.score = differenceScore(first.differences);
             const uint64_t hash = hashNode(first);
-            auto visited = seen.find(hash);
-            if (visited != seen.end() && visited->second >= first.omitted) return;
-            seen[hash] = first.omitted;
+            int& visited = seenValue(hash);
+            if (visited >= first.omitted) return;
+            visited = first.omitted;
             Op replacement = ops[anchor];
             replacement.k = kept;
             edits.push_back({anchor, -1, replacement, omit});
@@ -945,7 +1008,7 @@ vector<Op> repairDependentMovesPass(
         for (int kept = ops[anchor].len - 1; kept < trace[anchor].beforeFrom.size; ++kept)
             if (kept != ops[anchor].k) addRoot(false, kept);
         while (winner < 0 && !beam.empty() && !stopped) {
-            vector<int> nextBeam;
+            nextBeam.clear();
             for (int id : beam) {
                 if (Clock::now() >= attemptDeadline) {
                     timedOut = stopped = true;
@@ -956,10 +1019,10 @@ vector<Op> repairDependentMovesPass(
                     break;
                 }
                 ++stats.visited;
-                // Keep a copy: inserting child nodes may invalidate references.
-                const Node parent = nodes[id];
-                auto bestKnown = seen.find(hashNode(parent));
-                if (bestKnown != seen.end() && bestKnown->second > parent.omitted) continue;
+                // Capacity is reserved above and every insertion is capped at
+                // MAX_NODES, so children cannot invalidate this reference.
+                const Node& parent = nodes[id];
+                if (seenValue(hashNode(parent)) > parent.omitted) continue;
                 int at = (int)ops.size();
                 bool canRejoin = true;
                 for (const Difference& entry : parent.differences) {
@@ -976,6 +1039,8 @@ vector<Op> repairDependentMovesPass(
                 if (fromIt != parent.differences.end() && fromIt->cell == from) actualFrom = fromIt->value;
                 if (toIt != parent.differences.end() && toIt->cell == to) actualTo = toIt->value;
 
+                Node child;
+                child.differences.reserve(parent.differences.size() + 2);
                 auto addChild = [&](bool omit, int kept) {
                     if (winner >= 0 || stopped) return;
                     if (nodes.size() >= MAX_NODES) { stopped = true; return; }
@@ -983,7 +1048,7 @@ vector<Op> repairDependentMovesPass(
                     SlimeStack afterFrom = actualFrom, afterTo = actualTo;
                     if (!omit && transferSlimes(afterFrom, afterTo, kept, ops[at].len,
                             sim.nest[from], sim.nest[to]) < 0) return;
-                    Node child = parent;
+                    child = parent;
                     child.cursor = at;
                     setDifference(child.differences, from, afterFrom, trace[at].afterFrom);
                     setDifference(child.differences, to, afterTo, trace[at].afterTo);
@@ -993,11 +1058,11 @@ vector<Op> repairDependentMovesPass(
                     if (child.differences.empty() && child.omitted == 0) return;
                     child.score = differenceScore(child.differences);
                     const uint64_t hash = hashNode(child);
-                    auto visited = seen.find(hash);
+                    int& visited = seenValue(hash);
                     // Hash collisions can only discard a candidate; exact
                     // replay below, never this table, authorizes a replacement.
-                    if (visited != seen.end() && visited->second >= child.omitted) return;
-                    seen[hash] = child.omitted;
+                    if (visited >= child.omitted) return;
+                    visited = child.omitted;
                     if (changed) {
                         Op replacement = ops[at];
                         replacement.k = kept;
@@ -1005,7 +1070,7 @@ vector<Op> repairDependentMovesPass(
                         edits.push_back({at, parent.edit, replacement, omit});
                     }
                     int childId = (int)nodes.size();
-                    nodes.push_back(std::move(child));
+                    nodes.push_back(child);
                     if (nodes.back().differences.empty()) winner = childId;
                     else nextBeam.push_back(childId);
                 };
@@ -1022,7 +1087,7 @@ vector<Op> repairDependentMovesPass(
                 return a < b;
             };
             retainBestNodes(nextBeam, BEAM_WIDTH, better);
-            beam = std::move(nextBeam);
+            beam.swap(nextBeam);
         }
 
         bool accepted = false;
@@ -1189,20 +1254,30 @@ vector<RouteTree> buildCrossingTrees(
         vector<array<double, 2>> crossing;
         vector<array<double, 4>> sharing;
     };
-    auto preferencesFor = [&](const Support& foreign) {
-        RoutePreferences preferences{vector<array<double, 2>>(cells),
-                                     vector<array<double, 4>>(cells)};
+    vector<RoutePreferences> preferenceCache(K,
+        RoutePreferences{vector<array<double, 2>>(cells), vector<array<double, 4>>(cells)});
+    vector<Support> preferenceInput(K, Support(cells));
+    vector<uint8_t> preferenceReady(K);
+    auto preferencesFor = [&](int color, const Support& foreign) -> const RoutePreferences& {
+        auto& preferences = preferenceCache[color];
+        auto& previous = preferenceInput[color];
         // Opposite traffic can provide a springboard even when the colors
         // cannot travel together. Keep the existing crossing/sharing weights.
         for (int v = 0; v < cells; ++v) {
-            for (int axis = 0; axis < 2; ++axis) {
-                double amount = max(0.0, foreign[v].axis[1 - axis]) +
-                                0.5 * max(0.0, foreign[v].axis[axis]);
-                preferences.crossing[v][axis] = 1.0 - exp(-amount);
+            if (!preferenceReady[color] || previous[v].axis != foreign[v].axis) {
+                for (int axis = 0; axis < 2; ++axis) {
+                    double amount = max(0.0, foreign[v].axis[1 - axis]) +
+                                    0.5 * max(0.0, foreign[v].axis[axis]);
+                    preferences.crossing[v][axis] = 1.0 - exp(-amount);
+                }
             }
-            for (int d = 0; d < 4; ++d)
-                preferences.sharing[v][d] = 1.0 - exp(-max(0.0, foreign[v].direction[d]));
+            for (int d = 0; d < 4; ++d) {
+                if (!preferenceReady[color] || previous[v].direction[d] != foreign[v].direction[d])
+                    preferences.sharing[v][d] = 1.0 - exp(-max(0.0, foreign[v].direction[d]));
+            }
+            previous[v] = foreign[v];
         }
+        preferenceReady[color] = true;
         return preferences;
     };
     auto weightedEdgeCost = [&](double crossing, double sharing, int direction,
@@ -1222,6 +1297,39 @@ vector<RouteTree> buildCrossingTrees(
         return direct + max(2, direct / 3);
     };
     auto rebuildingDeadline = refinementDeadline;
+    // Both routing searches use the same scratch storage sequentially.
+    // Heap construction is linear in the number of existing tree vertices.
+    using RouteEntry = pair<double, int>;
+    vector<double> distance(cells);
+    vector<int> previous(cells), routeDepth(cells), direction(cells), straight(cells);
+    vector<uint8_t> settled(cells);
+    vector<RouteEntry> routeHeap;
+    routeHeap.reserve(4 * cells);
+    auto prepareRouteSearch = [&](const RouteTree& tree) {
+        fill(distance.begin(), distance.end(), 1e100);
+        fill(previous.begin(), previous.end(), -1);
+        fill(settled.begin(), settled.end(), 0);
+        routeDepth = tree.depth;
+        direction = tree.direction;
+        straight = tree.straight;
+        routeHeap.clear();
+        for (int v = 0; v < cells; ++v) {
+            if (tree.depth[v] < 0) continue;
+            distance[v] = 0.04 * tree.depth[v];
+            routeHeap.emplace_back(distance[v], v);
+        }
+        make_heap(routeHeap.begin(), routeHeap.end(), greater<RouteEntry>{});
+    };
+    auto pushRoute = [&](double cost, int v) {
+        routeHeap.emplace_back(cost, v);
+        push_heap(routeHeap.begin(), routeHeap.end(), greater<RouteEntry>{});
+    };
+    auto popRoute = [&]() {
+        pop_heap(routeHeap.begin(), routeHeap.end(), greater<RouteEntry>{});
+        RouteEntry next = routeHeap.back();
+        routeHeap.pop_back();
+        return next;
+    };
     auto build = [&](int color, const Support& foreign, bool timed) -> optional<RouteTree> {
         RouteTree tree;
         tree.parent.assign(cells, -1);
@@ -1231,32 +1339,21 @@ vector<RouteTree> buildCrossingTrees(
         tree.depth[root[color]] = 0;
         int remaining = (int)slimes[color].size();
 
-        const auto preferences = preferencesFor(foreign);
+        const auto& preferences = preferencesFor(color, foreign);
 
         while (remaining > 0) {
             if (timed && chrono::steady_clock::now() >= rebuildingDeadline) return nullopt;
-            vector<double> distance(cells, 1e100);
-            vector<int> previous(cells, -1), routeDepth = tree.depth;
-            vector<int> direction = tree.direction, straight = tree.straight;
-            vector<bool> settled(cells, false);
-            using Entry = pair<double, int>;
-            priority_queue<Entry, vector<Entry>, greater<Entry>> q;
-            for (int v = 0; v < cells; ++v) {
-                if (tree.depth[v] < 0) continue;
-                distance[v] = 0.04 * tree.depth[v];
-                q.push({distance[v], v});
-            }
+            prepareRouteSearch(tree);
 
             int target = -1;
             // One settled label per cell is a routing heuristic, rather than
             // an exact direction-state shortest path. Every predecessor is
             // already settled, so the resulting physical path cannot cycle.
             unsigned expansions = 0;
-            while (!q.empty()) {
+            while (!routeHeap.empty()) {
                 if (timed && (++expansions & 63u) == 0 &&
                     chrono::steady_clock::now() >= rebuildingDeadline) return nullopt;
-                auto [cost, p] = q.top();
-                q.pop();
+                auto [cost, p] = popRoute();
                 if (settled[p] || cost > distance[p]) continue;
                 settled[p] = true;
                 if (tree.depth[p] < 0 && slimeColor[p] == color) {
@@ -1278,7 +1375,7 @@ vector<RouteTree> buildCrossingTrees(
                     routeDepth[v] = nextDepth;
                     direction[v] = towardNest;
                     straight[v] = run;
-                    q.push({nextCost, v});
+                    pushRoute(nextCost, v);
                 }
             }
             if (target < 0) return nullopt;
@@ -1458,23 +1555,12 @@ vector<RouteTree> buildCrossingTrees(
                        const RoutePreferences& preferences, uint64_t salt, double jitter) {
         if (Clock::now() >= refinementDeadline || targetDepthLimit < 1) return false;
         if (candidate.depth[target] >= 0) return true;
-        vector<double> distance(cells, 1e100);
-        vector<int> previous(cells, -1), routeDepth = candidate.depth;
-        vector<int> direction = candidate.direction, straight = candidate.straight;
-        vector<bool> settled(cells, false);
-        using Entry = pair<double, int>;
-        priority_queue<Entry, vector<Entry>, greater<Entry>> q;
-        for (int v = 0; v < cells; ++v) {
-            if (candidate.depth[v] < 0) continue;
-            distance[v] = 0.04 * candidate.depth[v];
-            q.push({distance[v], v});
-        }
+        prepareRouteSearch(candidate);
         bool reached = false;
         unsigned expansions = 0;
-        while (!q.empty()) {
+        while (!routeHeap.empty()) {
             if ((++expansions & 63u) == 0 && Clock::now() >= refinementDeadline) return false;
-            auto [cost, from] = q.top();
-            q.pop();
+            auto [cost, from] = popRoute();
             if (settled[from] || cost > distance[from]) continue;
             settled[from] = true;
             if (from == target) {
@@ -1502,7 +1588,7 @@ vector<RouteTree> buildCrossingTrees(
                 routeDepth[v] = nextDepth;
                 direction[v] = towardNest;
                 straight[v] = run;
-                q.push({nextCost, v});
+                pushRoute(nextCost, v);
             }
         }
         if (!reached || Clock::now() >= refinementDeadline) return false;
@@ -1614,21 +1700,39 @@ vector<RouteTree> buildCrossingTrees(
 
     // A changed route also changes other colors' crossing rewards. Compare
     // the complete set with the original weights, without proposal noise.
+    vector<double> geometry(K * cells), proposedGeometry(K * cells);
+    vector<uint8_t> geometryDirty(cells);
     auto globalGeometry = [&](const Support& support, int replacementColor,
                               const RouteTree* replacement) {
+        for (int v = 0; v < cells; ++v)
+            geometryDirty[v] = replacementColor < 0 ||
+                support[v].axis != total[v].axis || support[v].direction != total[v].direction;
         double cost = 0.0;
         for (int color = 0; color < K; ++color) {
             const auto& tree = color == replacementColor ? *replacement : trees[color];
             for (int v = 0; v < cells; ++v) {
+                const int index = color * cells + v;
                 int p = tree.parent[v];
-                if (p < 0) continue;
+                if (p < 0) {
+                    proposedGeometry[index] = 0.0;
+                    continue;
+                }
                 int d = tree.direction[v], axis = d / 2;
+                const auto& old = trees[color];
+                if (!geometryDirty[v] && (color != replacementColor ||
+                    (old.parent[v] == p && old.direction[v] == d &&
+                     old.straight[v] == tree.straight[v] && old.direction[p] == tree.direction[p]))) {
+                    proposedGeometry[index] = geometry[index];
+                    cost += geometry[index];
+                    continue;
+                }
                 double ownAxis = 0.25 + 0.75 * (tree.straight[v] - 1) / 7.0;
                 double amount = max(0.0, support[v].axis[1 - axis]) +
                                 0.5 * max(0.0, support[v].axis[axis] - ownAxis);
                 double crossing = 1.0 - exp(-amount);
                 double sharing = 1.0 - exp(-max(0.0, support[v].direction[d] - 1.0));
-                cost += weightedEdgeCost(crossing, sharing, d, tree.straight[v], tree.direction[p]);
+                proposedGeometry[index] = weightedEdgeCost(crossing, sharing, d, tree.straight[v], tree.direction[p]);
+                cost += proposedGeometry[index];
             }
         }
         return cost;
@@ -1636,6 +1740,7 @@ vector<RouteTree> buildCrossingTrees(
     const auto searchStart = Clock::now();
     vector<RouteTree> bestTrees = trees;
     double currentCost = globalGeometry(total, -1, nullptr), bestCost = currentCost;
+    geometry.swap(proposedGeometry);
     vector<vector<int>> initialParents;
     if constexpr (ENABLE_DEBUG) {
         stats.initialGeometry = currentCost;
@@ -1646,6 +1751,7 @@ vector<RouteTree> buildCrossingTrees(
     }
     const double budget = max(1e-9, chrono::duration<double>(refinementDeadline - searchStart).count());
     int iteration = 0, colorOffset = 0;
+    vector<optional<TreeShape>> shapeCache(K);
     while (Clock::now() < refinementDeadline) {
         if (iteration % K == 0) colorOffset = random64() % K;
         int color = (iteration + colorOffset) % K;
@@ -1654,7 +1760,8 @@ vector<RouteTree> buildCrossingTrees(
             ++stats.attempts;
             ++stats.proposed[kind];
         }
-        auto shape = inspectTree(color);
+        if (!shapeCache[color]) shapeCache[color] = inspectTree(color);
+        const auto& shape = *shapeCache[color];
         vector<int> anchors;
         for (int v : shape.nodes) {
             int count = shape.terminalCount[v];
@@ -1674,7 +1781,7 @@ vector<RouteTree> buildCrossingTrees(
         double jitter = 0.80 - 0.55 * progress;
         Support foreign = total;
         addSupport(foreign, trees[color], -1.0);
-        const auto preferences = preferencesFor(foreign);
+        const auto& preferences = preferencesFor(color, foreign);
         auto candidate = kind == 0 ? rerootBranch(color, anchor, shape, preferences, jitter) :
                                      rebuildBranches(color, anchor, shape, preferences, jitter);
         if (!candidate || !refreshTree(color, *candidate) ||
@@ -1693,8 +1800,10 @@ vector<RouteTree> buildCrossingTrees(
         double temperature = 1.4 * pow(0.02 / 1.4, progress);
         if (delta > 1e-9 && uniform() >= exp(-delta / temperature)) continue;
         trees[color] = std::move(*candidate);
+        shapeCache[color].reset();
         total = std::move(changedSupport);
         currentCost = cost;
+        geometry.swap(proposedGeometry);
         if constexpr (ENABLE_DEBUG) {
             ++stats.accepted;
             ++stats.adopted[kind];
@@ -1860,8 +1969,6 @@ struct CooperativeScheduler {
     };
     struct Decision {
         Candidate greedy;
-        // Focused history edits omit their original action. Beam decisions
-        // include greedy and retain several distinct action families.
         vector<Candidate> alternatives;
     };
     static constexpr int AMOUNT_ALTERNATIVES = 6;
@@ -1881,6 +1988,11 @@ struct CooperativeScheduler {
     struct ProgressMask { uint16_t strict = 0, nonworsening = 0; };
     struct TreeChildren { array<int, 4> cell{}; int size = 0; };
     struct SupportInput { int incoming = -1, distance = -1, arrival = -1; };
+    struct ExposureChoices {
+        unsigned version = 0;
+        // Low nine bits hold target + 1; the remaining bits hold depth gain.
+        array<uint32_t, 4> best{};
+    };
 
     // Rows are appended in order during construction, then accessed as spans.
     // Both the elements and row boundaries occupy single contiguous vectors.
@@ -1928,6 +2040,8 @@ struct CooperativeScheduler {
     vector<array<double, 9>> supportByColor;
     vector<SupportInput> supportInput;
     vector<double> originalExposure;
+    vector<ExposureChoices> exposureChoices;
+    vector<unsigned> exposureVersion;
     vector<Stack> cachedBoard;
     vector<double> arrivalSharedValue;
     vector<uint8_t> arrivalHomedSize;
@@ -1937,7 +2051,7 @@ struct CooperativeScheduler {
     vector<unsigned> supportAt, exposureAt;
     vector<int> activeCells, dirtySupportCells;
     array<uint64_t, 7> occupied{};
-    bool boardCacheReady = false, cachedShortcuts = false;
+    bool boardCacheReady = false, cachedShortcuts = false, supportCacheReady = false;
     uint64_t cachedRevision = UINT64_MAX;
     mutable uint64_t nextRevision = 0;
     unsigned decisionGeneration = 0;
@@ -1957,6 +2071,7 @@ struct CooperativeScheduler {
           arrivalDistance(nearest), arrivalSize(K * cells, 1), nearestSize(arrivalSize),
           traffic(K * cells), support(cells), supportByColor(K * cells),
           supportInput(K * cells), originalExposure(cells),
+          exposureChoices(K * cells * 36), exposureVersion(cells),
           cachedBoard(cells), arrivalSharedValue(K * cells), arrivalHomedSize(K * cells),
           arrivalCachedColors(cells), batchPrefix(cells), originalOnTree(cells),
           supportAt(cells), exposureAt(cells) {
@@ -2249,56 +2364,6 @@ struct CooperativeScheduler {
             return result;
         }
     };
-    struct BeamAlternativeCollector {
-        static constexpr int SOURCE_LIMIT = 8;
-        static constexpr int ROUTE_LIMIT = 8;
-        static constexpr int STEP_LIMIT = 3;
-        static constexpr int SCORE_LIMIT = 12;
-        vector<Candidate> sources, routes, scored;
-        array<vector<Candidate>, 2> bySteps;
-        array<Candidate, 8> byAmount;
-
-        BeamAlternativeCollector() {
-            sources.reserve(SOURCE_LIMIT + 1);
-            routes.reserve(ROUTE_LIMIT + 1);
-            scored.reserve(SCORE_LIMIT + 1);
-            for (auto& pool : bySteps) pool.reserve(STEP_LIMIT + 1);
-        }
-        void add(const Candidate& action) {
-            AlternativeCollector::collect(sources, action, SOURCE_LIMIT,
-                                          AlternativeCollector::sameSource);
-            AlternativeCollector::collect(routes, action, ROUTE_LIMIT,
-                                          AlternativeCollector::sameRoute);
-            AlternativeCollector::collect(bySteps[action.steps() - 1], action, STEP_LIMIT,
-                                          AlternativeCollector::sameSource);
-            Candidate& amount = byAmount[action.count - 1];
-            if (better(action, amount)) amount = action;
-            AlternativeCollector::collect(scored, action, SCORE_LIMIT, sameAction);
-        }
-        vector<Candidate> finish(const Candidate& greedy) const {
-            vector<Candidate> result;
-            result.reserve(MAX_ALTERNATIVES);
-            auto append = [&](const Candidate& action) {
-                if (action.source < 0 || result.size() >= MAX_ALTERNATIVES) return;
-                if (any_of(result.begin(), result.end(), [&](const Candidate& old) {
-                    return sameAction(old, action);
-                })) return;
-                result.push_back(action);
-            };
-            append(greedy);
-            // Interleave the families so a caller taking a prefix still sees
-            // different sources, routes, operation counts and payload sizes.
-            for (int i = 0; i < 8; ++i) {
-                if (i < (int)sources.size()) append(sources[i]);
-                if (i < (int)routes.size()) append(routes[i]);
-                for (const auto& pool : bySteps)
-                    if (i < (int)pool.size()) append(pool[i]);
-                append(byAmount[i]);
-            }
-            for (const Candidate& action : scored) append(action);
-            return result;
-        }
-    };
     int sharedPrefix(int v, const Stack& stack, int count) const {
         int reference = stack.color[stack.size - 1];
         int length = depth[cellIndex(reference, v)];
@@ -2444,11 +2509,14 @@ struct CooperativeScheduler {
             if (waitTarget[v] >= 0) waiting[waitTarget[v]] = true;
     }
 
-    void prepareDecisionCache(bool allowShortcuts) {
+    void prepareDecisionCache(bool allowShortcuts, bool needSupport) {
         const auto& board = state.board;
+        if (boardCacheReady && state.revision == cachedRevision &&
+            cachedShortcuts == allowShortcuts && (!needSupport || supportCacheReady)) return;
         // Consecutive repair steps expose their two or three changed cells.
         // Restored histories fall back to comparing the full cached board.
-        const bool refreshSupport = !boardCacheReady || cachedShortcuts != allowShortcuts;
+        const bool refreshExposure = !boardCacheReady || cachedShortcuts != allowShortcuts;
+        const bool refreshSupport = needSupport && (refreshExposure || !supportCacheReady);
         unsigned dirtyColors = boardCacheReady ? 0u : (1u << K) - 1;
         array<array<uint64_t, 7>, MAX_COLOR> dirtyArrivals{};
         array<int, MAX_COLOR> dirtyArrivalCount{};
@@ -2479,6 +2547,16 @@ struct CooperativeScheduler {
             // models, and option masks until this destination stack changes.
             arrivalCachedColors[v] = 0;
             const Stack& old = cachedBoard[v];
+            if (old.size != stack.size) {
+                // Visibility is symmetric. Only sources on these rays can
+                // have a cached destination whose available capacity changed.
+                for (const auto& direction : ray[v]) {
+                    for (int source : direction) {
+                        if (source < 0) break;
+                        exposureVersion[source] = decisionGeneration;
+                    }
+                }
+            }
             array<int, MAX_COLOR> difference{};
             unsigned presentColors = 0;
             for (int j = 0; j < old.size; ++j) {
@@ -2502,7 +2580,7 @@ struct CooperativeScheduler {
             sharedPotential[v] = sharedValue(v, stack);
             int color = stack.size > 0 ? stack.color[stack.size - 1] : -1;
             int count = stack.topCount();
-            if (topColor[v] != color || topCount[v] != count) {
+            if (needSupport && (topColor[v] != color || topCount[v] != count)) {
                 if (topColor[v] >= 0) markArrivalDirty(topColor[v], v);
                 if (color >= 0) markArrivalDirty(color, v);
             }
@@ -2524,6 +2602,9 @@ struct CooperativeScheduler {
         boardCacheReady = true;
         cachedShortcuts = allowShortcuts;
         cachedRevision = state.revision;
+        supportCacheReady = needSupport;
+        if (refreshExposure)
+            fill(exposureVersion.begin(), exposureVersion.end(), decisionGeneration);
         // Ascending cell order preserves candidate serials and cycle choices.
         activeCells.clear();
         for (int word = 0; word < (int)occupied.size(); ++word) {
@@ -2544,6 +2625,7 @@ struct CooperativeScheduler {
         if (refreshSupport)
             for (int v = 0; v < cells; ++v) markSupportDirty(v);
         auto updateSupport = [&](int color, int v) {
+            if (!needSupport) return;
             int incoming = pending[cellIndex(color, v)] - local[cellIndex(color, v)];
             int distance = arrivalDistance[cellIndex(color, v)], arrival = arrivalSize[cellIndex(color, v)];
             auto& previous = supportInput[cellIndex(color, v)];
@@ -2585,6 +2667,40 @@ struct CooperativeScheduler {
             // Normal repair steps update only changed nodes and ancestors.
             bool rebuild = refreshSupport ||
                 dirtyArrivalCount[color] >= max(8, (int)order[color].size() / 4);
+            if (!needSupport) {
+                // Readiness uses subtree mass, but exposed arrival distances
+                // and batch sizes only affect support. A later weighted model
+                // rebuilds those tables because supportCacheReady is false.
+                if (rebuild) {
+                    copy_n(local.begin() + color * cells, cells, pending.begin() + color * cells);
+                    for (int v : order[color]) {
+                        int p = parent[cellIndex(color, v)];
+                        if (p >= 0) pending[cellIndex(color, p)] += pending[cellIndex(color, v)];
+                    }
+                } else {
+                    auto& queued = dirtyArrivals[color];
+                    int words = ((int)order[color].size() + 63) / 64;
+                    for (int word = 0; word < words; ++word) {
+                        while (queued[word]) {
+                            int index = word * 64 + __builtin_ctzll(queued[word]);
+                            queued[word] &= queued[word] - 1;
+                            int v = order[color][index], at = cellIndex(color, v);
+                            int mass = local[at];
+                            const auto& child = children[at];
+                            for (int i = 0; i < child.size; ++i)
+                                mass += pending[cellIndex(color, child.cell[i])];
+                            if (mass == pending[at]) continue;
+                            pending[at] = mass;
+                            int p = parent[at];
+                            if (p >= 0) {
+                                int parentIndex = orderIndex[cellIndex(color, p)];
+                                queued[parentIndex >> 6] |= uint64_t(1) << (parentIndex & 63);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             if (rebuild) {
                 fill_n(nearest.begin() + color * cells, cells, cells + 1);
                 fill_n(nearestSize.begin() + color * cells, cells, 1);
@@ -2666,20 +2782,23 @@ struct CooperativeScheduler {
         }
     }
 
-    optional<Decision> decide(int mode, bool allowShortcuts, bool allowTransfers,
-                              Clock::time_point deadline, const Candidate* focus = nullptr,
-                              bool beamExplore = false) {
+    // Compile the ordinary repair path separately, without alternative
+    // collectors or relaxed-policy branches in its candidate loops.
+    template<bool Explore>
+    optional<Decision> decideImpl(int mode, bool allowShortcuts, bool allowTransfers,
+                                  Clock::time_point deadline, const Candidate* focus) {
         auto& board = state.board;
         if (Clock::now() >= deadline) return nullopt;
         if (++decisionGeneration == 0) {
             fill(supportAt.begin(), supportAt.end(), 0);
             fill(exposureAt.begin(), exposureAt.end(), 0);
+            fill(exposureVersion.begin(), exposureVersion.end(), 1);
+            for (auto& entry : exposureChoices) entry.version = 0;
             ++decisionGeneration;
         }
-        // These are scheduling preferences, not legality constraints. History
-        // edits and beam expansion both need the alternatives they suppress.
-        assert(focus == nullptr || !beamExplore);
-        const bool explore = focus != nullptr || beamExplore;
+        // These are scheduling preferences, not legality constraints. Relax
+        // them at the edited action only; suffix repair keeps the full policy.
+        constexpr bool explore = Explore;
         const auto& forward = allowShortcuts ? shortcutForward : treeForward;
         unsigned candidateChecks = 0;
         auto deadlineReached = [&]() {
@@ -2693,20 +2812,18 @@ struct CooperativeScheduler {
 
         const double sharedWeight = 0.45;
 
-        prepareDecisionCache(allowShortcuts);
+        const bool needSupport = supportWeight != 0.0;
+        prepareDecisionCache(allowShortcuts, needSupport);
 
         Decision decision;
         optional<AlternativeCollector> alternatives;
-        optional<BeamAlternativeCollector> beamAlternatives;
-        if (focus) alternatives.emplace(board, *focus);
-        if (beamExplore) beamAlternatives.emplace();
+        if (explore) alternatives.emplace(board, *focus);
         int serial = 0;
         auto offer = [&](const Candidate& action) {
             Candidate tagged = action;
             tagged.serial = serial++;
             if (better(tagged, decision.greedy)) decision.greedy = tagged;
-            if (focus) alternatives->add(tagged);
-            if (beamExplore) beamAlternatives->add(tagged);
+            if (explore) alternatives->add(tagged);
         };
 
         for (int source : activeCells) {
@@ -2717,7 +2834,7 @@ struct CooperativeScheduler {
             int bottom = height - block;
             int subtree = pending[cellIndex(color, source)];
             int desired = min(8 - bottom, subtree);
-            double originalSupport = foreignSupport(color, source, height);
+            double originalSupport = needSupport ? foreignSupport(color, source, height) : 0.0;
             unsigned tie = (unsigned)(source + 1) * 2654435761u;
             tie ^= (unsigned)(color + 1) * 2246822519u;
             const double tieScore = 0.00001 * (tie % 1024);
@@ -2737,9 +2854,11 @@ struct CooperativeScheduler {
                 remaining.size = kept;
                 remaining.home(nest[source]);
                 const double sourceSupportChange =
-                    foreignSupport(color, source, remaining.size) - originalSupport;
+                    needSupport ? foreignSupport(color, source, remaining.size) - originalSupport : 0.0;
                 const double sourceSharedChange =
                     sharedValue(source, remaining) - sharedPotential[source];
+                const double ready = min(1.0, SMALL_RATIO[count][desired]);
+                const double readinessPenalty = readinessWeight * (1.0 - ready);
                 array<int, 4> firstJoin;
                 firstJoin.fill(9);
                 if (allowShortcuts && !explore) {
@@ -2778,11 +2897,10 @@ struct CooperativeScheduler {
                     if (destinationHeight + count > 8) continue;
 
                     int sameAtTarget = topColor[target] == color ? topCount[target] : 0;
-                    double ready = min(1.0, SMALL_RATIO[count][desired]);
                     // Once a block is full, waiting for more descendants cannot
                     // save an additional batch on this departure.
                     double score = 1.0 + 0.55 * count + 1.65 * (step.gain - 1);
-                    score -= readinessWeight * (1.0 - ready);
+                    score -= readinessPenalty;
                     if (sameAtTarget > 0)
                         score += 1.25 * min(count, sameAtTarget);
                     score -= 0.8 * min(count, skippedSameColor);
@@ -2798,8 +2916,9 @@ struct CooperativeScheduler {
                     const int arrivalHeight = nest[target] == color ?
                         arrivalHomedSize[arrivalIndex] : destinationHeight + count;
                     double supportChange = sourceSupportChange;
-                    supportChange += foreignSupport(color, target, arrivalHeight) -
-                                     foreignSupport(color, target, destinationHeight);
+                    if (needSupport)
+                        supportChange += foreignSupport(color, target, arrivalHeight) -
+                                         foreignSupport(color, target, destinationHeight);
                     score += supportWeight * supportChange;
 
                     // A monochrome arrival may form a useful mixed stack.
@@ -2894,20 +3013,54 @@ struct CooperativeScheduler {
         auto exposure = [&](const LocalState& state, int v, const Stack& stack) {
             if (stack.size == 0) return 0.0;
             int color = stack.color[stack.size - 1], count = stack.topCount();
-            if (!allowShortcuts) {
-                int maximum = min<int>(run[cellIndex(color, v)], stack.size - count + 1);
-                for (int len = maximum; len >= 1; --len) {
-                    int target = jump[cellIndex(color, v)][len - 1];
-                    if (readStack(state, target).size + count <= 8)
-                        return 0.5 * count + len - 1;
+            int index = cellIndex(color, v), maximum = stack.size - count + 1;
+            // There are only 36 possible (top count, maximum length) pairs.
+            // Keep four baseline destinations: at most three locally edited
+            // cells can invalidate them, so one retained unaffected choice
+            // suffices. Changed capacities are checked explicitly below.
+            auto& choices = exposureChoices[index * 36 +
+                (count - 1) * (18 - count) / 2 + maximum - 1];
+            if (choices.version != exposureVersion[v]) {
+                choices.version = exposureVersion[v];
+                choices.best.fill(0);
+                int found = 0;
+                if (!allowShortcuts) {
+                    for (int len = min<int>(run[index], maximum); len >= 1; --len) {
+                        int target = jump[index][len - 1];
+                        if (board[target].size + count > 8) continue;
+                        choices.best[found++] = (uint32_t(len) << 9) | (target + 1);
+                        if (found == 4) break;
+                    }
+                } else {
+                    for (const Forward& step : shortcutExposure[index]) {
+                        if (step.length > maximum || board[step.target].size + count > 8) continue;
+                        choices.best[found++] = (uint32_t(step.gain) << 9) | (step.target + 1);
+                        if (found == 4) break;
+                    }
                 }
-                return 0.0;
             }
-            int maximum = stack.size - count + 1;
-            for (const Forward& step : shortcutExposure[cellIndex(color, v)])
-                if (step.length <= maximum && readStack(state, step.target).size + count <= 8)
-                    return 0.5 * count + step.gain - 1;
-            return 0.0;
+            int bestGain = 0;
+            for (uint32_t choice : choices.best) {
+                if (!choice) break;
+                int target = int(choice & 511u) - 1;
+                if (readStack(state, target).size + count > 8) continue;
+                bestGain = choice >> 9;
+                break;
+            }
+            for (int i = 0; i < state.size; ++i) {
+                int target = state.cell[i];
+                // Only a newly feasible destination can improve the baseline.
+                if (board[target].size + count <= 8 || state.stack[i].size + count > 8) continue;
+                int info = moveInfo[v * cells + target];
+                if (info < 0 || (info & 7) + 1 > maximum) continue;
+                if (!allowShortcuts) {
+                    int len = (info & 7) + 1;
+                    if (jump[index][len - 1] == target) bestGain = max(bestGain, len);
+                } else if (depth[cellIndex(color, target)] >= 0) {
+                    bestGain = max(bestGain, depth[index] - depth[cellIndex(color, target)]);
+                }
+            }
+            return bestGain > 0 ? 0.5 * count + bestGain - 1 : 0.0;
         };
         const LocalState before;
         struct MixedReadiness {
@@ -2921,29 +3074,6 @@ struct CooperativeScheduler {
             int steps = action.secondTarget < 0 ? 1 : 2;
             const Stack& original = board[action.source];
             const auto& gain = state.gain;
-            double supportChange = 0.0, exposureChange = 0.0, sharedChange = 0.0;
-            for (int i = 0; i < state.size; ++i) {
-                int v = state.cell[i];
-                const Stack& old = board[v];
-                const Stack& now = state.stack[i];
-                if (!originalOnTree[v]) return;
-                for (int j = 0; j < now.size; ++j) {
-                    int color = now.color[j];
-                    if (depth[cellIndex(color, v)] < 0) return;
-                }
-                double change = support[v][now.size] - support[v][old.size];
-                for (unsigned mask = movingMask; mask; mask &= mask - 1) {
-                    int color = __builtin_ctz(mask);
-                    change -= colorSupport(color, v, now.size) - colorSupport(color, v, old.size);
-                }
-                supportChange += change;
-                if (exposureAt[v] != decisionGeneration) {
-                    exposureAt[v] = decisionGeneration;
-                    originalExposure[v] = exposure(before, v, old);
-                }
-                exposureChange += exposure(state, v, now) - originalExposure[v];
-                sharedChange += sharedValue(v, now) - sharedPotential[v];
-            }
             const bool commonRoute = steps == 1 &&
                 jump[cellIndex(original.color[original.size - 1], action.source)][action.length - 1] == action.target &&
                 sourcePrefix >= action.length;
@@ -2967,6 +3097,31 @@ struct CooperativeScheduler {
                 score = 1.0 + 0.55 * action.count + 1.65 * (distance - 1.0) +
                         0.85 * (readiness.colors - 1) -
                         readinessWeight * (1.0 - readiness.combinedReady);
+            }
+            double supportChange = 0.0, exposureChange = 0.0, sharedChange = 0.0;
+            for (int i = 0; i < state.size; ++i) {
+                int v = state.cell[i];
+                const Stack& old = board[v];
+                const Stack& now = state.stack[i];
+                if (!originalOnTree[v]) return;
+                for (int j = 0; j < now.size; ++j) {
+                    int color = now.color[j];
+                    if (depth[cellIndex(color, v)] < 0) return;
+                }
+                if (needSupport) {
+                    double change = support[v][now.size] - support[v][old.size];
+                    for (unsigned mask = movingMask; mask; mask &= mask - 1) {
+                        int color = __builtin_ctz(mask);
+                        change -= colorSupport(color, v, now.size) - colorSupport(color, v, old.size);
+                    }
+                    supportChange += change;
+                }
+                if (exposureAt[v] != decisionGeneration) {
+                    exposureAt[v] = decisionGeneration;
+                    originalExposure[v] = exposure(before, v, old);
+                }
+                exposureChange += exposure(state, v, now) - originalExposure[v];
+                sharedChange += sharedValue(v, now) - sharedPotential[v];
             }
             score += 1.25 * state.merged - 0.85 * state.splits - 0.8 * state.skipped;
             score += 0.20 * state.homed + supportWeight * supportChange;
@@ -3141,9 +3296,8 @@ struct CooperativeScheduler {
             // exactly that suffix onward. Only the intermediate landing may
             // go backward or leave the color's tree; the loan must restore
             // its host stack and finish strictly ahead on the original tree.
-            // This exploration neighborhood is independent of the option mask.
-            // Beam expansion limits its source/host pairs below; focused
-            // history edits retain the full neighborhood around their pivot.
+            // This SA neighborhood is independent of the seed's options and
+            // is never enumerated during initial construction or greedy repair.
             auto borrowSpringboard = [&](int source, int host, int firstLength) {
                 const Stack& original = board[source];
                 const Stack& springboard = board[host];
@@ -3199,85 +3353,32 @@ struct CooperativeScheduler {
                 }
                 return true;
             };
-            if (focus) {
-                // Also borrow the focused source as a host: otherwise a pivot
-                // that removes a springboard cannot discover how to use it first.
-                int at = focus->source;
-                if (at >= 0 && at < cells && board[at].size > 0) {
-                    for (int d = 0; d < 4; ++d) {
-                        for (int len = 1; len <= 8; ++len) {
-                            if (deadlineReached()) return nullopt;
-                            int other = ray[at][d][len - 1];
-                            if (other < 0) break;
-                            if (board[other].size == 0) continue;
-                            if (!borrowSpringboard(at, other, len) ||
-                                !borrowSpringboard(other, at, len)) return nullopt;
-                        }
-                    }
-                }
-            } else if (beamExplore) {
-                constexpr int LOAN_SOURCES = 3;
-                array<int, LOAN_SOURCES> sources;
-                sources.fill(-1);
-                int sourceCount = 0;
-                // Snapshot before borrowing: new offers can reorder the
-                // collector while the selected sources are being expanded.
-                for (const Candidate& action : beamAlternatives->sources) {
-                    if (sourceCount == LOAN_SOURCES) break;
-                    if (!originalOnTree[action.source]) continue;
-                    sources[sourceCount++] = action.source;
-                }
-                while (sourceCount < LOAN_SOURCES) {
-                    int best = -1, bestPotential = -1;
-                    for (int source : activeCells) {
-                        if (!originalOnTree[source] ||
-                            find(sources.begin(), sources.end(), source) != sources.end()) continue;
-                        int color = topColor[source];
-                        if (color < 0 || depth[cellIndex(color, source)] <= 0) continue;
-                        int potential = topCount[source] * depth[cellIndex(color, source)];
-                        if (potential > bestPotential) {
-                            best = source;
-                            bestPotential = potential;
-                        }
-                    }
-                    if (best < 0) break;
-                    sources[sourceCount++] = best;
-                }
-                for (int i = 0; i < sourceCount; ++i) {
-                    int source = sources[i];
-                    const Stack& original = board[source];
-                    int color = topColor[source], block = topCount[source];
-                    // One promising occupied host per direction bounds this
-                    // extra work to at most twelve ordered source/host pairs.
-                    for (int d = 0; d < 4; ++d) {
-                        int host = -1, firstLength = 0, bestPotential = -1;
-                        for (int len = 1; len <= 8; ++len) {
-                            if (deadlineReached()) return nullopt;
-                            int other = ray[source][d][len - 1];
-                            if (other < 0) break;
-                            const Stack& tower = board[other];
-                            if (tower.size == 0 || tower.size == 8 ||
-                                !originalOnTree[other] || nest[other] == color) continue;
-                            int amount = min<int>({block, 8 - tower.size,
-                                                   original.size - len + 1});
-                            if (amount <= 0) continue;
-                            int potential = 4 * amount * (tower.size + 1) - len;
-                            if (potential > bestPotential) {
-                                host = other;
-                                firstLength = len;
-                                bestPotential = potential;
-                            }
-                        }
-                        if (host >= 0 && !borrowSpringboard(source, host, firstLength)) return nullopt;
+            // Also borrow the focused source as a host: otherwise a pivot
+            // that removes a springboard cannot discover how to use it first.
+            int at = focus->source;
+            if (at >= 0 && at < cells && board[at].size > 0) {
+                for (int d = 0; d < 4; ++d) {
+                    for (int len = 1; len <= 8; ++len) {
+                        if (deadlineReached()) return nullopt;
+                        int other = ray[at][d][len - 1];
+                        if (other < 0) break;
+                        if (board[other].size == 0) continue;
+                        if (!borrowSpringboard(at, other, len) ||
+                            !borrowSpringboard(other, at, len)) return nullopt;
                     }
                 }
             }
         }
 
         if (decision.greedy.source < 0) return nullopt;
-        if (focus) decision.alternatives = alternatives->finish();
-        if (beamExplore) decision.alternatives = beamAlternatives->finish(decision.greedy);
+        if (explore) decision.alternatives = alternatives->finish();
         return decision;
+    }
+
+    optional<Decision> decide(int mode, bool allowShortcuts, bool allowTransfers,
+                              Clock::time_point deadline, const Candidate* focus = nullptr) {
+        return focus ? decideImpl<true>(mode, allowShortcuts, allowTransfers, deadline, focus) :
+                       decideImpl<false>(mode, allowShortcuts, allowTransfers, deadline, nullptr);
     }
 
     int moveDirection(int source, int target, int length) const {
@@ -3327,153 +3428,6 @@ struct CooperativeScheduler {
 
 };
 
-// Ranking estimate for the construction beam, not an admissible lower bound.
-// Every dynamic term depends only on one stack and its four adjacent stacks,
-// so siblings can be scored without rebuilding the scheduler's global cache.
-struct BeamStateEvaluator {
-    using State = CooperativeScheduler::State;
-    struct Features {
-        double transport = 0.0;
-        double fragmentation = 0.0;
-        double shared = 0.0;
-        double support = 0.0;
-    };
-
-    const CooperativeScheduler& sim;
-    vector<double> transportUnit, blockWeight;
-
-    explicit BeamStateEvaluator(const CooperativeScheduler& scheduler)
-        : sim(scheduler), transportUnit(sim.K * sim.cells),
-          blockWeight(sim.K * sim.cells) {
-        vector<int> initialMass(sim.K * sim.cells, 0);
-        vector<int> roots(sim.K, -1);
-        for (int v = 0; v < sim.cells; ++v) {
-            if (sim.nest[v] >= 0) roots[sim.nest[v]] = v;
-            const auto& stack = sim.initial.board[v];
-            for (int j = 0; j < stack.size; ++j)
-                ++initialMass[sim.cellIndex(stack.color[j], v)];
-        }
-        for (int color = 0; color < sim.K; ++color) {
-            for (int v : sim.order[color]) {
-                int index = sim.cellIndex(color, v), p = sim.parent[index];
-                if (p >= 0) initialMass[sim.cellIndex(color, p)] += initialMass[index];
-            }
-            for (int v = 0; v < sim.cells; ++v) {
-                int index = sim.cellIndex(color, v);
-                int distance = sim.depth[index];
-                if (distance < 0) {
-                    // Normal completed beam actions stay on every moved color's
-                    // tree. Still give off-tree positions a finite, costly rank.
-                    int root = roots[color];
-                    distance = sim.n + (root < 0 ? sim.n :
-                        abs(v / sim.n - root / sim.n) + abs(v % sim.n - root % sim.n));
-                    transportUnit[index] = distance;
-                }
-                blockWeight[index] = 1.0 + 0.25 * sqrt((double)distance);
-            }
-            for (auto it = sim.order[color].rbegin(); it != sim.order[color].rend(); ++it) {
-                int v = *it, index = sim.cellIndex(color, v), p = sim.parent[index];
-                if (p < 0) {
-                    transportUnit[index] = 0.0;
-                    continue;
-                }
-                // Fixed initial tuning values: expected batching grows with
-                // initial downstream traffic, while long straight runs receive
-                // only a modest discount for possible springboard use.
-                double batch = min(4.0, 1.0 + 0.65 *
-                    sqrt((double)max(0, initialMass[index] - 1)));
-                double stride = 1.0 + 0.20 * min(3, max(0, (int)sim.run[index] - 1));
-                transportUnit[index] = transportUnit[sim.cellIndex(color, p)] +
-                                       1.0 / (batch * stride);
-            }
-        }
-    }
-
-    Features atCell(const State& state, int v) const {
-        Features result;
-        const auto& stack = state.board[v];
-        if (stack.size == 0) return result;
-        int previous = -1;
-        for (int j = 0; j < stack.size; ++j) {
-            int color = stack.color[j], index = sim.cellIndex(color, v);
-            result.transport += transportUnit[index];
-            if (color != previous) result.fragmentation += blockWeight[index];
-            previous = color;
-        }
-        // Cap mixed-stack credit: the same merger already reduces the number
-        // of transported blocks, and a long shared route is only a prospect.
-        result.shared = min(6.0, sim.sharedValue(v, stack));
-        if (stack.size == 8) return result;
-
-        for (int direction = 0; direction < 4; ++direction) {
-            int source = sim.ray[v][direction][0];
-            if (source < 0) continue;
-            const auto& incoming = state.board[source];
-            if (incoming.size == 0) continue;
-            int color = incoming.color[incoming.size - 1];
-            // Require present foreign-color traffic that can arrive along its
-            // tree. A tall stack on its own earns no springboard credit.
-            if (color == stack.color[stack.size - 1] || sim.nest[v] == color ||
-                sim.parent[sim.cellIndex(color, source)] != v) continue;
-            int arrival = incoming.topCount();
-            double fit = (double)min(arrival, 8 - (int)stack.size) / arrival;
-            int index = sim.cellIndex(color, v);
-            int gain = sim.reachableGain[index][stack.size] - sim.reachableGain[index][0];
-            // Several waiting neighbors cannot all reuse the same space at
-            // once. Retain one bounded opportunity instead of summing them.
-            result.support = max(result.support, min(3, max(0, gain)) * fit);
-        }
-        return result;
-    }
-
-    static void accumulate(Features& target, const Features& value, double factor = 1.0) {
-        target.transport += factor * value.transport;
-        target.fragmentation += factor * value.fragmentation;
-        target.shared += factor * value.shared;
-        target.support += factor * value.support;
-    }
-
-    Features evaluate(const State& state) const {
-        Features result;
-        for (int v = 0; v < sim.cells; ++v) accumulate(result, atCell(state, v));
-        return result;
-    }
-
-    Features update(const Features& old, const State& before, const State& after) const {
-        Features result = old;
-        array<int, 15> affected{}; // At most three changed cells, each plus four neighbors.
-        int count = 0;
-        auto include = [&](int v) {
-            if (v < 0 || find(affected.begin(), affected.begin() + count, v) !=
-                         affected.begin() + count) return;
-            assert(count < (int)affected.size());
-            affected[count++] = v;
-        };
-        for (int i = 0; i < after.changedCount; ++i) {
-            int v = after.changedCells[i];
-            include(v);
-            for (int direction = 0; direction < 4; ++direction)
-                include(sim.ray[v][direction][0]);
-        }
-        for (int i = 0; i < count; ++i) {
-            accumulate(result, atCell(before, affected[i]), -1.0);
-            accumulate(result, atCell(after, affected[i]));
-        }
-        return result;
-    }
-
-    double estimate(const Features& value, int occupiedCount, int lane) const {
-        if (occupiedCount == 0) return 0.0;
-        // Untuned initial weights for progress, consolidation, and mixed-color
-        // cooperation lanes. These values rank states; none justify pruning.
-        static constexpr array<double, 3> fragmentationWeight{0.65, 1.50, 0.80};
-        static constexpr array<double, 3> sharedWeight{0.12, 0.18, 0.30};
-        static constexpr array<double, 3> supportWeight{0.08, 0.06, 0.25};
-        return max(0.0, value.transport + fragmentationWeight[lane] * value.fragmentation -
-                        sharedWeight[lane] * value.shared - supportWeight[lane] * value.support);
-    }
-};
-
 struct GreedySeed {
     vector<Op> operations;
     vector<CooperativeScheduler::Candidate> actions;
@@ -3506,281 +3460,6 @@ optional<GreedySeed> buildCooperativeSeed(
         seed.actions.push_back(action);
     }
     return seed;
-}
-
-struct BeamSearchStats {
-    long long expanded = 0, generated = 0, duplicate = 0, dominated = 0;
-    long long rollouts = 0, rolloutCompleted = 0, improvements = 0;
-    long long rolloutNs = 0, elapsedNs = 0;
-    int initialOps = 0, bestOps = 0, layers = 0, lastCost = 0;
-    int minWidth = INT_MAX, maxWidth = 0, peakBucket = 0, seenStates = 0;
-    array<long long, 3> laneExpanded{};
-};
-
-// Construct alternative schedules from the initial board. Layers count physical
-// operations, so two-operation transfers enter g+2 without competing at g+1.
-vector<Op> buildCooperativeBeam(
-    CooperativeScheduler& sim, const vector<Op>& incumbent,
-    chrono::steady_clock::time_point deadline, BeamSearchStats& stats) {
-    using Clock = chrono::steady_clock;
-    using State = CooperativeScheduler::State;
-    using Candidate = CooperativeScheduler::Candidate;
-    using Features = BeamStateEvaluator::Features;
-    const auto started = Clock::now();
-    stats.initialOps = stats.bestOps = (int)incumbent.size();
-    vector<Op> bestOutput = incumbent;
-    int bestCost = (int)incumbent.size();
-    if (started >= deadline || sim.initial.remaining == 0) return bestOutput;
-    BeamStateEvaluator evaluator(sim);
-    const auto totalBudget = deadline - started;
-    const auto finishReserve = min(chrono::duration_cast<Clock::duration>(chrono::milliseconds(80)),
-                                   totalBudget / 10);
-    const auto expansionDeadline = deadline - finishReserve;
-    struct Trace { int parent; Candidate action; };
-    vector<Trace> traces;
-    traces.reserve(8192);
-    struct Node {
-        State state;
-        Features features;
-        uint64_t hash = 0;
-        // Pending actions are materialized only for selected nodes.
-        int parentTrace = -1, lane = 0;
-        Candidate action;
-    };
-    struct Bucket {
-        vector<Node> nodes;
-        unordered_multimap<uint64_t, int> index;
-    };
-    array<Bucket, 3> buckets;
-    struct Seen { vector<SlimeStack> board; int cost; };
-    vector<Seen> seen;
-    unordered_multimap<uint64_t, int> seenIndex;
-    // Bound retained exact boards to roughly 120 MiB at the largest N.
-    constexpr int MAX_SEEN = 32768;
-    seen.reserve(MAX_SEEN);
-    seenIndex.reserve(MAX_SEEN * 2);
-    auto dominated = [&](const State& state, uint64_t hash, int cost) {
-        auto range = seenIndex.equal_range(hash);
-        for (auto it = range.first; it != range.second; ++it) {
-            const auto& old = seen[it->second];
-            if (old.cost <= cost && old.board == state.board) return true;
-        }
-        return false;
-    };
-    auto remember = [&](const Node& node, int cost) {
-        if ((int)seen.size() == MAX_SEEN) return;
-        seenIndex.emplace(node.hash, (int)seen.size());
-        seen.push_back({node.state.board, cost});
-    };
-    auto materialize = [&](Node& node) {
-        if (node.action.source < 0) return;
-        traces.push_back({node.parentTrace, node.action});
-        node.parentTrace = (int)traces.size() - 1;
-        node.action = Candidate{};
-    };
-    auto prefixActions = [&](int trace) {
-        vector<Candidate> actions;
-        while (trace >= 0) {
-            actions.push_back(traces[trace].action);
-            trace = traces[trace].parent;
-        }
-        reverse(actions.begin(), actions.end());
-        return actions;
-    };
-    auto save = [&](int trace, const vector<Candidate>& suffix, int cost) {
-        if (cost >= bestCost) return;
-        auto actions = prefixActions(trace);
-        actions.insert(actions.end(), suffix.begin(), suffix.end());
-        State replay = sim.initial;
-        vector<Op> output;
-        output.reserve(cost);
-        for (const auto& action : actions)
-            if (!sim.apply(replay, action, &output)) return;
-        if (replay.remaining != 0 || (int)output.size() != cost) return;
-        bestCost = cost;
-        bestOutput = std::move(output);
-        stats.bestOps = cost;
-        ++stats.improvements;
-    };
-    auto insert = [&](Node&& node, int cost) {
-        if (dominated(node.state, node.hash, cost)) {
-            ++stats.dominated;
-            return;
-        }
-        auto& bucket = buckets[cost % 3];
-        auto range = bucket.index.equal_range(node.hash);
-        for (auto it = range.first; it != range.second; ++it) {
-            if (bucket.nodes[it->second].state.board == node.state.board) {
-                ++stats.duplicate;
-                return;
-            }
-        }
-        bucket.index.emplace(node.hash, (int)bucket.nodes.size());
-        bucket.nodes.push_back(std::move(node));
-        stats.peakBucket = max(stats.peakBucket, (int)bucket.nodes.size());
-    };
-    Node initial;
-    initial.state = sim.initial;
-    initial.features = evaluator.evaluate(initial.state);
-    for (int v = 0; v < sim.cells; ++v)
-        initial.hash ^= initial.state.board[v].positionHash(v);
-    insert(std::move(initial), 0);
-    // The lanes retain different whole-board evaluations; local action scores
-    // are used only to limit branching, never accumulated as a path score.
-    constexpr array<int, 3> modes{1, 4, 3};
-    auto rollout = [&](const Node& node, int cost, Clock::time_point until) {
-        if (Clock::now() >= until || cost + node.state.occupiedCount >= bestCost) return;
-        const auto rolloutStart = Clock::now();
-        ++stats.rollouts;
-        sim.state = node.state;
-        vector<Candidate> tail;
-        while (sim.state.remaining > 0 && Clock::now() < until) {
-            if (cost + sim.state.occupiedCount >= bestCost) break;
-            auto decision = sim.decide(modes[node.lane], true, true, until);
-            if (!decision || cost + decision->greedy.steps() >= bestCost) break;
-            if (!sim.apply(sim.state, decision->greedy)) break;
-            tail.push_back(decision->greedy);
-            cost += decision->greedy.steps();
-        }
-        if (sim.state.remaining == 0) {
-            ++stats.rolloutCompleted;
-            save(node.parentTrace, tail, cost);
-        }
-        stats.rolloutNs += chrono::duration_cast<chrono::nanoseconds>(Clock::now() - rolloutStart).count();
-    };
-    const int load = sim.initial.remaining * sim.n;
-    const int maximumWidth = load <= 1000 ? 64 : load <= 2800 ? 40 : 24;
-    vector<Node> finishers;
-    int finisherCost = 0, nextRolloutCost = max(8, bestCost / 10), rolloutLane = 0;
-    auto nextRolloutTime = started + chrono::milliseconds(100);
-    for (int cost = 0; cost < bestCost && Clock::now() < expansionDeadline; ++cost) {
-        auto& slot = buckets[cost % 3];
-        vector<Node> current = std::move(slot.nodes);
-        slot.nodes.clear();
-        slot.index.clear();
-        if (current.empty()) {
-            if (buckets[(cost + 1) % 3].nodes.empty() &&
-                buckets[(cost + 2) % 3].nodes.empty()) break;
-            continue;
-        }
-        ++stats.layers;
-        stats.lastCost = cost;
-        int width = maximumWidth;
-        if (stats.expanded >= 8) {
-            const double workNs = max(1.0, (double)chrono::duration_cast<chrono::nanoseconds>(
-                Clock::now() - started).count() - stats.rolloutNs);
-            const double perNode = workNs / stats.expanded;
-            const double leftNs = max(0.0, (double)chrono::duration_cast<chrono::nanoseconds>(
-                expansionDeadline - Clock::now()).count());
-            const double target = 0.80 * leftNs / (perNode * max(8, bestCost - cost));
-            width = max(3, (int)min<double>(maximumWidth, target));
-        } else {
-            width = min(width, 12);
-        }
-        vector<int> eligible;
-        eligible.reserve(current.size());
-        for (int i = 0; i < (int)current.size(); ++i) {
-            const auto& node = current[i];
-            // Only this proven lower bound prunes against the incumbent.
-            if (cost + node.state.occupiedCount >= bestCost) continue;
-            if (dominated(node.state, node.hash, cost)) { ++stats.dominated; continue; }
-            eligible.push_back(i);
-        }
-        array<vector<int>, 3> order;
-        for (int lane = 0; lane < 3; ++lane) {
-            order[lane] = eligible;
-            auto better = [&](int a, int b) {
-                const double x = evaluator.estimate(current[a].features,
-                    current[a].state.occupiedCount, lane);
-                const double y = evaluator.estimate(current[b].features,
-                    current[b].state.occupiedCount, lane);
-                if (x != y) return x < y;
-                if (current[a].hash != current[b].hash) return current[a].hash < current[b].hash;
-                return a < b;
-            };
-            retainBestNodes(order[lane], width, better);
-        }
-        vector<pair<int, int>> selected;
-        vector<uint8_t> used(current.size());
-        array<int, 3> cursor{};
-        while ((int)selected.size() < width) {
-            bool added = false;
-            for (int turn = 0; turn < 3 && (int)selected.size() < width; ++turn) {
-                int lane = (turn + cost) % 3;
-                auto& at = cursor[lane];
-                while (at < (int)order[lane].size() && used[order[lane][at]]) ++at;
-                if (at == (int)order[lane].size()) continue;
-                int id = order[lane][at++];
-                used[id] = 1;
-                selected.push_back({id, lane});
-                added = true;
-            }
-            if (!added) break;
-        }
-        if (selected.empty()) continue;
-        stats.minWidth = min(stats.minWidth, (int)selected.size());
-        stats.maxWidth = max(stats.maxWidth, (int)selected.size());
-        finishers.clear();
-        finisherCost = cost;
-        for (auto [id, lane] : selected) {
-            auto& node = current[id];
-            node.lane = lane;
-            materialize(node);
-            if (finishers.size() < 3) finishers.push_back(node);
-        }
-        if (cost >= nextRolloutCost && Clock::now() >= nextRolloutTime) {
-            const auto until = min(expansionDeadline, Clock::now() + chrono::milliseconds(25));
-            rollout(finishers[rolloutLane++ % finishers.size()], cost, until);
-            nextRolloutCost = cost + max(8, bestCost / 10);
-            nextRolloutTime = Clock::now() + chrono::milliseconds(100);
-        }
-        for (auto [id, lane] : selected) {
-            if (Clock::now() >= expansionDeadline) break;
-            auto& node = current[id];
-            if (cost + node.state.occupiedCount >= bestCost) continue;
-            sim.state = node.state;
-            auto decision = sim.decide(modes[lane], true, true, expansionDeadline, nullptr, true);
-            if (!decision) continue;
-            remember(node, cost);
-            ++stats.expanded;
-            ++stats.laneExpanded[lane];
-            for (const auto& action : decision->alternatives) {
-                if (Clock::now() >= expansionDeadline) break;
-                const int nextCost = cost + action.steps();
-                if (nextCost >= bestCost) continue;
-                Node child;
-                child.state = node.state;
-                if (!sim.apply(child.state, action)) continue;
-                ++stats.generated;
-                if (child.state.remaining == 0) {
-                    save(node.parentTrace, vector<Candidate>{action}, nextCost);
-                    continue;
-                }
-                if (nextCost + child.state.occupiedCount >= bestCost) continue;
-                child.hash = node.hash;
-                for (int j = 0; j < child.state.changedCount; ++j) {
-                    const int v = child.state.changedCells[j];
-                    child.hash ^= node.state.board[v].positionHash(v) ^
-                                  child.state.board[v].positionHash(v);
-                }
-                child.features = evaluator.update(node.features, node.state, child.state);
-                child.parentTrace = node.parentTrace;
-                child.action = action;
-                insert(std::move(child), nextCost);
-            }
-        }
-    }
-    // Even a partially explored beam contributes complete candidates. Reserve
-    // a separate finishing slice instead of relying on reaching a goal layer.
-    for (int i = 0; i < (int)finishers.size() && Clock::now() < deadline; ++i) {
-        auto now = Clock::now();
-        auto until = now + (deadline - now) / ((int)finishers.size() - i);
-        rollout(finishers[i], finisherCost, until);
-    }
-    stats.seenStates = (int)seen.size();
-    if (stats.minWidth == INT_MAX) stats.minWidth = 0;
-    stats.elapsedNs = chrono::duration_cast<chrono::nanoseconds>(Clock::now() - started).count();
-    return bestOutput;
 }
 
 struct HistorySearchStats {
@@ -3826,6 +3505,8 @@ struct HistorySearchStats {
     array<Bucket, 4> position, phase;
     long long initialHistoryNs = 0, finalizeNs = 0, lastImprovementNs = -1;
     bool exhausted = false;
+    long long greedyCacheHits = 0, greedyCacheMisses = 0, greedyCacheCollisions = 0;
+    long long greedyTransitionHits = 0;
 
     void writeProfile(ostream& out) const {
         constexpr const char* names[] = {
@@ -3863,6 +3544,10 @@ struct HistorySearchStats {
         out << " sa_profile={\"version\":1,\"initial_history_ns\":" << initialHistoryNs
             << ",\"finalize_ns\":" << finalizeNs
             << ",\"last_improvement_ns\":" << lastImprovementNs
+            << ",\"greedy_cache_hits\":" << greedyCacheHits
+            << ",\"greedy_cache_misses\":" << greedyCacheMisses
+            << ",\"greedy_cache_collisions\":" << greedyCacheCollisions
+            << ",\"greedy_transition_hits\":" << greedyTransitionHits
             << ",\"exhausted\":" << exhausted << ",\"total\":";
         bucket(total);
         out << ",\"position\":[";
@@ -3944,7 +3629,9 @@ optional<vector<Op>> rewriteCooperativeHistory(
         vector<int> cost, weight;
         vector<uint64_t> hash;
         vector<State> checkpoints;
-        unordered_multimap<uint64_t, int> boundary;
+        // Bucket heads and links avoid per-boundary allocations and division
+        // on every rejoin lookup. Exact hashes and boards are still checked.
+        vector<int> boundary, nextBoundary;
         vector<Site> sites;
         vector<int> weightTree;
         int totalWeight = 0;
@@ -3955,49 +3642,46 @@ optional<vector<Op>> rewriteCooperativeHistory(
         return hash;
     };
     auto applyTracked = [&](State& state, const Candidate& action, uint64_t& hash) {
-        array<int, 3> touched{action.source, action.target, action.secondTarget};
-        uint64_t before = 0;
-        for (int i = 0; i < 3; ++i) {
-            int v = touched[i];
-            if (v < 0) continue;
-            if (v >= sim.cells) return false;
-            for (int j = 0; j < i; ++j)
-                if (touched[j] == v) { v = -1; break; }
-            if (v >= 0) before ^= state.board[v].positionHash(v);
-        }
+        const int source = action.source, target = action.target, second = action.secondTarget;
+        if (source < 0 || source >= sim.cells || target < 0 || target >= sim.cells ||
+            second >= sim.cells) return false;
+        const bool third = second >= 0 && second != source && second != target;
+        uint64_t before = state.board[source].positionHash(source) ^
+                          state.board[target].positionHash(target);
+        if (third) before ^= state.board[second].positionHash(second);
         if (!sim.apply(state, action)) return false;
-        hash ^= before;
-        for (int i = 0; i < 3; ++i) {
-            int v = touched[i];
-            if (v < 0) continue;
-            for (int j = 0; j < i; ++j)
-                if (touched[j] == v) { v = -1; break; }
-            if (v >= 0) hash ^= state.board[v].positionHash(v);
-        }
+        hash ^= before ^ state.board[source].positionHash(source) ^
+                         state.board[target].positionHash(target);
+        if (third) hash ^= state.board[second].positionHash(second);
         return true;
     };
     auto equalState = [](const State& a, const State& b) {
         return a.remaining == b.remaining && a.board == b.board;
     };
+    const uint64_t initialHash = stateHash(sim.initial);
     auto buildHistory = [&](vector<Candidate> actions) -> optional<History> {
         History history;
         history.actions = std::move(actions);
         int count = (int)history.actions.size();
         history.cost.reserve(count + 1);
         history.hash.reserve(count + 1);
-        history.boundary.reserve((count + 1) * 2);
+        history.boundary.assign(bit_ceil(unsigned(count + 1) * 2u), -1);
+        history.nextBoundary.resize(count + 1);
         history.checkpoints.reserve(count / CHECKPOINT + 1);
         history.weight.resize(count);
         history.sites.resize(count);
+        const int heavierBegin = (count + 1) / 2;
         for (int i = 0; i < count; ++i)
-            history.weight[i] = 2 + 2 * i / max(1, count);
+            history.weight[i] = i < heavierBegin ? 2 : 3;
         State state = sim.initial;
-        uint64_t hash = stateHash(state);
+        uint64_t hash = initialHash;
         int cost = 0;
         for (int i = 0; i <= count; ++i) {
             history.cost.push_back(cost);
             history.hash.push_back(hash);
-            history.boundary.emplace(hash, i);
+            int& head = history.boundary[hash & (history.boundary.size() - 1)];
+            history.nextBoundary[i] = head;
+            head = i;
             if (i % CHECKPOINT == 0) {
                 history.checkpoints.push_back(state);
             }
@@ -4035,8 +3719,8 @@ optional<vector<Op>> rewriteCooperativeHistory(
             history.weightTree[i] -= weight;
     };
     auto selectSite = [](const History& history, int draw) {
-        int at = 0, count = (int)history.actions.size(), step = 1;
-        while (step <= count / 2) step <<= 1;
+        int at = 0, count = (int)history.actions.size();
+        int step = bit_floor(unsigned(count));
         for (; step > 0; step >>= 1) {
             int next = at + step;
             if (next <= count && history.weightTree[next] <= draw) {
@@ -4087,6 +3771,62 @@ optional<vector<Op>> rewriteCooperativeHistory(
         stats.initialHistoryNs = chrono::duration_cast<chrono::nanoseconds>(searchStart - profileStart).count();
     const double duration = max(1e-9, chrono::duration<double>(deadline - searchStart).count());
     const double startTemperature = clamp(bestRaw * 0.01, 1.5, 5.0);
+
+    // The seed fixes routes, model and options throughout this search. Its
+    // ordinary greedy decision therefore depends only on the ordered board.
+    // Entries survive history rewrites; focused/relaxed decisions are excluded.
+    struct GreedyCacheEntry {
+        uint64_t hash = 0, nextHash = 0;
+        int remaining = -1;
+        bool nextHashReady = false;
+        Candidate action;
+        // Exact, sparse snapshots: nine cell bits plus the 36-bit stack code.
+        // Matching the occupied count rules out additional unrecorded stacks.
+        vector<uint64_t> stacks;
+    };
+    constexpr size_t GREEDY_CACHE_SIZE = 4096;
+    vector<GreedyCacheEntry> greedyCache(GREEDY_CACHE_SIZE);
+    GreedyCacheEntry* nextGreedyEntry = nullptr;
+    auto greedyAt = [&](uint64_t hash) -> optional<Candidate> {
+        nextGreedyEntry = nullptr;
+        if (Clock::now() >= deadline) return nullopt;
+        auto& entry = greedyCache[hash & (GREEDY_CACHE_SIZE - 1)];
+        if (entry.remaining == sim.state.remaining && entry.hash == hash &&
+            (int)entry.stacks.size() == sim.state.occupiedCount) {
+            bool exact = true;
+            for (uint64_t packed : entry.stacks) {
+                int cell = packed & 511u;
+                if (sim.state.board[cell].encoding() != (packed >> 9)) {
+                    exact = false;
+                    break;
+                }
+            }
+            if (exact) {
+                if constexpr (ENABLE_DEBUG) ++stats.greedyCacheHits;
+                nextGreedyEntry = &entry;
+                return entry.action;
+            }
+            if constexpr (ENABLE_DEBUG) ++stats.greedyCacheCollisions;
+        }
+        if constexpr (ENABLE_DEBUG) ++stats.greedyCacheMisses;
+        auto decision = sim.decide(seed.mode, seed.shortcuts, seed.transfers, deadline);
+        if (!decision) return nullopt; // Never memoize an interrupted enumeration.
+        entry.hash = hash;
+        entry.remaining = sim.state.remaining;
+        entry.nextHashReady = false;
+        entry.action = decision->greedy;
+        entry.stacks.clear();
+        entry.stacks.reserve(sim.activeCells.size());
+        for (int cell : sim.activeCells)
+            entry.stacks.push_back((sim.state.board[cell].encoding() << 9) | uint64_t(cell));
+        assert((int)entry.stacks.size() == sim.state.occupiedCount);
+        nextGreedyEntry = &entry;
+        return entry.action;
+    };
+    vector<Candidate> rebuilt;
+    rebuilt.reserve(seed.actions.size());
+    State exact;
+    exact.board.reserve(sim.cells);
 
     while (Clock::now() < deadline) {
         if (current.totalWeight == 0) {
@@ -4143,6 +3883,7 @@ optional<vector<Op>> rewriteCooperativeHistory(
             if (!site.available()) removeSite(current, cut);
         }
         Candidate next = site.choices[selected];
+        nextGreedyEntry = nullptr; // The edited action uses relaxed scheduling.
         if constexpr (ENABLE_DEBUG) {
             ++stats.attempts;
             ++profile.data.count[Profile::Attempts];
@@ -4160,16 +3901,15 @@ optional<vector<Op>> rewriteCooperativeHistory(
                          bestRaw + max(3, (int)ceil(3.0 * temperature))});
         int cost = current.cost[cut], join = -1;
         uint64_t hash = current.hash[cut];
-        vector<Candidate> rebuilt;
+        rebuilt.clear();
         bool completed = false;
         bool secondPending = doubleRequested;
         bool secondApplied = false, nextIsSecond = false;
         auto tryJoin = [&]() {
-            auto range = current.boundary.equal_range(hash);
-            for (auto it = range.first; it != range.second; ++it) {
-                int at = it->second;
+            int first = current.boundary[hash & (current.boundary.size() - 1)];
+            for (int at = first; at >= 0; at = current.nextBoundary[at]) {
+                if (current.hash[at] != hash) continue;
                 if (at <= cut || cost + current.cost.back() - current.cost[at] > limit) continue;
-                State exact;
                 if (!restore(current, at, exact)) continue;
                 // The hash only indexes candidates; compare the ordered stacks.
                 if (!equalState(sim.state, exact)) continue;
@@ -4189,7 +3929,24 @@ optional<vector<Op>> rewriteCooperativeHistory(
                 break;
             }
             {
-                if (!applyTracked(sim.state, next, hash)) {
+                bool applied;
+                assert(!nextGreedyEntry || nextGreedyEntry->hash == hash);
+                if (nextGreedyEntry && nextGreedyEntry->nextHashReady) {
+                    // Exact input stacks were checked at lookup. The same
+                    // deterministic action has the same successor hash, too.
+                    applied = sim.apply(sim.state, next);
+                    if (applied) {
+                        hash = nextGreedyEntry->nextHash;
+                        if constexpr (ENABLE_DEBUG) ++stats.greedyTransitionHits;
+                    }
+                } else {
+                    applied = applyTracked(sim.state, next, hash);
+                    if (applied && nextGreedyEntry) {
+                        nextGreedyEntry->nextHash = hash;
+                        nextGreedyEntry->nextHashReady = true;
+                    }
+                }
+                if (!applied) {
                     if constexpr (ENABLE_DEBUG) {
                         ++stats.invalid;
                         ++profile.data.failures[Profile::Invalid];
@@ -4226,7 +3983,7 @@ optional<vector<Op>> rewriteCooperativeHistory(
                 completed = true;
                 break;
             }
-            auto decision = sim.decide(seed.mode, seed.shortcuts, seed.transfers, deadline);
+            auto decision = greedyAt(hash);
             if (!decision) {
                 bool timedOut = Clock::now() >= deadline;
                 if (secondPending && !timedOut) {
@@ -4241,7 +3998,7 @@ optional<vector<Op>> rewriteCooperativeHistory(
                     ++profile.data.failures[timedOut ? Profile::Timeout : Profile::NoMove];
                 break;
             }
-            next = decision->greedy;
+            next = *decision;
             if (secondPending && (int)rebuilt.size() >= secondPivotAfter) {
                 // Compare against the normal greedy choice. Exploration relaxes
                 // scheduling rules, so its own greedy choice may already differ.
@@ -4260,6 +4017,7 @@ optional<vector<Op>> rewriteCooperativeHistory(
                     int second = chooseAlternative(choices, 0);
                     assert(second >= 0);
                     next = choices[second];
+                    nextGreedyEntry = nullptr;
                     nextIsSecond = true;
                 } else {
                     if constexpr (ENABLE_DEBUG) ++profile.data.count[Profile::DoubleFallback];
@@ -4298,7 +4056,9 @@ optional<vector<Op>> rewriteCooperativeHistory(
         bool accept = delta < 0 || (delta == 0 ? uniform() < 0.25 :
                                                uniform() < exp(-delta / temperature));
         if (!accept) continue;
-        vector<Candidate> actions(current.actions.begin(), current.actions.begin() + cut);
+        vector<Candidate> actions;
+        actions.reserve(cut + rebuilt.size() + (join >= 0 ? current.actions.size() - join : 0));
+        actions.insert(actions.end(), current.actions.begin(), current.actions.begin() + cut);
         actions.insert(actions.end(), rebuilt.begin(), rebuilt.end());
         int tailStart = (int)actions.size();
         if (join >= 0)
@@ -4385,7 +4145,7 @@ int main() {
     vector<string> grid(N);
     for (auto& row : grid) cin >> row;
     const auto routingDeadline = start + chrono::milliseconds(350);
-    const auto baselineDeadline = start + chrono::milliseconds(450);
+    const auto baselineDeadline = start + chrono::milliseconds(950);
     const auto overallDeadline = start + chrono::milliseconds(1950);
     // Reserve 100 ms for compression. Repeated sparse repairs share their
     // deadlines; retain 10 ms to revisit the output of the region searches.
@@ -4408,19 +4168,40 @@ int main() {
     const auto candidateBuildStart = debugNow();
     const int initialSlimes = scheduler.initial.remaining;
     const int candidateLoad = initialSlimes * N;
+    const auto selectedModels = candidateModelIds(candidateLoad);
+    optional<GreedySeed> seed;
+    int seedScore = INT_MAX, seedAttempts = 0, seedCompleted = 0, seedPruned = 0;
     const char* answerSource = "fallback";
-    bool seedPruned = false;
-    // Obtain one inexpensive incumbent, then spend the construction budget on
-    // alternative intermediate boards instead of independent greedy models.
-    auto seed = buildCooperativeSeed(scheduler, 1, true, true,
-                                     baselineDeadline, (int)answer.size(), seedPruned);
-    if (seed && seed->operations.size() < answer.size()) {
-        answer = seed->operations;
-        answerSource = "seed";
+    constexpr int optionMasks[] = {0, 1, 2, 3};
+    constexpr int optionCount = size(optionMasks);
+    const int candidateCount = (int)selectedModels.size() * optionCount;
+    // Preserve the retained models' order; equal-length candidates keep the first seed.
+    for (int job = 0; job < candidateCount; ++job) {
+        if (chrono::steady_clock::now() >= baselineDeadline) break;
+        int mode = selectedModels[job / optionCount], options = optionMasks[job % optionCount];
+        // Option bits: 1 = transfers, 2 = shortcuts, 3 = both; 0 enables neither.
+        bool shortcuts = (options & 2) != 0, transfers = (options & 1) != 0;
+        if constexpr (ENABLE_DEBUG) ++seedAttempts;
+        bool pruned = false;
+        auto candidate = buildCooperativeSeed(scheduler, mode, shortcuts, transfers,
+                                              baselineDeadline, seedScore, pruned);
+        if constexpr (ENABLE_DEBUG) seedPruned += pruned;
+        if (!candidate) continue;
+        if constexpr (ENABLE_DEBUG) ++seedCompleted;
+        // Select by the complete, uncompressed initial operation count.
+        const int candidateScore = (int)candidate->operations.size();
+        if (candidate->operations.size() < answer.size()) {
+            answer = candidate->operations;
+            answerSource = "seed";
+        }
+        if (!seed || candidateScore < seedScore) {
+            seedScore = candidateScore;
+            seed = std::move(candidate);
+        }
     }
     const auto candidateBuildEnd = debugNow();
     const size_t baselineOps = answer.size();
-    BeamSearchStats beamStats;
+    HistorySearchStats stats;
     long long searchNs = 0, straightNs = 0, smallRegionNs = 0;
     size_t compressionInputOps = answer.size(), straightSaved = 0;
     auto straighten = [&](const vector<Op>& input, auto deadline) {
@@ -4430,13 +4211,23 @@ int main() {
             straightNs += chrono::duration_cast<chrono::nanoseconds>(debugNow() - stageStart).count();
         return output;
     };
-    const auto searchStart = debugNow();
-    answer = buildCooperativeBeam(scheduler, answer, searchDeadline, beamStats);
-    if (answer.size() < baselineOps) answerSource = "beam";
-    if constexpr (ENABLE_DEBUG)
-        searchNs = chrono::duration_cast<chrono::nanoseconds>(debugNow() - searchStart).count();
-    compressionInputOps = answer.size();
-    const auto postprocessingStart = debugNow();
+    auto postprocessingStart = debugNow();
+    if (seed) {
+        const auto searchStart = debugNow();
+        auto rewritten = rewriteCooperativeHistory(scheduler, *seed, searchDeadline, stats);
+        if constexpr (ENABLE_DEBUG)
+            searchNs = chrono::duration_cast<chrono::nanoseconds>(debugNow() - searchStart).count();
+        postprocessingStart = debugNow();
+        if (rewritten) {
+            auto compressed = straighten(*rewritten, straightCompressionDeadline);
+            if (compressed.size() < answer.size()) {
+                compressionInputOps = rewritten->size();
+                straightSaved += rewritten->size() - compressed.size();
+                answer = std::move(compressed);
+                answerSource = "history";
+            }
+        }
+    }
     const size_t beforePostprocessing = answer.size();
     answer = straighten(answer, straightCompressionDeadline);
     straightSaved += beforePostprocessing - answer.size();
@@ -4477,32 +4268,21 @@ int main() {
              << " answer_source=" << answerSource
              << " initial_slimes=" << initialSlimes
              << " candidate_load=" << candidateLoad
-             << " search_method=construction_beam"
-             << " candidate_model_count=1 candidate_count=1 seed_attempts=1"
-             << " seed_completed=" << bool(seed)
+             << " candidate_model_count=" << selectedModels.size()
+             << " candidate_count=" << candidateCount
+             << " seed_attempts=" << seedAttempts
+             << " seed_completed=" << seedCompleted
              << " seed_pruned=" << seedPruned
              << " seed_mode=" << (seed ? seed->mode : -1)
              << " seed_shortcuts=" << (seed && seed->shortcuts)
              << " seed_transfers=" << (seed && seed->transfers)
-             << " beam_initial_raw_ops=" << beamStats.initialOps
-             << " beam_best_raw_ops=" << beamStats.bestOps
-             << " beam_expanded=" << beamStats.expanded
-             << " beam_generated=" << beamStats.generated
-             << " beam_duplicates=" << beamStats.duplicate
-             << " beam_dominated=" << beamStats.dominated
-             << " beam_layers=" << beamStats.layers
-             << " beam_last_cost=" << beamStats.lastCost
-             << " beam_min_width=" << beamStats.minWidth
-             << " beam_max_width=" << beamStats.maxWidth
-             << " beam_peak_bucket=" << beamStats.peakBucket
-             << " beam_seen_states=" << beamStats.seenStates
-             << " beam_lane0_expanded=" << beamStats.laneExpanded[0]
-             << " beam_lane1_expanded=" << beamStats.laneExpanded[1]
-             << " beam_lane2_expanded=" << beamStats.laneExpanded[2]
-             << " beam_rollouts=" << beamStats.rollouts
-             << " beam_rollout_completed=" << beamStats.rolloutCompleted
-             << " beam_rollout_ns=" << beamStats.rolloutNs
-             << " beam_improvements=" << beamStats.improvements
+             << " history_initial_raw_ops=" << stats.initialRawOps
+             << " history_best_raw_ops=" << stats.bestRawOps
+             << " history_attempts=" << stats.attempts
+             << " history_completed=" << stats.completed
+             << " history_accepted=" << stats.accepted
+             << " history_improvements=" << stats.improvements
+             << " history_invalid=" << stats.invalid
              << " compression_input_ops=" << compressionInputOps
              << " compression_saved=" << compressionInputOps - answer.size()
              << " straight_saved_ops=" << straightSaved
@@ -4578,6 +4358,7 @@ int main() {
              << " route_initial_geometry=" << routingStats.initialGeometry
              << " route_best_geometry=" << routingStats.bestGeometry
              << " route_deadline_reached=" << routingStats.deadlineReached;
+        stats.writeProfile(cerr);
         cerr << '\n';
     }
     for (const auto& op : answer)
