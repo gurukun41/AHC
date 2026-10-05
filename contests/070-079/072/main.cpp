@@ -1111,11 +1111,34 @@ struct RouteTree {
     vector<int> parent, depth, direction, straight;
 };
 
+struct RoutingSearchStats {
+    long long attempts = 0, valid = 0, accepted = 0, improvements = 0;
+    long long neutralAccepted = 0, worseAccepted = 0;
+    array<long long, 2> proposed{}, feasible{}, adopted{};
+    long long initialNs = 0, rebuildNs = 0, searchNs = 0, totalNs = 0;
+    // Final structural changes are relative to the trees just before local search.
+    int initialEdges = 0, finalEdges = 0, changedParents = 0, changedColors = 0;
+    int addedEdges = 0, removedEdges = 0, reversedEdges = 0;
+    // This measures route geometry, not the number of solution operations.
+    double initialGeometry = 0, bestGeometry = 0;
+    bool deadlineReached = false;
+};
+
 // Grow each color's tree toward its slimes. Favor both crossing springboards
 // and edges shared in the same direction, where mixed stacks can travel together.
 vector<RouteTree> buildCrossingTrees(
     const vector<string>& grid, int K,
-    chrono::steady_clock::time_point refinementDeadline) {
+    chrono::steady_clock::time_point refinementDeadline, RoutingSearchStats& stats) {
+    using Clock = chrono::steady_clock;
+    const auto routingStart = Clock::now();
+    struct TotalTimer {
+        Clock::time_point start;
+        RoutingSearchStats& stats;
+        ~TotalTimer() {
+            if constexpr (ENABLE_DEBUG)
+                stats.totalNs = chrono::duration_cast<chrono::nanoseconds>(Clock::now() - start).count();
+        }
+    } totalTimer{routingStart, stats};
     const int n = (int)grid.size(), cells = n * n;
     const int dr[4] = {-1, 1, 0, 0};
     const int dc[4] = {0, 0, -1, 1};
@@ -1162,6 +1185,43 @@ vector<RouteTree> buildCrossingTrees(
     };
     using Support = vector<RouteSupport>;
     const Support emptySupport(cells);
+    struct RoutePreferences {
+        vector<array<double, 2>> crossing;
+        vector<array<double, 4>> sharing;
+    };
+    auto preferencesFor = [&](const Support& foreign) {
+        RoutePreferences preferences{vector<array<double, 2>>(cells),
+                                     vector<array<double, 4>>(cells)};
+        // Opposite traffic can provide a springboard even when the colors
+        // cannot travel together. Keep the existing crossing/sharing weights.
+        for (int v = 0; v < cells; ++v) {
+            for (int axis = 0; axis < 2; ++axis) {
+                double amount = max(0.0, foreign[v].axis[1 - axis]) +
+                                0.5 * max(0.0, foreign[v].axis[axis]);
+                preferences.crossing[v][axis] = 1.0 - exp(-amount);
+            }
+            for (int d = 0; d < 4; ++d)
+                preferences.sharing[v][d] = 1.0 - exp(-max(0.0, foreign[v].direction[d]));
+        }
+        return preferences;
+    };
+    auto weightedEdgeCost = [&](double crossing, double sharing, int direction,
+                                int straight, int parentDirection) {
+        double lengthValue = (straight - 1) / 7.0;
+        double reward = 0.45 * crossing * (0.25 + 0.75 * lengthValue) + 0.25 * sharing;
+        bool bends = parentDirection >= 0 && parentDirection != direction;
+        return 1.0 + 0.12 * bends - 0.08 * lengthValue - reward;
+    };
+    auto edgeCost = [&](const RoutePreferences& preferences, int v, int direction,
+                        int straight, int parentDirection) {
+        return weightedEdgeCost(preferences.crossing[v][direction / 2],
+                                preferences.sharing[v][direction], direction, straight, parentDirection);
+    };
+    auto depthLimit = [&](int color, int v) {
+        int direct = shortest[color][v];
+        return direct + max(2, direct / 3);
+    };
+    auto rebuildingDeadline = refinementDeadline;
     auto build = [&](int color, const Support& foreign, bool timed) -> optional<RouteTree> {
         RouteTree tree;
         tree.parent.assign(cells, -1);
@@ -1171,22 +1231,10 @@ vector<RouteTree> buildCrossingTrees(
         tree.depth[root[color]] = 0;
         int remaining = (int)slimes[color].size();
 
-        // Keep crossing and same-direction sharing separate: opposite traffic
-        // can provide a springboard, but cannot be carried as one mixed stack.
-        vector<array<double, 2>> crossing(cells);
-        vector<array<double, 4>> sharing(cells);
-        for (int v = 0; v < cells; ++v) {
-            for (int axis = 0; axis < 2; ++axis) {
-                double amount = max(0.0, foreign[v].axis[1 - axis]) +
-                                0.5 * max(0.0, foreign[v].axis[axis]);
-                crossing[v][axis] = 1.0 - exp(-amount);
-            }
-            for (int d = 0; d < 4; ++d)
-                sharing[v][d] = 1.0 - exp(-max(0.0, foreign[v].direction[d]));
-        }
+        const auto preferences = preferencesFor(foreign);
 
         while (remaining > 0) {
-            if (timed && chrono::steady_clock::now() >= refinementDeadline) return nullopt;
+            if (timed && chrono::steady_clock::now() >= rebuildingDeadline) return nullopt;
             vector<double> distance(cells, 1e100);
             vector<int> previous(cells, -1), routeDepth = tree.depth;
             vector<int> direction = tree.direction, straight = tree.straight;
@@ -1203,7 +1251,10 @@ vector<RouteTree> buildCrossingTrees(
             // One settled label per cell is a routing heuristic, rather than
             // an exact direction-state shortest path. Every predecessor is
             // already settled, so the resulting physical path cannot cycle.
+            unsigned expansions = 0;
             while (!q.empty()) {
+                if (timed && (++expansions & 63u) == 0 &&
+                    chrono::steady_clock::now() >= rebuildingDeadline) return nullopt;
                 auto [cost, p] = q.top();
                 q.pop();
                 if (settled[p] || cost > distance[p]) continue;
@@ -1216,18 +1267,11 @@ vector<RouteTree> buildCrossingTrees(
                     int v = neighbor[p][outward];
                     if (v < 0 || tree.depth[v] >= 0 || settled[v]) continue;
                     int nextDepth = routeDepth[p] + 1;
-                    int direct = shortest[color][v];
-                    if (nextDepth > direct + max(2, direct / 3)) continue;
+                    if (nextDepth > depthLimit(color, v)) continue;
                     int towardNest = outward ^ 1;
                     int run = direction[p] == towardNest ? min(8, straight[p] + 1) : 1;
-                    double lengthValue = (run - 1) / 7.0;
-                    double reward = 0.45 * crossing[v][towardNest / 2] *
-                                    (0.25 + 0.75 * lengthValue) +
-                                    0.25 * sharing[v][towardNest];
-                    bool bends = direction[p] >= 0 && direction[p] != towardNest;
-                    double edgeCost = 1.0 + 0.12 * bends - 0.08 * lengthValue - reward;
                     // edgeCost >= 0.22 even with maximal crossing support.
-                    double nextCost = cost + edgeCost;
+                    double nextCost = cost + edgeCost(preferences, v, towardNest, run, direction[p]);
                     if (nextCost >= distance[v]) continue;
                     distance[v] = nextCost;
                     previous[v] = p;
@@ -1258,6 +1302,8 @@ vector<RouteTree> buildCrossingTrees(
         if (!tree) return {}; // Connected floors make this unreachable.
         trees[color] = std::move(*tree);
     }
+    if constexpr (ENABLE_DEBUG)
+        stats.initialNs = chrono::duration_cast<chrono::nanoseconds>(Clock::now() - routingStart).count();
     Support total = emptySupport;
     auto addSupport = [&](Support& support, const RouteTree& tree, double sign) {
         for (int v = 0; v < cells; ++v) {
@@ -1269,19 +1315,425 @@ vector<RouteTree> buildCrossingTrees(
     };
     for (const auto& tree : trees) addSupport(total, tree, 1.0);
 
+    // Reserve half of the remaining routing budget for local reconnections.
+    // Initial trees are always completed; neither refinement phase may leave
+    // a partly constructed tree for the scheduler.
+    auto refinementStart = chrono::steady_clock::now();
+    // Even if the initial build has used the budget, reach the common
+    // finalization below so diagnostics describe the unchanged returned trees.
+    rebuildingDeadline = refinementStart + (refinementDeadline - refinementStart) / 2;
+
     // Revisiting colors lets earlier routes see later colors as well. This is
     // fixed geometric rerouting, independent of history rewriting.
-    for (int pass = 0; pass < 3; ++pass) {
+    bool stopRebuilding = false;
+    for (int pass = 0; pass < 3 && !stopRebuilding; ++pass) {
         for (int i = 0; i < K; ++i) {
-            if (chrono::steady_clock::now() >= refinementDeadline) return trees;
+            if (chrono::steady_clock::now() >= rebuildingDeadline) {
+                stopRebuilding = true;
+                break;
+            }
             int color = pass % 2 == 0 ? i : K - 1 - i;
             Support foreign = total;
             addSupport(foreign, trees[color], -1.0);
             auto tree = build(color, foreign, true);
-            if (!tree) return trees;
+            if (!tree) {
+                stopRebuilding = true;
+                break;
+            }
             addSupport(total, trees[color], -1.0);
             trees[color] = std::move(*tree);
             addSupport(total, trees[color], 1.0);
+        }
+    }
+    if constexpr (ENABLE_DEBUG)
+        stats.rebuildNs = chrono::duration_cast<chrono::nanoseconds>(Clock::now() - refinementStart).count();
+
+    // Prune a forest before reconnecting it. Component roots (parent == -1)
+    // remain in place; only nonterminal leaves with an outgoing edge vanish.
+    auto pruneUnused = [&](int color, RouteTree& tree) {
+        vector<int> childCount(cells), leaves;
+        for (int v = 0; v < cells; ++v) {
+            int p = tree.parent[v];
+            if (p >= cells) return false;
+            if (p >= 0) ++childCount[p];
+        }
+        for (int v = 0; v < cells; ++v)
+            if (tree.parent[v] >= 0 && childCount[v] == 0 && slimeColor[v] != color)
+                leaves.push_back(v);
+        for (int i = 0; i < (int)leaves.size(); ++i) {
+            int v = leaves[i], p = tree.parent[v];
+            tree.parent[v] = -1;
+            tree.depth[v] = tree.direction[v] = -1;
+            tree.straight[v] = 0;
+            if (--childCount[p] == 0 && tree.parent[p] >= 0 && slimeColor[p] != color)
+                leaves.push_back(p);
+        }
+        return true;
+    };
+    auto refreshTree = [&](int color, RouteTree& tree) {
+        if (!pruneUnused(color, tree)) return false;
+        vector<array<int, 4>> children(cells);
+        vector<int> childCount(cells);
+        int active = 1;
+        if (tree.parent[root[color]] >= 0) return false;
+        for (int v = 0; v < cells; ++v) {
+            int p = tree.parent[v];
+            if (p < 0) continue;
+            if (p >= cells || (p != root[color] && tree.parent[p] < 0) ||
+                childCount[p] == 4 ||
+                find(neighbor[v].begin(), neighbor[v].end(), p) == neighbor[v].end())
+                return false;
+            children[p][childCount[p]++] = v;
+            ++active;
+        }
+        fill(tree.depth.begin(), tree.depth.end(), -1);
+        fill(tree.direction.begin(), tree.direction.end(), -1);
+        fill(tree.straight.begin(), tree.straight.end(), 0);
+        tree.depth[root[color]] = 0;
+        vector<int> order{root[color]};
+        for (int i = 0; i < (int)order.size(); ++i) {
+            int p = order[i];
+            for (int j = 0; j < childCount[p]; ++j) {
+                int v = children[p][j];
+                if (tree.depth[v] >= 0) return false;
+                tree.depth[v] = tree.depth[p] + 1;
+                if (tree.depth[v] > depthLimit(color, v)) return false;
+                int direction = (int)(find(neighbor[v].begin(), neighbor[v].end(), p) -
+                                      neighbor[v].begin());
+                tree.direction[v] = direction;
+                tree.straight[v] = tree.direction[p] == direction ?
+                    min(8, tree.straight[p] + 1) : 1;
+                order.push_back(v);
+            }
+        }
+        if ((int)order.size() != active) return false; // Disconnected edges or a cycle.
+        for (int v : slimes[color])
+            if (tree.depth[v] < 0) return false;
+        return true;
+    };
+    uint64_t randomState = 0x72a4c91d385ef607ULL;
+    for (const auto& row : grid)
+        for (unsigned char ch : row) randomState = mixHash(randomState ^ ch);
+    auto random64 = [&]() {
+        randomState += 0x9e3779b97f4a7c15ULL;
+        return mixHash(randomState);
+    };
+    auto uniform = [&]() { return (random64() >> 11) * 0x1.0p-53; };
+
+    struct TreeShape {
+        vector<array<int, 4>> children;
+        vector<int> childCount, terminalCount, nodes;
+    };
+    auto inspectTree = [&](int color) {
+        const auto& tree = trees[color];
+        TreeShape shape{vector<array<int, 4>>(cells), vector<int>(cells), vector<int>(cells), {}};
+        for (int v : slimes[color]) shape.terminalCount[v] = 1;
+        for (int v = 0; v < cells; ++v) {
+            int p = tree.parent[v];
+            if (p < 0) continue;
+            shape.children[p][shape.childCount[p]++] = v;
+            shape.nodes.push_back(v);
+        }
+        sort(shape.nodes.begin(), shape.nodes.end(),
+             [&](int a, int b) { return tree.depth[a] > tree.depth[b]; });
+        for (int v : shape.nodes)
+            shape.terminalCount[tree.parent[v]] += shape.terminalCount[v];
+        return shape;
+    };
+    auto branchNodes = [&](const TreeShape& shape, int anchor) {
+        vector<int> branch{anchor};
+        for (int i = 0; i < (int)branch.size(); ++i) {
+            int v = branch[i];
+            for (int j = 0; j < shape.childCount[v]; ++j)
+                branch.push_back(shape.children[v][j]);
+        }
+        return branch;
+    };
+
+    // Grow a connector from the root component. Detached vertices are blocked
+    // except for the requested attachment. Positive proposal-only noise and
+    // an old-edge penalty let repeated proposals explore different corridors.
+    auto connect = [&](int color, RouteTree& candidate, const vector<uint8_t>& blocked,
+                       int target, int targetDepthLimit, int forbiddenParent,
+                       const RoutePreferences& preferences, uint64_t salt, double jitter) {
+        if (Clock::now() >= refinementDeadline || targetDepthLimit < 1) return false;
+        if (candidate.depth[target] >= 0) return true;
+        vector<double> distance(cells, 1e100);
+        vector<int> previous(cells, -1), routeDepth = candidate.depth;
+        vector<int> direction = candidate.direction, straight = candidate.straight;
+        vector<bool> settled(cells, false);
+        using Entry = pair<double, int>;
+        priority_queue<Entry, vector<Entry>, greater<Entry>> q;
+        for (int v = 0; v < cells; ++v) {
+            if (candidate.depth[v] < 0) continue;
+            distance[v] = 0.04 * candidate.depth[v];
+            q.push({distance[v], v});
+        }
+        bool reached = false;
+        unsigned expansions = 0;
+        while (!q.empty()) {
+            if ((++expansions & 63u) == 0 && Clock::now() >= refinementDeadline) return false;
+            auto [cost, from] = q.top();
+            q.pop();
+            if (settled[from] || cost > distance[from]) continue;
+            settled[from] = true;
+            if (from == target) {
+                reached = true;
+                break;
+            }
+            for (int outward = 0; outward < 4; ++outward) {
+                int v = neighbor[from][outward];
+                if (v < 0 || settled[v] || candidate.depth[v] >= 0 ||
+                    (blocked[v] && v != target) ||
+                    (v == target && from == forbiddenParent)) continue;
+                int nextDepth = routeDepth[from] + 1;
+                int limit = v == target ? targetDepthLimit : depthLimit(color, v);
+                if (nextDepth > limit) continue;
+                int towardNest = outward ^ 1;
+                int run = direction[from] == towardNest ? min(8, straight[from] + 1) : 1;
+                double unit = (mixHash(salt ^ (uint64_t(v) << 3) ^ unsigned(towardNest)) >> 11) * 0x1.0p-53;
+                double noise = 1.0 + jitter * (2.0 * unit - 1.0);
+                double oldEdge = trees[color].parent[v] == from ? 0.15 * jitter : 0.0;
+                double nextCost = cost +
+                    edgeCost(preferences, v, towardNest, run, direction[from]) * noise + oldEdge;
+                if (nextCost >= distance[v]) continue;
+                distance[v] = nextCost;
+                previous[v] = from;
+                routeDepth[v] = nextDepth;
+                direction[v] = towardNest;
+                straight[v] = run;
+                q.push({nextCost, v});
+            }
+        }
+        if (!reached || Clock::now() >= refinementDeadline) return false;
+        for (int v = target; candidate.depth[v] < 0; v = previous[v]) {
+            if (previous[v] < 0) return false;
+            candidate.parent[v] = previous[v];
+            candidate.depth[v] = routeDepth[v];
+            candidate.direction[v] = direction[v];
+            candidate.straight[v] = straight[v];
+        }
+        return true;
+    };
+
+    auto rerootBranch = [&](int color, int anchor, const TreeShape& shape,
+                            const RoutePreferences& preferences, double jitter) -> optional<RouteTree> {
+        const auto& tree = trees[color];
+        const auto branch = branchNodes(shape, anchor);
+        vector<uint8_t> inside(cells);
+        for (int v : branch) inside[v] = 1;
+        vector<int> ports;
+        for (int v : branch) {
+            for (int p : neighbor[v]) {
+                if (p >= 0 && !inside[p] && !(v == anchor && p == tree.parent[anchor])) {
+                    ports.push_back(v);
+                    break;
+                }
+            }
+        }
+        if (ports.empty()) return nullopt;
+        // Prefer a new attachment vertex; ordinary anchor reconnection remains
+        // possible when no descendant has access to the exterior.
+        if (ports.size() > 1)
+            erase(ports, anchor);
+        int port = ports[random64() % ports.size()];
+        RouteTree candidate = tree;
+        int previous = -1;
+        for (int v = port;;) {
+            int next = tree.parent[v];
+            candidate.parent[v] = previous;
+            if (v == anchor) break;
+            previous = v;
+            v = next;
+        }
+        // Reversing the chain can leave its former root as an unnecessary
+        // nonterminal leaf. Prune it before computing the new depth allowance.
+        if (!pruneUnused(color, candidate)) return nullopt;
+        for (int v = 0; v < cells; ++v) {
+            if (v != root[color] && (inside[v] || candidate.parent[v] < 0)) {
+                candidate.depth[v] = candidate.direction[v] = -1;
+                candidate.straight[v] = 0;
+            }
+        }
+        vector<uint8_t> blocked(cells);
+        vector<int> relativeDepth(cells, -1), order{port};
+        relativeDepth[port] = 0;
+        int portDepthLimit = depthLimit(color, port);
+        for (int i = 0; i < (int)order.size(); ++i) {
+            int v = order[i];
+            blocked[v] = 1;
+            portDepthLimit = min(portDepthLimit, depthLimit(color, v) - relativeDepth[v]);
+            for (int child : neighbor[v]) {
+                if (child < 0 || !inside[child] || candidate.parent[child] != v) continue;
+                relativeDepth[child] = relativeDepth[v] + 1;
+                order.push_back(child);
+            }
+        }
+        int forbiddenParent = port == anchor ? tree.parent[anchor] : -1;
+        if (!connect(color, candidate, blocked, port, portDepthLimit, forbiddenParent,
+                     preferences, random64(), jitter)) return nullopt;
+        return candidate;
+    };
+
+    auto rebuildBranches = [&](int color, int anchor, const TreeShape& shape,
+                               const RoutePreferences& preferences, double jitter) -> optional<RouteTree> {
+        const auto& tree = trees[color];
+        vector<uint8_t> removed(cells);
+        vector<int> terminals;
+        for (int v : branchNodes(shape, anchor)) {
+            if (slimeColor[v] != color) continue;
+            removed[v] = 1;
+            terminals.push_back(v);
+        }
+        if (terminals.empty()) return nullopt;
+        RouteTree candidate{vector<int>(cells, -1), vector<int>(cells, -1),
+                            vector<int>(cells, -1), vector<int>(cells, 0)};
+        candidate.depth[root[color]] = 0;
+        // Keep exactly the old paths still needed by unselected terminals.
+        // The selected subtree's interior and junctions are rebuilt freely.
+        for (int terminal : slimes[color]) {
+            if (removed[terminal]) continue;
+            for (int v = terminal; candidate.depth[v] < 0; v = tree.parent[v]) {
+                candidate.parent[v] = tree.parent[v];
+                candidate.depth[v] = tree.depth[v];
+                candidate.direction[v] = tree.direction[v];
+                candidate.straight[v] = tree.straight[v];
+            }
+        }
+        for (int i = (int)terminals.size() - 1; i > 0; --i)
+            swap(terminals[i], terminals[random64() % (i + 1)]);
+        const vector<uint8_t> blocked(cells);
+        uint64_t salt = random64();
+        for (int target : terminals) {
+            if (candidate.depth[target] >= 0) continue;
+            if (!connect(color, candidate, blocked, target, depthLimit(color, target), -1,
+                         preferences, salt, jitter)) return nullopt;
+        }
+        return candidate;
+    };
+
+    // A changed route also changes other colors' crossing rewards. Compare
+    // the complete set with the original weights, without proposal noise.
+    auto globalGeometry = [&](const Support& support, int replacementColor,
+                              const RouteTree* replacement) {
+        double cost = 0.0;
+        for (int color = 0; color < K; ++color) {
+            const auto& tree = color == replacementColor ? *replacement : trees[color];
+            for (int v = 0; v < cells; ++v) {
+                int p = tree.parent[v];
+                if (p < 0) continue;
+                int d = tree.direction[v], axis = d / 2;
+                double ownAxis = 0.25 + 0.75 * (tree.straight[v] - 1) / 7.0;
+                double amount = max(0.0, support[v].axis[1 - axis]) +
+                                0.5 * max(0.0, support[v].axis[axis] - ownAxis);
+                double crossing = 1.0 - exp(-amount);
+                double sharing = 1.0 - exp(-max(0.0, support[v].direction[d] - 1.0));
+                cost += weightedEdgeCost(crossing, sharing, d, tree.straight[v], tree.direction[p]);
+            }
+        }
+        return cost;
+    };
+    const auto searchStart = Clock::now();
+    vector<RouteTree> bestTrees = trees;
+    double currentCost = globalGeometry(total, -1, nullptr), bestCost = currentCost;
+    vector<vector<int>> initialParents;
+    if constexpr (ENABLE_DEBUG) {
+        stats.initialGeometry = currentCost;
+        for (const auto& tree : trees) {
+            initialParents.push_back(tree.parent);
+            for (int p : tree.parent) stats.initialEdges += p >= 0;
+        }
+    }
+    const double budget = max(1e-9, chrono::duration<double>(refinementDeadline - searchStart).count());
+    int iteration = 0, colorOffset = 0;
+    while (Clock::now() < refinementDeadline) {
+        if (iteration % K == 0) colorOffset = random64() % K;
+        int color = (iteration + colorOffset) % K;
+        int kind = iteration++ % 3 == 2 ? 1 : 0;
+        if constexpr (ENABLE_DEBUG) {
+            ++stats.attempts;
+            ++stats.proposed[kind];
+        }
+        auto shape = inspectTree(color);
+        vector<int> anchors;
+        for (int v : shape.nodes) {
+            int count = shape.terminalCount[v];
+            if (count >= 2 && (kind == 0 || count <= 24) && shape.childCount[v] >= 2)
+                anchors.push_back(v);
+        }
+        // Most proposals touch actual junctions; also explore single branches
+        // and colors whose tree has no branching vertex below the nest.
+        if (anchors.empty() || random64() % 4 == 0) {
+            anchors.clear();
+            for (int v : shape.nodes)
+                if (kind == 0 || shape.terminalCount[v] <= 24) anchors.push_back(v);
+        }
+        if (anchors.empty()) continue;
+        int anchor = anchors[random64() % anchors.size()];
+        double progress = clamp(chrono::duration<double>(Clock::now() - searchStart).count() / budget, 0.0, 1.0);
+        double jitter = 0.80 - 0.55 * progress;
+        Support foreign = total;
+        addSupport(foreign, trees[color], -1.0);
+        const auto preferences = preferencesFor(foreign);
+        auto candidate = kind == 0 ? rerootBranch(color, anchor, shape, preferences, jitter) :
+                                     rebuildBranches(color, anchor, shape, preferences, jitter);
+        if (!candidate || !refreshTree(color, *candidate) ||
+            candidate->parent == trees[color].parent) continue;
+        if (Clock::now() >= refinementDeadline) break;
+        if constexpr (ENABLE_DEBUG) {
+            ++stats.valid;
+            ++stats.feasible[kind];
+        }
+        Support changedSupport = total;
+        addSupport(changedSupport, trees[color], -1.0);
+        addSupport(changedSupport, *candidate, 1.0);
+        double cost = globalGeometry(changedSupport, color, &*candidate);
+        if (Clock::now() >= refinementDeadline) break;
+        double delta = cost - currentCost;
+        double temperature = 1.4 * pow(0.02 / 1.4, progress);
+        if (delta > 1e-9 && uniform() >= exp(-delta / temperature)) continue;
+        trees[color] = std::move(*candidate);
+        total = std::move(changedSupport);
+        currentCost = cost;
+        if constexpr (ENABLE_DEBUG) {
+            ++stats.accepted;
+            ++stats.adopted[kind];
+            stats.neutralAccepted += abs(delta) <= 1e-9;
+            stats.worseAccepted += delta > 1e-9;
+        }
+        // Equal-cost structural changes may become the returned best as well.
+        // Uphill exploration never forces a worse geometric solution to output.
+        if (currentCost <= bestCost + 1e-9) {
+            if constexpr (ENABLE_DEBUG) stats.improvements += currentCost < bestCost - 1e-9;
+            bestCost = currentCost;
+            bestTrees = trees;
+        }
+    }
+    trees = std::move(bestTrees);
+    if constexpr (ENABLE_DEBUG) {
+        stats.searchNs = chrono::duration_cast<chrono::nanoseconds>(Clock::now() - searchStart).count();
+        stats.bestGeometry = bestCost;
+        stats.deadlineReached = Clock::now() >= refinementDeadline;
+        for (int color = 0; color < K; ++color) {
+            const auto& before = initialParents[color];
+            const auto& after = trees[color].parent;
+            bool changed = false;
+            for (int v = 0; v < cells; ++v) {
+                int oldParent = before[v], newParent = after[v];
+                stats.finalEdges += newParent >= 0;
+                if (oldParent != newParent) {
+                    ++stats.changedParents;
+                    changed = true;
+                }
+                if (oldParent >= 0) {
+                    bool reversed = after[oldParent] == v;
+                    stats.reversedEdges += reversed;
+                    stats.removedEdges += newParent != oldParent && !reversed;
+                }
+                if (newParent >= 0)
+                    stats.addedEdges += oldParent != newParent && before[newParent] != v;
+            }
+            stats.changedColors += changed;
         }
     }
     return trees;
@@ -3405,7 +3857,8 @@ int main() {
     const auto smallRegionDeadline = overallDeadline - chrono::milliseconds(13);
     const auto repairRescanDeadline = overallDeadline - chrono::milliseconds(3);
     const auto postprocessingDeadline = overallDeadline;
-    auto routes = buildCrossingTrees(grid, K, routingDeadline);
+    RoutingSearchStats routingStats;
+    auto routes = buildCrossingTrees(grid, K, routingDeadline, routingStats);
     if ((int)routes.size() != K) return 0;
     auto fallback = sequentialSolve(grid, K, routes);
     if (!fallback) return 0;
@@ -3579,7 +4032,33 @@ int main() {
              << " candidate_end_ns=" << nanoseconds(candidateBuildEnd - start)
              << " candidate_budget_exhausted=" << (candidateBuildEnd >= baselineDeadline)
              << " search_ns=" << searchNs
-             << " solve_ns=" << nanoseconds(solveEnd - start);
+             << " solve_ns=" << nanoseconds(solveEnd - start)
+             << " route_attempts=" << routingStats.attempts
+             << " route_valid=" << routingStats.valid
+             << " route_accepted=" << routingStats.accepted
+             << " route_improvements=" << routingStats.improvements
+             << " route_neutral_accepted=" << routingStats.neutralAccepted
+             << " route_worse_accepted=" << routingStats.worseAccepted
+             << " route_reroot_attempts=" << routingStats.proposed[0]
+             << " route_reroot_valid=" << routingStats.feasible[0]
+             << " route_reroot_accepted=" << routingStats.adopted[0]
+             << " route_rebuild_attempts=" << routingStats.proposed[1]
+             << " route_rebuild_valid=" << routingStats.feasible[1]
+             << " route_rebuild_accepted=" << routingStats.adopted[1]
+             << " route_initial_ns=" << routingStats.initialNs
+             << " route_initial_rebuild_ns=" << routingStats.rebuildNs
+             << " route_search_ns=" << routingStats.searchNs
+             << " route_total_ns=" << routingStats.totalNs
+             << " route_initial_edges=" << routingStats.initialEdges
+             << " route_final_edges=" << routingStats.finalEdges
+             << " route_changed_parents=" << routingStats.changedParents
+             << " route_changed_colors=" << routingStats.changedColors
+             << " route_added_edges=" << routingStats.addedEdges
+             << " route_removed_edges=" << routingStats.removedEdges
+             << " route_reversed_edges=" << routingStats.reversedEdges
+             << " route_initial_geometry=" << routingStats.initialGeometry
+             << " route_best_geometry=" << routingStats.bestGeometry
+             << " route_deadline_reached=" << routingStats.deadlineReached;
         stats.writeProfile(cerr);
         cerr << '\n';
     }
