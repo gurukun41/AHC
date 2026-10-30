@@ -1,8 +1,9 @@
-# Ignore everything except C++ source code and this file.
+# Ignore everything except C++ source code, the library index, and this file.
 *
 !*/
 !*.cpp
 !/.gitignore
+!/lib/index.md
 
 # Contest tooling and generated reports are not personal source/notes.
 /contests/**/tools/
